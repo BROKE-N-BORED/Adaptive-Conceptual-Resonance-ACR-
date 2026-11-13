@@ -61,6 +61,19 @@ SEED = 20261112
 RESONANCE_THRESHOLD = 0.75
 RESONANCE_JUMP = 0.25
 PREVIEW_LEN = 80
+SESSION_FORMAT_VERSION = 1
+
+TRACE_KEYS = ("id", "input", "delta_norm", "old_norm", "new_norm",
+              "resonance", "alpha", "confidence", "new_layer",
+              "frozen")
+
+
+class SessionError(ValueError):
+    """A session file is missing, malformed, or unreadable.
+
+    The message is plain words for the status line, never a
+    traceback: loading a bad file must fail gracefully.
+    """
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
@@ -155,6 +168,67 @@ def _dominant_direction(w):
     return vec, max(0.0, lam)
 
 
+# ------------------------------------------------------- session checks
+# Load-time validation for session files. Each helper returns a
+# clean deep copy or raises SessionError with a plain message.
+
+
+def _is_number(value):
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool))
+
+
+def _checked_factors(value, name):
+    if (not isinstance(value, list) or len(value) != DIM):
+        raise SessionError(
+            "the session data has a bad %s matrix" % name)
+    out = []
+    for row in value:
+        if (not isinstance(row, list) or len(row) != RANK
+                or not all(_is_number(x) for x in row)):
+            raise SessionError(
+                "the session data has a bad %s matrix" % name)
+        out.append([float(x) for x in row])
+    return out
+
+
+def _checked_vector(value, name, allow_none=False):
+    if value is None and allow_none:
+        return None
+    if (not isinstance(value, list) or len(value) != DIM
+            or not all(_is_number(x) for x in value)):
+        raise SessionError(
+            "the session data has a bad %s vector" % name)
+    return [float(x) for x in value]
+
+
+def _checked_trace(value, step_count):
+    if not isinstance(value, list) or len(value) != step_count:
+        raise SessionError("the session data has a bad trace log")
+    out = []
+    for i, entry in enumerate(value):
+        if (not isinstance(entry, dict)
+                or entry.get("id") != i + 1
+                or any(key not in entry for key in TRACE_KEYS)):
+            raise SessionError("the session data has a bad trace log")
+        out.append(dict(entry))
+    return out
+
+
+def _checked_buffer(value):
+    if not isinstance(value, list) or len(value) > BUFFER_SIZE:
+        raise SessionError("the session data has a bad buffer")
+    out = []
+    for item in value:
+        if (not isinstance(item, dict)
+                or not isinstance(item.get("text"), str)):
+            raise SessionError("the session data has a bad buffer")
+        out.append({"text": item["text"],
+                    "vector": _checked_vector(item.get("vector"),
+                                              "buffer")})
+    return out
+
+
 # ---------------------------------------------------------------- engine
 
 
@@ -176,6 +250,62 @@ class Engine:
         self.h_prev = None
         self.prev_resonance = None
         self.step_count = 0
+
+    def state_dict(self):
+        """Full engine state as a JSON-ready dict.
+
+        Everything needed to resume this exact session: the W_t
+        factors, the previous embedding and resonance (the next
+        step predicts from them), the step count, the whole trace
+        log, and the buffer with its vectors. Deep copies: mutating
+        the dict never touches the engine. The format version lives
+        in the session file around this dict, not here.
+        """
+        return {
+            "u": [row[:] for row in self.u],
+            "v": [row[:] for row in self.v],
+            "h_prev": (list(self.h_prev)
+                       if self.h_prev is not None else None),
+            "prev_resonance": self.prev_resonance,
+            "step_count": self.step_count,
+            "trace": [dict(entry) for entry in self.trace],
+            "buffer": [{"text": item["text"],
+                        "vector": list(item["vector"])}
+                       for item in self.buffer],
+        }
+
+    def load_state_dict(self, state):
+        """Restore state from state_dict().
+
+        Validates everything before touching the engine, so a bad
+        file leaves the current session intact. Raises SessionError
+        with a plain message on anything malformed.
+        """
+        if not isinstance(state, dict):
+            raise SessionError("the session data is not an object")
+        u = _checked_factors(state.get("u"), "u")
+        v = _checked_factors(state.get("v"), "v")
+        h_prev = _checked_vector(state.get("h_prev"), "h_prev",
+                                 allow_none=True)
+        prev_resonance = state.get("prev_resonance")
+        if (prev_resonance is not None
+                and not isinstance(prev_resonance, (int, float))):
+            raise SessionError(
+                "the session data has a bad prev_resonance")
+        step_count = state.get("step_count")
+        if (not isinstance(step_count, int)
+                or isinstance(step_count, bool)
+                or step_count < 0):
+            raise SessionError("the session data has a bad step_count")
+        trace = _checked_trace(state.get("trace"), step_count)
+        buffer = _checked_buffer(state.get("buffer"))
+        self.u = u
+        self.v = v
+        self.h_prev = h_prev
+        self.prev_resonance = prev_resonance
+        self.step_count = step_count
+        self.trace = trace
+        self.buffer = buffer
 
     def w_norm(self):
         return _frobenius(_materialize_w(self.u, self.v))

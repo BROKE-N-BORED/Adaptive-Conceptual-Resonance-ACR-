@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.3.
+"""ACR - Adaptive Contextual Resonance, v0.4.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -12,6 +12,7 @@ What it is not: a full self-evolving neural engine. That does not
 exist yet, and this app does not claim to be it.
 """
 
+import csv
 import json
 import math
 import os
@@ -26,11 +27,12 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from acr_engine import BUFFER_SIZE, DIM, RANK, Engine
+from acr_engine import (BUFFER_SIZE, DIM, RANK, Engine,
+                        SESSION_FORMAT_VERSION, SessionError)
 from debug_log import DebugLogger, check_ollama
 
 APP_NAME = "acr"
-VERSION = "0.3"
+VERSION = "0.4"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
@@ -331,14 +333,30 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.export_button = QPushButton("Export trace JSON")
         self.export_button.clicked.connect(self.on_export)
+        self.export_csv_button = QPushButton("Export trace CSV")
+        self.export_csv_button.clicked.connect(self.on_export_csv)
         self.report_button = QPushButton("Generate debug report")
         self.report_button.clicked.connect(self.on_debug_report)
+        btn_row.addWidget(self.export_button)
+        btn_row.addWidget(self.export_csv_button)
+        btn_row.addWidget(self.report_button)
+        left.addLayout(btn_row)
+
+        session_row = QHBoxLayout()
+        self.save_button = QPushButton("Save session")
+        self.save_button.clicked.connect(self.on_save_session)
+        self.load_button = QPushButton("Load session")
+        self.load_button.clicked.connect(self.on_load_session)
+        self.export_session_button = QPushButton("Export session")
+        self.export_session_button.clicked.connect(
+            self.on_export_session)
         self.reset_button = QPushButton("Reset")
         self.reset_button.clicked.connect(self.on_reset)
-        btn_row.addWidget(self.export_button)
-        btn_row.addWidget(self.report_button)
-        btn_row.addWidget(self.reset_button)
-        left.addLayout(btn_row)
+        session_row.addWidget(self.save_button)
+        session_row.addWidget(self.load_button)
+        session_row.addWidget(self.export_session_button)
+        session_row.addWidget(self.reset_button)
+        left.addLayout(session_row)
 
         self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
@@ -477,6 +495,246 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText("Trace exported to %s" % path)
 
+    # -- sessions -----------------------------------------------------
+    def session_dict(self):
+        """The whole session as a JSON-ready dict.
+
+        The engine state (W_t factors, previous embedding and
+        resonance, trace, buffer), the current settings, and the
+        heatmap history so the views tab restores exactly. The
+        format version lets later versions detect old saves.
+        """
+        return {
+            "format": "acr-session",
+            "version": SESSION_FORMAT_VERSION,
+            "app_version": VERSION,
+            "engine": self.engine.state_dict(),
+            "settings": {
+                "alpha": self._alpha(),
+                "cap": self.cap_spin.value(),
+                "frozen": self.freeze_check.isChecked(),
+            },
+            "heat_history": [[step_id, list(rows)]
+                             for step_id, rows in self._heat_history],
+        }
+
+    def save_session_to(self, path):
+        """Write the session as JSON. Returns the path."""
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(self.session_dict(), fh, indent=2)
+        self.logger.action("session saved to %s" % path)
+        return path
+
+    def on_save_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save session", "acr-session.json",
+            "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            self.save_session_to(path)
+        except OSError:
+            self.logger.exception("session save failed")
+            self.status_label.setText("Save failed - could not write.")
+            return
+        self.status_label.setText("Session saved to %s" % path)
+
+    def load_session_from(self, path):
+        """Load a session file, restoring engine, settings, views.
+
+        Validates everything before applying it, so a bad file
+        leaves the current session intact. Raises SessionError
+        with a plain message on anything malformed; OSError on a
+        file that cannot be read at all. Returns the path.
+        """
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise SessionError("that file is not a session file")
+        if not isinstance(data, dict):
+            raise SessionError("that file is not a session file")
+        if data.get("format") != "acr-session":
+            raise SessionError("that file is not an ACR session file")
+        if "version" not in data:
+            raise SessionError(
+                "that session file has no version number")
+        if data["version"] != SESSION_FORMAT_VERSION:
+            raise SessionError(
+                "that session file is version %s, this app reads "
+                "version %d" % (data["version"],
+                               SESSION_FORMAT_VERSION))
+        if "engine" not in data:
+            raise SessionError("that session file has no engine state")
+        # Validate the engine state on a spare engine first: a bad
+        # file must not disturb the live session.
+        spare = Engine()
+        spare.load_state_dict(data["engine"])
+        settings = data.get("settings")
+        if not isinstance(settings, dict):
+            raise SessionError("that session file has no settings")
+        alpha = settings.get("alpha")
+        cap = settings.get("cap")
+        frozen = settings.get("frozen")
+        if (not isinstance(alpha, (int, float))
+                or isinstance(alpha, bool)
+                or not 0.01 <= alpha <= 0.50):
+            raise SessionError(
+                "that session file has a bad learning rate")
+        if (not isinstance(cap, (int, float))
+                or isinstance(cap, bool)
+                or not 0.1 <= cap <= 5.0):
+            raise SessionError(
+                "that session file has a bad stability cap")
+        if not isinstance(frozen, bool):
+            raise SessionError(
+                "that session file has a bad freeze setting")
+        heat = self._checked_heat_history(data.get("heat_history"))
+        # Everything checked: apply it.
+        self.engine = spare
+        self.alpha_slider.setValue(int(round(alpha * 100)))
+        self.cap_spin.setValue(cap)
+        self.freeze_check.setChecked(frozen)
+        self._heat_history = heat
+        self._heat_follow = True
+        self.logger.action("session loaded from %s" % path)
+        self._refresh_all()
+        return path
+
+    def _checked_heat_history(self, value):
+        """Validate the heatmap history, or return [] if absent."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise SessionError(
+                "that session file has a bad heatmap history")
+        out = []
+        for item in value:
+            if (not isinstance(item, list) or len(item) != 2
+                    or not isinstance(item[0], int)
+                    or isinstance(item[0], bool)
+                    or not isinstance(item[1], list)
+                    or len(item[1]) != DIM
+                    or not all(isinstance(x, (int, float))
+                               and not isinstance(x, bool)
+                               for x in item[1])):
+                raise SessionError(
+                    "that session file has a bad heatmap history")
+            out.append([item[0], [float(x) for x in item[1]]])
+        return out
+
+    def on_load_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load session", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            self.load_session_from(path)
+        except OSError:
+            self.logger.exception("session load failed")
+            self.status_label.setText(
+                "Load failed - could not read the file.")
+            return
+        except SessionError as exc:
+            self.logger.action("session load rejected: %s" % exc)
+            self.status_label.setText("Load failed - %s." % exc)
+            return
+        self.status_label.setText("Session loaded from %s" % path)
+
+    # -- exports ------------------------------------------------------
+    def export_trace_csv_to(self, path):
+        """Write the trace log as CSV, same columns as the table.
+
+        Returns the path.
+        """
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(TRACE_COLUMNS)
+            for entry in self.engine.trace:
+                writer.writerow([
+                    entry["id"],
+                    entry["input"],
+                    "%.4f" % entry["delta_norm"],
+                    "%.4f" % entry["old_norm"],
+                    "%.4f" % entry["new_norm"],
+                    "%.4f" % entry["resonance"],
+                    "%.2f" % entry["alpha"],
+                    "%.4f" % entry["confidence"],
+                    "yes" if entry["new_layer"] else "",
+                ])
+        self.logger.action("trace CSV exported to %s" % path)
+        return path
+
+    def on_export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export trace CSV", "acr-trace.csv",
+            "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            self.export_trace_csv_to(path)
+        except OSError:
+            self.logger.exception("trace CSV export failed")
+            self.status_label.setText("Export failed - could not write.")
+            return
+        self.status_label.setText("Trace exported to %s" % path)
+
+    def export_session_to(self, path):
+        """Write the session as readable text: the final state, then
+        every input and trace entry in time order. Returns the path.
+        """
+        lines = ["ACR session export",
+                 "App version: %s" % VERSION,
+                 "",
+                 "Final state",
+                 "  Steps: %d" % self.engine.step_count,
+                 "  W norm: %.4f" % self.engine.w_norm()]
+        if self.engine.trace:
+            last = self.engine.trace[-1]
+            lines.append("  Resonance: %.4f" % last["resonance"])
+        else:
+            lines.append("  Resonance: -")
+        candidates = [e for e in self.engine.trace if e["new_layer"]]
+        lines.append("  Layer candidates: %d" % len(candidates))
+        lines.append("")
+        if not self.engine.trace:
+            lines.append("No steps yet.")
+        else:
+            lines.append("Steps, in time order")
+            for entry in self.engine.trace:
+                lines.append("Step %d: %s"
+                             % (entry["id"], entry["input"]))
+                lines.append(
+                    "  Delta norm: %.4f  W norm: %.4f -> %.4f  "
+                    "Resonance: %.4f"
+                    % (entry["delta_norm"], entry["old_norm"],
+                       entry["new_norm"], entry["resonance"]))
+                lines.append(
+                    "  Alpha: %.2f  Confidence: %.4f  New layer: %s  "
+                    "Frozen: %s"
+                    % (entry["alpha"], entry["confidence"],
+                       "yes" if entry["new_layer"] else "no",
+                       "yes" if entry["frozen"] else "no"))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        self.logger.action("session exported to %s" % path)
+        return path
+
+    def on_export_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export session", "acr-session.txt",
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            self.export_session_to(path)
+        except OSError:
+            self.logger.exception("session export failed")
+            self.status_label.setText("Export failed - could not write.")
+            return
+        self.status_label.setText("Session exported to %s" % path)
+
     def generate_debug_report(self):
         """Write a debug report. Returns the path."""
         path = self.logger.generate_report()
@@ -507,7 +765,7 @@ class MainWindow(QMainWindow):
     def on_reset(self):
         answer = QMessageBox.question(
             self, "Reset",
-            "Clear the trace, the buffer, and W_t back to its start?",
+            "Clear the session and reset W_t?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer == QMessageBox.Yes:
             self.do_reset()

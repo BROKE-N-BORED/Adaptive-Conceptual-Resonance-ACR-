@@ -67,12 +67,20 @@ bash run.sh
    the setting the resonance climb was verified at. Freeze weights
    logs steps without changing W_t. The stability cap bounds each
    update.
-5. Export trace JSON saves the whole trace log as a file.
+5. Export trace JSON saves the whole trace log as a file. Export
+   trace CSV saves the same log as a spreadsheet-friendly file.
 6. The Resonance views tab shows the W_t norm over time (red dots
    are resonance spikes), the change heatmap for one step (pick a
    step to look back, or leave it on the latest), and the layer
    candidates: resonance spikes with the input that triggered them.
    Click a candidate to see its trace entries.
+7. Save session writes the whole session (W_t, buffer, trace,
+   settings) to one JSON file. Load session brings it back exactly
+   where you left off. Export session writes the same session as
+   readable text: the inputs and trace in time order, with the
+   final state at the top.
+8. Reset asks first, then clears the session and puts W_t back to
+   its start.
 
 ## If something breaks
 
