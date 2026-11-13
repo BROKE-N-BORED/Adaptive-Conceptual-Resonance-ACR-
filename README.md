@@ -107,9 +107,11 @@ bash run.sh
     model asks another installed model to continue the theme from
     the most resonant inputs; its words show in the panel,
     labelled with the model name. The button is off while the
-    built-in encoder is active, and nothing is completed when no
-    other model is installed. The completion is on-demand only:
-    stepping never generates anything.
+    built-in encoder is active. The picker lists every installed
+    model and defaults to one that is not the encoder model; when
+    the encoder model is the only one installed, it is the pick.
+    The completion is on-demand only: stepping never generates
+    anything.
 
 ## If something breaks
 
