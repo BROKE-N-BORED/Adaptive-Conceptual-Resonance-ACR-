@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.6.
+"""ACR - Adaptive Contextual Resonance, v0.7.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -21,6 +21,13 @@ v0.6 upgrades the synthesis head: analogies and counter-examples
 built from the session's own buffer and resonance, plus an
 optional completion from another installed local model, labelled
 as that model's words.
+
+v0.7 adds stability and control: freeze modes (whole W_t, or
+individual rank directions), learning-rate schedule presets
+(steady / fast-adapt / gentle), a live top-singular-value readout
+next to the stability cap with a trace flag for steps the cap
+clipped, and revert: roll W_t back to any recent step from the
+trace log.
 """
 
 import csv
@@ -41,8 +48,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from acr_engine import (BUFFER_SIZE, DIM, RANK, Engine,
-                        SESSION_FORMAT_VERSION, SessionError)
+from acr_engine import (BUFFER_SIZE, DIM, RANK, SCHEDULES,
+                        SCHEDULE_STEADY, Engine,
+                        SESSION_FORMAT_VERSION, SessionError,
+                        schedule_alpha)
 from debug_log import DebugLogger, check_ollama
 from local_encoder import (
     MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
@@ -50,11 +59,12 @@ from local_encoder import (
     pick_completion_model, pick_default_model)
 
 APP_NAME = "acr"
-VERSION = "0.6"
+VERSION = "0.7"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
-                 "Resonance", "Alpha", "Confidence", "New layer"]
+                 "Resonance", "Alpha", "Confidence", "New layer",
+                 "Capped"]
 
 CHART_LINE = QColor(31, 78, 121)
 CHART_SPIKE = QColor(192, 57, 43)
@@ -261,10 +271,16 @@ class ChangeHeatmap(QWidget):
         self.setMinimumHeight(130)
         self.values = []
         self.step_id = 0
+        self.note = None
 
-    def set_data(self, values, step_id):
+    def set_data(self, values, step_id, note=None):
+        """Bar values for one step. ``note`` is the message to
+        paint when nothing moved: the app supplies it (first
+        step, frozen step, or a revert that changed nothing), so
+        the painted message always matches the summary line."""
         self.values = list(values)
         self.step_id = step_id
+        self.note = note
         self.update()
 
     def top_rows(self, count=3):
@@ -278,16 +294,23 @@ class ChangeHeatmap(QWidget):
         painter.fillRect(self.rect(), Qt.white)
         if not self.values:
             painter.setPen(CHART_AXIS)
-            painter.drawText(self.rect(), Qt.AlignCenter,
-                             "Step some text to see the heatmap.")
+            # A step with no recorded change data (a session
+            # loaded without heat history) shows the reason, not
+            # the empty-session message.
+            message = (self.note if self.note is not None
+                       else "Step some text to see the heatmap.")
+            painter.drawText(self.rect(), Qt.AlignCenter, message)
             return
         top = set(self.top_rows(3))
         peak = max(self.values)
         if peak <= 0.0:
             painter.setPen(CHART_AXIS)
+            if self.note is not None:
+                message = self.note
             # v0.3: step 1 never moves W_t (no previous state to
-            # predict from), so it is not a frozen step.
-            if self.step_id == 1:
+            # predict from), so it is not a frozen step. Fallback
+            # for callers that pass no note.
+            elif self.step_id == 1:
                 message = ("Step 1: W_t did not move (first step "
                            "has no previous state).")
             else:
@@ -454,11 +477,42 @@ class MainWindow(QMainWindow):
         self.alpha_slider.valueChanged.connect(self._on_alpha_changed)
         left.addWidget(self.alpha_slider)
 
-        self.freeze_check = QCheckBox("Freeze weights (log only, no update)")
-        self.freeze_check.stateChanged.connect(
-            lambda _s: self.logger.action(
-                "freeze toggled: %s" % self.freeze_check.isChecked()))
-        left.addWidget(self.freeze_check)
+        # v0.7: freeze mode and learning-rate schedule share one
+        # row: both are adaptation controls, and the column is
+        # full. Freeze Off adapts as usual; Whole W_t logs steps
+        # without changing W_t; Rank directions freezes only the
+        # checked directions below. The slider sets the base
+        # alpha the schedule scales from.
+        control_row = QHBoxLayout()
+        control_row.addWidget(QLabel("Freeze"))
+        self.freeze_combo = QComboBox()
+        self.freeze_combo.addItems(
+            ["Off", "Whole W_t", "Rank directions"])
+        self.freeze_combo.currentIndexChanged.connect(
+            self._on_freeze_mode_changed)
+        control_row.addWidget(self.freeze_combo)
+        control_row.addWidget(QLabel("Schedule"))
+        self.schedule_combo = QComboBox()
+        self.schedule_combo.addItems(
+            ["Steady", "Fast-adapt", "Gentle"])
+        self.schedule_combo.currentIndexChanged.connect(
+            self._on_schedule_changed)
+        control_row.addWidget(self.schedule_combo, 1)
+        left.addLayout(control_row)
+
+        # Rank-direction toggles, live only in Rank directions
+        # mode. Checked means frozen: that component holds still
+        # while the rest adapt.
+        rank_row = QHBoxLayout()
+        rank_row.addWidget(QLabel("Directions"))
+        self.rank_checks = []
+        for k in range(RANK):
+            check = QCheckBox(str(k + 1))
+            check.setEnabled(False)
+            self.rank_checks.append(check)
+            rank_row.addWidget(check)
+        rank_row.addStretch(1)
+        left.addLayout(rank_row)
 
         cap_row = QHBoxLayout()
         cap_row.addWidget(QLabel("Stability cap"))
@@ -467,6 +521,10 @@ class MainWindow(QMainWindow):
         self.cap_spin.setSingleStep(0.1)
         self.cap_spin.setValue(1.0)
         cap_row.addWidget(self.cap_spin)
+        # v0.7: the top singular value of W_t, live next to the
+        # cap: the size of W_t's strongest direction.
+        self.spectral_label = QLabel("Top singular value: -")
+        cap_row.addWidget(self.spectral_label)
         cap_row.addStretch(1)
         left.addLayout(cap_row)
 
@@ -559,6 +617,15 @@ class MainWindow(QMainWindow):
                     col, QHeaderView.ResizeToContents)
         trace_layout.addWidget(self.trace_table, 3)
 
+        # v0.7: roll W_t back to the state after a selected step.
+        revert_row = QHBoxLayout()
+        self.revert_button = QPushButton(
+            "Revert W_t to selected step")
+        self.revert_button.clicked.connect(self.on_revert)
+        revert_row.addWidget(self.revert_button)
+        revert_row.addStretch(1)
+        trace_layout.addLayout(revert_row)
+
         trace_layout.addWidget(QLabel(
             "Latent state buffer - last %d inputs, newest first"
             % BUFFER_SIZE))
@@ -607,10 +674,51 @@ class MainWindow(QMainWindow):
 
     # -- actions ------------------------------------------------------
     def _alpha(self):
+        """Base learning rate, from the slider."""
         return self.alpha_slider.value() / 100.0
 
-    def _on_alpha_changed(self, value):
-        self.alpha_label.setText("Alpha: %.2f" % (value / 100.0))
+    def _preset(self):
+        """Schedule preset key for the dropdown's current item."""
+        return SCHEDULES[self.schedule_combo.currentIndex()]
+
+    def _effective_alpha(self):
+        """Learning rate the next step will actually use: the base
+        alpha under the current schedule preset."""
+        return schedule_alpha(self._preset(), self._alpha(),
+                              self.engine.step_count + 1)
+
+    def _freeze_mode(self):
+        """Freeze mode key: "off", "whole", or "ranks"."""
+        return ("off", "whole",
+                "ranks")[self.freeze_combo.currentIndex()]
+
+    def _frozen_ranks(self):
+        """Checked rank directions, when the mode is Rank
+        directions; otherwise none."""
+        if self._freeze_mode() != "ranks":
+            return []
+        return [k for k, check in enumerate(self.rank_checks)
+                if check.isChecked()]
+
+    def _refresh_alpha_label(self):
+        # The label shows the effective alpha for the next step,
+        # not the slider value: under Fast-adapt and Gentle the
+        # two differ, and the trace records the effective one.
+        self.alpha_label.setText(
+            "Alpha: %.2f" % self._effective_alpha())
+
+    def _on_alpha_changed(self, _value):
+        self._refresh_alpha_label()
+
+    def _on_schedule_changed(self, _index):
+        self.logger.action("schedule preset: %s" % self._preset())
+        self._refresh_alpha_label()
+
+    def _on_freeze_mode_changed(self, _index):
+        mode = self._freeze_mode()
+        for check in self.rank_checks:
+            check.setEnabled(mode == "ranks")
+        self.logger.action("freeze mode: %s" % mode)
 
     # -- encoder ------------------------------------------------------
     def _set_encoder_ui(self):
@@ -878,9 +986,10 @@ class MainWindow(QMainWindow):
         old_v = [row[:] for row in self.engine.v]
         try:
             entry = self.engine.step(
-                text, alpha=self._alpha(),
-                frozen=self.freeze_check.isChecked(),
-                cap=self.cap_spin.value(), h=h)
+                text, alpha=self._effective_alpha(),
+                frozen=self._freeze_mode() == "whole",
+                cap=self.cap_spin.value(), h=h,
+                frozen_ranks=self._frozen_ranks())
         except Exception:
             self.logger.exception("step failed")
             self.status_label.setText(
@@ -948,7 +1057,12 @@ class MainWindow(QMainWindow):
             "settings": {
                 "alpha": self._alpha(),
                 "cap": self.cap_spin.value(),
-                "frozen": self.freeze_check.isChecked(),
+                # "frozen" stays for older readers: True exactly
+                # when the whole W_t is frozen.
+                "frozen": self._freeze_mode() == "whole",
+                "freeze_mode": self._freeze_mode(),
+                "frozen_ranks": self._frozen_ranks(),
+                "preset": self._preset(),
             },
             "heat_history": [[step_id, list(rows)]
                              for step_id, rows in self._heat_history],
@@ -1068,7 +1182,6 @@ class MainWindow(QMainWindow):
             raise SessionError("that session file has no settings")
         alpha = settings.get("alpha")
         cap = settings.get("cap")
-        frozen = settings.get("frozen")
         if (not isinstance(alpha, (int, float))
                 or isinstance(alpha, bool)
                 or not 0.01 <= alpha <= 0.50):
@@ -1079,9 +1192,31 @@ class MainWindow(QMainWindow):
                 or not 0.1 <= cap <= 5.0):
             raise SessionError(
                 "that session file has a bad stability cap")
-        if not isinstance(frozen, bool):
+        # Freeze: v0.7 files name the mode and the frozen
+        # directions; older files only carry the "frozen" bool,
+        # which maps to the whole-W_t mode.
+        freeze_mode = settings.get("freeze_mode")
+        if freeze_mode is None:
+            frozen = settings.get("frozen")
+            if not isinstance(frozen, bool):
+                raise SessionError(
+                    "that session file has a bad freeze setting")
+            freeze_mode = "whole" if frozen else "off"
+        elif freeze_mode not in ("off", "whole", "ranks"):
             raise SessionError(
                 "that session file has a bad freeze setting")
+        frozen_ranks = settings.get("frozen_ranks", [])
+        if (not isinstance(frozen_ranks, list)
+                or any(not isinstance(k, int)
+                       or isinstance(k, bool)
+                       or not 0 <= k < RANK
+                       for k in frozen_ranks)):
+            raise SessionError(
+                "that session file has a bad freeze setting")
+        preset = settings.get("preset", SCHEDULE_STEADY)
+        if preset not in SCHEDULES:
+            raise SessionError(
+                "that session file has a bad schedule preset")
         heat = self._checked_heat_history(data.get("heat_history"),
                                           encoder_dim)
         # Everything checked: apply it.
@@ -1102,7 +1237,12 @@ class MainWindow(QMainWindow):
         self.logger.set_setting("dim", encoder_dim)
         self.alpha_slider.setValue(int(round(alpha * 100)))
         self.cap_spin.setValue(cap)
-        self.freeze_check.setChecked(frozen)
+        self.freeze_combo.setCurrentIndex(
+            ("off", "whole", "ranks").index(freeze_mode))
+        for k, check in enumerate(self.rank_checks):
+            check.setChecked(k in frozen_ranks)
+        self.schedule_combo.setCurrentIndex(
+            SCHEDULES.index(preset))
         self._heat_history = heat
         self._heat_follow = True
         # A loaded session is a different session: the old
@@ -1174,6 +1314,7 @@ class MainWindow(QMainWindow):
                     "%.2f" % entry["alpha"],
                     "%.4f" % entry["confidence"],
                     "yes" if entry["new_layer"] else "",
+                    "yes" if entry.get("capped") else "",
                 ])
         self.logger.action("trace CSV exported to %s" % path)
         return path
@@ -1230,10 +1371,16 @@ class MainWindow(QMainWindow):
                        entry["new_norm"], entry["resonance"]))
                 lines.append(
                     "  Alpha: %.2f  Confidence: %.4f  New layer: %s  "
-                    "Frozen: %s"
+                    "Frozen: %s  Capped: %s"
                     % (entry["alpha"], entry["confidence"],
                        "yes" if entry["new_layer"] else "no",
-                       "yes" if entry["frozen"] else "no"))
+                       "yes" if entry["frozen"] else "no",
+                       "yes" if entry.get("capped") else "no"))
+                if entry.get("frozen_ranks"):
+                    lines.append(
+                        "  Frozen directions: %s"
+                        % ", ".join(str(k + 1)
+                                    for k in entry["frozen_ranks"]))
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
         self.logger.action("session exported to %s" % path)
@@ -1290,6 +1437,53 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self.do_reset()
 
+    def on_revert(self):
+        """Revert W_t to the selected trace step, after asking.
+
+        Revert discards the current W_t, so it asks first, like
+        Reset. Nothing is selected, or the step has aged out of
+        the revert history, and the status line says so plainly.
+        """
+        row = self.trace_table.currentRow()
+        if row < 0 or row >= len(self.engine.trace):
+            self.status_label.setText(
+                "Pick a step in the trace log first.")
+            return
+        step_id = self.engine.trace[row]["id"]
+        answer = QMessageBox.question(
+            self, "Revert W_t",
+            "Revert W_t to the state after step %d? The current "
+            "W_t will be replaced." % step_id,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.do_revert(step_id)
+
+    def do_revert(self, step_id):
+        """Roll W_t back to the state after one step, no asking.
+
+        Used by on_revert after the confirm dialog, and by tests.
+        The trace keeps a revert entry, so the log shows what
+        happened; later entries are never deleted. A step with no
+        snapshot (aged out of the history) shows a plain message
+        instead.
+        """
+        old_u = [row[:] for row in self.engine.u]
+        old_v = [row[:] for row in self.engine.v]
+        try:
+            entry = self.engine.revert_to(step_id)
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+            return
+        self._heat_history.append(
+            (entry["id"], _row_change_norms(
+                old_u, old_v, self.engine.u, self.engine.v)))
+        self.logger.action(
+            "reverted W_t to step %d: W norm %.3f -> %.3f"
+            % (step_id, entry["old_norm"], entry["new_norm"]))
+        self._refresh_all()
+        self.status_label.setText(
+            "Reverted W_t to step %d." % step_id)
+
     # -- refresh ------------------------------------------------------
     def _refresh_all(self):
         self.step_label.setText("Step: %d" % self.engine.step_count)
@@ -1301,6 +1495,10 @@ class MainWindow(QMainWindow):
                 "Resonance: %.4f" % last["resonance"])
         else:
             self.resonance_label.setText("Resonance: -")
+        self._refresh_alpha_label()
+        self.spectral_label.setText(
+            "Top singular value: %.4f"
+            % self.engine.spectral_norm())
         self._refresh_trace_table()
         self._refresh_buffer_list()
         self._refresh_synthesis()
@@ -1322,6 +1520,7 @@ class MainWindow(QMainWindow):
                 "%.2f" % entry["alpha"],
                 "%.4f" % entry["confidence"],
                 "yes" if entry["new_layer"] else "",
+                "yes" if entry.get("capped") else "",
             ]
             for col, value in enumerate(values):
                 self.trace_table.setItem(
@@ -1411,19 +1610,29 @@ class MainWindow(QMainWindow):
         self.heat_spin.blockSignals(False)
         step_id = self.heat_spin.value()
         rows = self._heat_rows_for(step_id)
-        self.heatmap.set_data(rows, step_id)
         if not rows or max(rows) <= 0.0:
             # v0.3: step 1 never moves W_t (no previous state to
-            # predict from), so it is not a frozen step.
+            # predict from), so it is not a frozen step. v0.7: a
+            # revert that changed nothing is not a frozen step
+            # either. One note drives both the summary line and
+            # the message painted in the heatmap.
+            entry = None
+            if 1 <= step_id <= len(self.engine.trace):
+                entry = self.engine.trace[step_id - 1]
             if step_id == 1:
-                self.heat_summary.setText(
-                    "Step 1: W_t did not move (no previous step "
-                    "to learn from).")
+                note = ("Step 1: W_t did not move (no previous "
+                        "step to learn from).")
+            elif entry is not None and "reverted_to" in entry:
+                note = ("Step %d: reverted to step %d, W_t did "
+                        "not change."
+                        % (step_id, entry["reverted_to"]))
             else:
-                self.heat_summary.setText(
-                    "Step %d: W_t did not move (frozen step)."
-                    % step_id)
+                note = ("Step %d: W_t did not move (frozen step)."
+                        % step_id)
+            self.heatmap.set_data(rows, step_id, note)
+            self.heat_summary.setText(note)
             return
+        self.heatmap.set_data(rows, step_id)
         top = self.heatmap.top_rows(3)
         parts = ["row %d (%.3f)" % (i, rows[i]) for i in top]
         self.heat_summary.setText(
@@ -1475,12 +1684,13 @@ class MainWindow(QMainWindow):
             "  Delta norm: %.4f\n"
             "  W norm: %.4f -> %.4f\n"
             "  Resonance: %.4f  Alpha: %.2f  Confidence: %.4f\n"
-            "  Frozen: %s"
+            "  Frozen: %s  Capped: %s"
             % (label, entry["input"], entry["delta_norm"],
                entry["old_norm"], entry["new_norm"],
                entry["resonance"], entry["alpha"],
                entry["confidence"],
-               "yes" if entry["frozen"] else "no"))
+               "yes" if entry["frozen"] else "no",
+               "yes" if entry.get("capped") else "no"))
 
     def _on_layer_selected(self, current, _previous):
         if current is None:

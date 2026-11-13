@@ -67,13 +67,15 @@ class GuiDriveTests(unittest.TestCase):
         self.assertEqual(self.window.status_label.text(),
                          "Type something first.")
 
-    def test_freeze_stops_norm_change(self):
+    def test_whole_freeze_stops_norm_change(self):
         # v0.2 note: two warm-up steps, because the first step logs
         # without an update (no previous state to predict from).
+        # v0.7: the freeze checkbox is now a mode dropdown; Whole
+        # W_t is the old freeze behaviour.
         self._step_text("warm up the weights first")
         self._step_text("warm them up some more")
         before = self.window.norm_label.text()
-        self.window.freeze_check.setChecked(True)
+        self.window.freeze_combo.setCurrentIndex(1)
         self._step_text("this step is frozen")
         self.assertEqual(self.window.norm_label.text(), before)
         self.assertEqual(self.window.trace_table.rowCount(), 3)

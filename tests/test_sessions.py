@@ -174,7 +174,7 @@ class WindowSessionTests(unittest.TestCase):
             data = json.load(fh)
         self.assertEqual(data["format"], "acr-session")
         self.assertEqual(data["version"], 2)
-        self.assertEqual(data["app_version"], "0.6")
+        self.assertEqual(data["app_version"], "0.7")
         self.assertIn("engine", data)
         self.assertIn("settings", data)
         self.assertIn("heat_history", data)
@@ -217,17 +217,19 @@ class WindowSessionTests(unittest.TestCase):
         self._step_theme(2)
         self.window.alpha_slider.setValue(25)
         self.window.cap_spin.setValue(2.0)
-        self.window.freeze_check.setChecked(True)
+        # v0.7: the freeze checkbox is now a mode dropdown; Whole
+        # W_t is the old freeze behaviour.
+        self.window.freeze_combo.setCurrentIndex(1)
         path = self._path("session.json")
         self.window.save_session_to(path)
         self.window.alpha_slider.setValue(10)
         self.window.cap_spin.setValue(1.0)
-        self.window.freeze_check.setChecked(False)
+        self.window.freeze_combo.setCurrentIndex(0)
         self.window.load_session_from(path)
         self.assertEqual(self.window.alpha_slider.value(), 25)
         self.assertEqual(self.window.alpha_label.text(), "Alpha: 0.25")
         self.assertEqual(self.window.cap_spin.value(), 2.0)
-        self.assertTrue(self.window.freeze_check.isChecked())
+        self.assertEqual(self.window.freeze_combo.currentIndex(), 1)
 
     def test_save_load_restores_views(self):
         # 16 theme steps flags step 15 under the v0.2 engine, so

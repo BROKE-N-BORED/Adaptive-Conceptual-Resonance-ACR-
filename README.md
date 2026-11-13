@@ -68,10 +68,19 @@ bash run.sh
    and the synthesis head shows related past inputs.
 3. Step a few sentences on one theme and watch the resonance climb.
    Switch themes and watch it drop.
-4. Alpha (the slider) sets how fast W_t adapts. It starts at 0.30,
-   the setting the resonance climb was verified at. Freeze weights
-   logs steps without changing W_t. The stability cap bounds each
-   update.
+4. Alpha (the slider) sets the base learning rate: how fast W_t
+   adapts. It starts at 0.30, the setting the resonance climb was
+   verified at. The Schedule picker scales it: Steady keeps the
+   base, Fast-adapt starts at twice the base and settles back to
+   it over the first steps, Gentle runs at one third of the base.
+   The Alpha readout shows the rate the next step will use, and
+   the trace log records it per step. Freeze: Off adapts as
+   usual; Whole W_t logs steps without changing W_t; Rank
+   directions freezes only the checked directions (1-8) while
+   the rest keep adapting. The stability cap bounds each update;
+   the top singular value next to it is the size of W_t's
+   strongest direction, and the Capped column in the trace log
+   marks steps the cap actually clipped.
 5. Export trace JSON saves the whole trace log as a file. Export
    trace CSV saves the same log as a spreadsheet-friendly file.
 6. The Resonance views tab shows the W_t norm over time (red dots
@@ -112,6 +121,12 @@ bash run.sh
     the encoder model is the only one installed, it is the pick.
     The completion is on-demand only: stepping never generates
     anything.
+11. Revert: click a step in the trace log, then Revert W_t to
+    selected step, to roll W_t back to its state after that
+    step. It asks first, and the trace log keeps a revert entry
+    so the history shows what happened. The last 200 steps are
+    kept for reverting; older steps age out. A loaded session
+    starts its revert history from the loaded state.
 
 ## If something breaks
 
@@ -134,6 +149,15 @@ previous sentence, so it is logged without an update. Resonance is
 the cosine between the sentence vector and the top direction of W_t,
 found by power iteration. Confidence is the share of W_t's energy in
 that top direction.
+
+The schedule presets scale the base alpha: Steady is the base,
+Fast-adapt is the base times (1 + 2^(-(n-1)/3)) for step n (twice
+the base on step 1, 1.5x on step 4, 1.25x on step 7, settling on
+the base), Gentle is the base divided by 3. The top singular value
+is the size of W_t's strongest direction; the stability cap bounds
+the size of each update step, not W_t itself. Freezing a rank
+direction holds that component of U and V exactly still: it skips
+both the decay and the gradient step.
 
 The analogy takes the two most resonant past inputs (layer
 candidates first) and applies the direction between them to the

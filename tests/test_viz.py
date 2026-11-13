@@ -126,7 +126,9 @@ class VizTests(unittest.TestCase):
 
     def test_heatmap_frozen_step_is_zero(self):
         self._step_text("warm up the weights first")
-        self.window.freeze_check.setChecked(True)
+        # v0.7: the freeze checkbox is now a mode dropdown; Whole
+        # W_t is the old freeze behaviour.
+        self.window.freeze_combo.setCurrentIndex(1)
         self._step_text("this step is frozen")
         heatmap = self.window.heatmap
         self.assertEqual(heatmap.step_id, 2)

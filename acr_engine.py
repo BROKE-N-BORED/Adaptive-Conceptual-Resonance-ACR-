@@ -68,6 +68,17 @@ the 8x8 matrix (U^T U)(V^T V), whose top eigenvector lifts to
 W_t's top right singular vector through V. Same numbers, same
 rule, a fraction of the work. The naive forms (_materialize_w,
 _dominant_direction) stay for the tests that compare the two.
+
+v0.7 adds stability and control, without changing the update
+rule: per-direction freezing (individual rank components can be
+held still while the rest adapt), learning-rate schedule presets
+(steady / fast-adapt / gentle, computed by schedule_alpha), a
+spectral-norm readout (the top singular value of W_t), a trace
+flag for steps the stability cap actually clipped, and revert:
+the engine keeps a bounded snapshot history of (U, V) after each
+step, so W_t can be rolled back to any recent step. Snapshots are
+not saved in session files: a loaded session starts its revert
+history from the loaded state.
 """
 
 import hashlib
@@ -90,6 +101,19 @@ RESONANCE_JUMP = 0.25
 RESONANT_FLOOR = 0.4
 PREVIEW_LEN = 80
 SESSION_FORMAT_VERSION = 2
+# v0.7: revert keeps the last SNAPSHOT_LIMIT step states. Each
+# snapshot is two dim x rank factor matrices; at dim 768 that is
+# about 100 KB per step in plain floats, so 200 steps is a
+# reasonable bound on an 8 GB machine.
+SNAPSHOT_LIMIT = 200
+# v0.7: learning-rate schedule presets. Steady is the current
+# behaviour (constant base alpha). Fast-adapt starts at twice the
+# base and decays toward it over the first steps. Gentle runs at
+# one third of the base throughout. See schedule_alpha.
+SCHEDULE_STEADY = "steady"
+SCHEDULE_FAST = "fast-adapt"
+SCHEDULE_GENTLE = "gentle"
+SCHEDULES = (SCHEDULE_STEADY, SCHEDULE_FAST, SCHEDULE_GENTLE)
 
 TRACE_KEYS = ("id", "input", "delta_norm", "old_norm", "new_norm",
               "resonance", "alpha", "confidence", "new_layer",
@@ -312,7 +336,29 @@ def _checked_trace(value, step_count):
                 or entry.get("id") != i + 1
                 or any(key not in entry for key in TRACE_KEYS)):
             raise SessionError("the session data has a bad trace log")
-        out.append(dict(entry))
+        entry = dict(entry)
+        # v0.7 keys, absent from older files: fill the defaults
+        # (no frozen directions, cap never bit) and validate the
+        # types when the keys are present.
+        ranks = entry.get("frozen_ranks", [])
+        if (not isinstance(ranks, list)
+                or any(not isinstance(k, int)
+                       or isinstance(k, bool)
+                       or not 0 <= k < RANK for k in ranks)):
+            raise SessionError("the session data has a bad trace log")
+        entry["frozen_ranks"] = sorted(set(ranks))
+        capped = entry.get("capped", False)
+        if not isinstance(capped, bool):
+            raise SessionError("the session data has a bad trace log")
+        entry["capped"] = capped
+        if "reverted_to" in entry:
+            target = entry["reverted_to"]
+            if (not isinstance(target, int)
+                    or isinstance(target, bool)
+                    or not 1 <= target < entry["id"]):
+                raise SessionError(
+                    "the session data has a bad trace log")
+        out.append(entry)
     return out
 
 
@@ -330,6 +376,26 @@ def _checked_buffer(value, dim):
     return out
 
 
+def schedule_alpha(preset, base, step_number):
+    """Effective learning rate for one step under a preset.
+
+    ``preset`` is one of SCHEDULES, ``base`` the slider value,
+    ``step_number`` the 1-based number of the step about to run.
+    Steady is the base, constant. Fast-adapt starts at twice the
+    base and halves the excess every 3 steps: step 1 is 2x, step
+    4 is 1.5x, step 7 is 1.25x, step 10 is 1.125x, settling on the
+    base. Gentle is one third of the base, constant. Raises
+    ValueError on an unknown preset.
+    """
+    if preset == SCHEDULE_STEADY:
+        return base
+    if preset == SCHEDULE_GENTLE:
+        return base / 3.0
+    if preset == SCHEDULE_FAST:
+        return base * (1.0 + 2.0 ** (-(step_number - 1) / 3.0))
+    raise ValueError("unknown schedule preset: %r" % (preset,))
+
+
 # ---------------------------------------------------------------- engine
 
 
@@ -342,15 +408,17 @@ class Engine:
     cannot run at another.
     """
 
-    def __init__(self, dim=DIM):
+    def __init__(self, dim=DIM, snapshot_limit=SNAPSHOT_LIMIT):
         self.dim = dim
+        self.snapshot_limit = snapshot_limit
         self.reset()
 
     def reset(self):
         """Back to the initial W_t, empty buffer, empty trace.
 
         Keeps the dim: a reset is the same encoder starting over,
-        not a different encoder.
+        not a different encoder. The revert snapshots go too: a
+        reset session has no past to roll back to.
         """
         rng = random.Random(SEED)
         self.u = [[rng.gauss(0.0, 0.1) for _ in range(RANK)]
@@ -362,6 +430,11 @@ class Engine:
         self.h_prev = None
         self.prev_resonance = None
         self.step_count = 0
+        # Revert snapshots: step id -> (u copy, v copy), bounded
+        # to the last snapshot_limit steps. Not part of the saved
+        # session: a loaded session starts its history from the
+        # loaded state.
+        self._snapshots = {}
 
     def state_dict(self):
         """Full engine state as a JSON-ready dict.
@@ -429,17 +502,112 @@ class Engine:
         self.step_count = step_count
         self.trace = trace
         self.buffer = buffer
+        # Snapshots are not saved in session files: the revert
+        # history restarts from the loaded state, which is the
+        # state after the last step in the file.
+        self._snapshots = {}
+        if step_count > 0:
+            self._snapshot(step_count)
 
     def w_norm(self):
         return _frobenius_uv(self.u, self.v)
 
-    def step(self, text, alpha=0.1, frozen=False, cap=1.0, h=None):
+    def spectral_norm(self):
+        """Top singular value of W_t: the size of its strongest
+        direction. The square root of the top eigenvalue of
+        W^T W, from the rank-space power iteration."""
+        _direction, top_eigen = _dominant_direction_uv(self.u,
+                                                       self.v)
+        return math.sqrt(max(0.0, top_eigen))
+
+    def _snapshot(self, step_id):
+        """Record the current (U, V) under one step id, keeping
+        only the last snapshot_limit steps."""
+        self._snapshots[step_id] = (
+            [row[:] for row in self.u],
+            [row[:] for row in self.v])
+        while len(self._snapshots) > self.snapshot_limit:
+            oldest = next(iter(self._snapshots))
+            del self._snapshots[oldest]
+
+    def snapshot_step_ids(self):
+        """Step ids W_t can still be reverted to, oldest first."""
+        return sorted(self._snapshots)
+
+    def revert_to(self, step_id):
+        """Roll W_t back to its state after the given step.
+
+        Returns the new trace entry, which is marked with
+        "reverted_to" so the log stays honest: later entries are
+        never deleted. The input flow is untouched (h_prev and
+        the buffer stay), so the next step continues from the
+        reverted W_t. Raises ValueError with a plain message when
+        the step has no snapshot: either it never existed, or it
+        aged out of the bounded history.
+        """
+        if step_id not in self._snapshots:
+            if (not isinstance(step_id, int)
+                    or isinstance(step_id, bool)
+                    or step_id < 1
+                    or step_id > self.step_count):
+                raise ValueError(
+                    "there is no step %s" % (step_id,))
+            raise ValueError(
+                "step %d has aged out of the revert history "
+                "(the last %d steps are kept)"
+                % (step_id, self.snapshot_limit))
+        old_norm = self.w_norm()
+        snap_u, snap_v = self._snapshots[step_id]
+        self.u = [row[:] for row in snap_u]
+        self.v = [row[:] for row in snap_v]
+        new_norm = _frobenius_uv(self.u, self.v)
+        direction, top_eigen = _dominant_direction_uv(self.u,
+                                                      self.v)
+        if self.h_prev is None or _norm(self.h_prev) == 0.0:
+            resonance = 0.0
+        else:
+            resonance = abs(_dot(self.h_prev, direction))
+            resonance = max(0.0, min(1.0, resonance))
+        if new_norm > 0.0:
+            confidence = top_eigen / (new_norm * new_norm)
+            confidence = max(0.0, min(1.0, confidence))
+        else:
+            confidence = 0.0
+        self.step_count += 1
+        entry = {
+            "id": self.step_count,
+            "input": "Revert to step %d" % step_id,
+            "delta_norm": 0.0,
+            "old_norm": round(old_norm, 6),
+            "new_norm": round(new_norm, 6),
+            "resonance": round(resonance, 6),
+            "alpha": 0.0,
+            "confidence": round(confidence, 6),
+            "new_layer": False,
+            "frozen": False,
+            "frozen_ranks": [],
+            "capped": False,
+            "reverted_to": step_id,
+        }
+        self.trace.append(entry)
+        self.prev_resonance = resonance
+        self._snapshot(self.step_count)
+        return entry
+
+    def step(self, text, alpha=0.1, frozen=False, cap=1.0, h=None,
+             frozen_ranks=None):
         """Run one adaptive step on the given text.
 
         Returns the trace entry for this step. When frozen, W_t is
         not updated but the step is still logged. The first step is
         also logged without an update: with no previous state there
         is no drift to learn from and nothing to predict.
+
+        ``frozen_ranks`` is a list of rank-component indexes
+        (0..RANK-1) to hold still: those components skip both the
+        decay and the gradient step, so their values are exactly
+        unchanged, while the rest adapt as usual. An index outside
+        the range is a programming error and fails loudly.
 
         ``h`` is a precomputed embedding (from the local model
         service); when it is None the built-in encoder runs. A
@@ -448,6 +616,13 @@ class Engine:
         to fall back on: stepping it without h is a programming
         error, and fails loudly instead of silently mixing dims.
         """
+        ranks = sorted(set(frozen_ranks or ()))
+        for k in ranks:
+            if (not isinstance(k, int) or isinstance(k, bool)
+                    or not 0 <= k < RANK):
+                raise ValueError(
+                    "rank direction %r is not in 0..%d"
+                    % (k, RANK - 1))
         if h is None:
             if self.dim != DIM:
                 raise ValueError(
@@ -465,12 +640,14 @@ class Engine:
         delta_norm = _norm(delta)
         old_norm = self.w_norm()
 
+        capped = False
         if not frozen and self.h_prev is not None:
             # The residual gates the step: a big semantic drift
             # earns the full learning rate, a tiny drift earns
             # almost nothing.
             gated_alpha = alpha * min(1.0, delta_norm)
-            self._update(self.h_prev, h, gated_alpha, cap)
+            capped = self._update(self.h_prev, h, gated_alpha,
+                                  cap, ranks)
 
         # Norm and dominant direction from the low-rank forms: no
         # full matrix is ever formed, which is what keeps dim 768
@@ -511,8 +688,11 @@ class Engine:
             "confidence": round(confidence, 6),
             "new_layer": new_layer,
             "frozen": frozen,
+            "frozen_ranks": ranks,
+            "capped": capped,
         }
         self.trace.append(entry)
+        self._snapshot(self.step_count)
         self.buffer.append({"text": text[:PREVIEW_LEN], "vector": h})
         if len(self.buffer) > BUFFER_SIZE:
             self.buffer.pop(0)
@@ -520,7 +700,7 @@ class Engine:
         self.prev_resonance = resonance
         return entry
 
-    def _update(self, h_prev, h, alpha, cap):
+    def _update(self, h_prev, h, alpha, cap, frozen_ranks=()):
         """Gradient step on L = 0.5 * ||W h_prev - h||^2, via U and V.
 
         This is the blueprint's rule with L defined as next-embedding
@@ -532,10 +712,20 @@ class Engine:
         The step size is capped: if alpha times the update norm
         would exceed the stability cap, the update is scaled down
         to it.
+
+        ``frozen_ranks`` holds rank-component indexes to hold
+        still: they skip both the decay and the gradient step, so
+        their values are exactly unchanged, and they do not count
+        toward the update norm the cap is measured against (they
+        are not part of the step being taken). Returns True when
+        the cap actually clipped the update, False otherwise.
         """
+        frozen = set(frozen_ranks)
         decay = 1.0 - 0.005
         for i in range(self.dim):
             for k in range(RANK):
+                if k in frozen:
+                    continue
                 self.u[i][k] *= decay
                 self.v[i][k] *= decay
         # a = V^T h_prev, z = U a, err = z - h
@@ -548,10 +738,15 @@ class Engine:
         ut = _transpose(self.u)
         ut_err = _matvec(ut, err)
         dv = _outer(h_prev, ut_err)
+        for i in range(self.dim):
+            for k in frozen:
+                du[i][k] = 0.0
+                dv[i][k] = 0.0
         update_norm = math.sqrt(_frobenius(du) ** 2
                                 + _frobenius(dv) ** 2)
         step_size = alpha * update_norm
-        if step_size > cap and step_size > 0.0:
+        clipped = step_size > cap and step_size > 0.0
+        if clipped:
             scale = cap / step_size
         else:
             scale = 1.0
@@ -560,6 +755,7 @@ class Engine:
             for k in range(RANK):
                 self.u[i][k] -= eff * du[i][k]
                 self.v[i][k] -= eff * dv[i][k]
+        return clipped
 
     def resonant_entries(self, count=None):
         """Buffer entries from high-resonance steps, best first.
@@ -572,15 +768,19 @@ class Engine:
         best-ranked copy), so an analogy's two ends are always
         two different inputs. `count` caps the list. The buffer
         holds the last N inputs in step order, so buffer item j
-        is the trace entry for step (step_count - N + j + 1).
+        is the j-th of the last N real steps: revert entries are
+        not steps and carry no input, so they are filtered out
+        before the mapping (without that, a revert would shift
+        every buffer item onto the wrong trace entry).
         """
         if not self.buffer:
             return []
+        steps = [e for e in self.trace if "reverted_to" not in e]
         n = len(self.buffer)
         ranked = []
         for j, item in enumerate(self.buffer):
-            step_id = self.step_count - n + j + 1
-            entry = self.trace[step_id - 1]
+            entry = steps[len(steps) - n + j]
+            step_id = entry["id"]
             if entry["resonance"] >= RESONANT_FLOOR:
                 ranked.append((item["text"], item["vector"],
                                entry["resonance"],
