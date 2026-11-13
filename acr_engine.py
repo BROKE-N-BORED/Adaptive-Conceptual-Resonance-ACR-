@@ -5,6 +5,11 @@ loop, not a full neural engine:
 
 - Encoder: deterministic hashed word vectors, dim 64. Same input
   always gives the same vector. No downloads, no model files.
+  Since v0.5 the engine also accepts embeddings from the local
+  model service, at whatever dim that model returns: the engine
+  dim is set at construction (Engine(dim=...)) and step() takes
+  an optional precomputed vector h. The update rule is unchanged;
+  only the embedding source differs.
 - Dynamic weight matrix W_t: low-rank U V^T, rank 8. Each input step
   updates the factors by the blueprint's rule (section 2, steps 2-3):
   the residual signal is the drift D = h - h_prev, and the update is
@@ -47,6 +52,18 @@ unresolved; v0.2 replaces it with the D-driven rule above.
 Nothing here trains a language model. The synthesis head in the app
 surfaces related past inputs from the session buffer; it does not
 generate text from general knowledge.
+
+A note on cost: at the built-in dim 64 the naive O(dim^2) math is
+fast, but a local embedding model returns dim 768, where forming
+the full W_t and iterating on it costs about 5 seconds per step.
+Since W_t is low-rank (rank 8), the norm and the dominant
+direction are computed in the rank-8 space instead: the Frobenius
+norm from the Gram matrices (||W||_F^2 is the trace of
+(V^T V)(U^T U)), and the dominant direction by power iteration on
+the 8x8 matrix (U^T U)(V^T V), whose top eigenvector lifts to
+W_t's top right singular vector through V. Same numbers, same
+rule, a fraction of the work. The naive forms (_materialize_w,
+_dominant_direction) stay for the tests that compare the two.
 """
 
 import hashlib
@@ -61,7 +78,7 @@ SEED = 20261112
 RESONANCE_THRESHOLD = 0.75
 RESONANCE_JUMP = 0.25
 PREVIEW_LEN = 80
-SESSION_FORMAT_VERSION = 1
+SESSION_FORMAT_VERSION = 2
 
 TRACE_KEYS = ("id", "input", "delta_norm", "old_norm", "new_norm",
               "resonance", "alpha", "confidence", "new_layer",
@@ -141,9 +158,82 @@ def _outer(a, b):
 
 
 def _materialize_w(u, v):
-    """W = U V^T as a full DIM x DIM matrix."""
+    """W = U V^T as a full dim x dim matrix.
+
+    Naive form, kept for the tests. The engine itself never forms
+    W: the norm and dominant direction use the low-rank forms
+    below, which is what makes dim 768 usable.
+    """
+    dim = len(u)
     return [[sum(u[i][k] * v[j][k] for k in range(RANK))
-             for j in range(DIM)] for i in range(DIM)]
+             for j in range(dim)] for i in range(dim)]
+
+
+def _gram(a, b):
+    """A^T B for two dim x RANK matrices: a RANK x RANK matrix."""
+    return [[sum(a[i][p] * b[i][q] for i in range(len(a)))
+             for q in range(RANK)] for p in range(RANK)]
+
+
+def _frobenius_uv(u, v):
+    """||U V^T||_F without forming the matrix.
+
+    ||W||_F^2 is the trace of W^T W, which for W = U V^T is the
+    trace of (V^T V)(U^T U): a sum over two RANK x RANK Gram
+    matrices. Same number as _frobenius(_materialize_w(u, v)),
+    up to float rounding.
+    """
+    utu = _gram(u, u)
+    vtv = _gram(v, v)
+    total = 0.0
+    for p in range(RANK):
+        for q in range(RANK):
+            total += utu[p][q] * vtv[p][q]
+    return math.sqrt(max(0.0, total))
+
+
+def _dominant_direction_uv(u, v):
+    """Top right singular vector of W = U V^T, via the rank space.
+
+    The right singular vectors of W live in the column space of
+    V, so the power iteration runs on the RANK x RANK matrix
+    M = (U^T U)(V^T V): its top eigenvector c lifts to W's top
+    right singular vector as V c, normalized. Returns (vector,
+    eigenvalue) like _dominant_direction: the vector is a unit
+    vector in R^dim, the eigenvalue is the squared top singular
+    value.
+    """
+    dim = len(u)
+    utu = _gram(u, u)
+    vtv = _gram(v, v)
+    mat = [[sum(utu[i][k] * vtv[k][j] for k in range(RANK))
+            for j in range(RANK)] for i in range(RANK)]
+    rng = random.Random(SEED + 1)
+    coeffs = _normalize([rng.gauss(0.0, 1.0) for _ in range(RANK)])
+    # 200 iterations here costs nothing (8x8 matvecs) and drives
+    # the direction to the naive form's accuracy. The naive form
+    # stops at 30, which under-converges when the top two singular
+    # values are close; the cheap form can afford to converge.
+    for _ in range(200):
+        nxt = _matvec(mat, coeffs)
+        n = _norm(nxt)
+        if n == 0.0:
+            # W is (numerically) zero: no dominant direction.
+            # Mirror _dominant_direction's fallback.
+            fallback = _normalize(
+                [rng.gauss(0.0, 1.0) for _ in range(dim)])
+            return fallback, 0.0
+        coeffs = [x / n for x in nxt]
+    vec = _matvec(v, coeffs)
+    n = _norm(vec)
+    if n == 0.0:
+        fallback = _normalize(
+            [rng.gauss(0.0, 1.0) for _ in range(dim)])
+        return fallback, 0.0
+    vec = [x / n for x in vec]
+    # lambda = ||W v||^2, with W v = U (V^T v).
+    lam = _norm(_matvec(u, _matvec(_transpose(v), vec))) ** 2
+    return vec, max(0.0, lam)
 
 
 def _dominant_direction(w):
@@ -156,7 +246,7 @@ def _dominant_direction(w):
     """
     wt = _transpose(w)
     rng = random.Random(SEED + 1)
-    vec = _normalize([rng.gauss(0.0, 1.0) for _ in range(DIM)])
+    vec = _normalize([rng.gauss(0.0, 1.0) for _ in range(len(w))])
     for _ in range(30):
         nxt = _matvec(wt, _matvec(w, vec))
         n = _norm(nxt)
@@ -178,8 +268,8 @@ def _is_number(value):
             and not isinstance(value, bool))
 
 
-def _checked_factors(value, name):
-    if (not isinstance(value, list) or len(value) != DIM):
+def _checked_factors(value, name, dim):
+    if (not isinstance(value, list) or len(value) != dim):
         raise SessionError(
             "the session data has a bad %s matrix" % name)
     out = []
@@ -192,10 +282,10 @@ def _checked_factors(value, name):
     return out
 
 
-def _checked_vector(value, name, allow_none=False):
+def _checked_vector(value, name, dim, allow_none=False):
     if value is None and allow_none:
         return None
-    if (not isinstance(value, list) or len(value) != DIM
+    if (not isinstance(value, list) or len(value) != dim
             or not all(_is_number(x) for x in value)):
         raise SessionError(
             "the session data has a bad %s vector" % name)
@@ -215,7 +305,7 @@ def _checked_trace(value, step_count):
     return out
 
 
-def _checked_buffer(value):
+def _checked_buffer(value, dim):
     if not isinstance(value, list) or len(value) > BUFFER_SIZE:
         raise SessionError("the session data has a bad buffer")
     out = []
@@ -225,7 +315,7 @@ def _checked_buffer(value):
             raise SessionError("the session data has a bad buffer")
         out.append({"text": item["text"],
                     "vector": _checked_vector(item.get("vector"),
-                                              "buffer")})
+                                              "buffer", dim)})
     return out
 
 
@@ -233,18 +323,29 @@ def _checked_buffer(value):
 
 
 class Engine:
-    """One ACR session: encoder, W_t, buffer, trace log."""
+    """One ACR session: encoder, W_t, buffer, trace log.
 
-    def __init__(self):
+    ``dim`` is the embedding size: 64 for the built-in encoder,
+    whatever the local model returns otherwise. Switching encoders
+    means a new engine: the factors, buffer, and trace of one dim
+    cannot run at another.
+    """
+
+    def __init__(self, dim=DIM):
+        self.dim = dim
         self.reset()
 
     def reset(self):
-        """Back to the initial W_t, empty buffer, empty trace."""
+        """Back to the initial W_t, empty buffer, empty trace.
+
+        Keeps the dim: a reset is the same encoder starting over,
+        not a different encoder.
+        """
         rng = random.Random(SEED)
         self.u = [[rng.gauss(0.0, 0.1) for _ in range(RANK)]
-                  for _ in range(DIM)]
+                  for _ in range(self.dim)]
         self.v = [[rng.gauss(0.0, 0.1) for _ in range(RANK)]
-                  for _ in range(DIM)]
+                  for _ in range(self.dim)]
         self.trace = []
         self.buffer = []  # list of {"text": preview, "vector": h}
         self.h_prev = None
@@ -254,14 +355,16 @@ class Engine:
     def state_dict(self):
         """Full engine state as a JSON-ready dict.
 
-        Everything needed to resume this exact session: the W_t
-        factors, the previous embedding and resonance (the next
-        step predicts from them), the step count, the whole trace
-        log, and the buffer with its vectors. Deep copies: mutating
-        the dict never touches the engine. The format version lives
-        in the session file around this dict, not here.
+        Everything needed to resume this exact session: the dim,
+        the W_t factors, the previous embedding and resonance (the
+        next step predicts from them), the step count, the whole
+        trace log, and the buffer with its vectors. Deep copies:
+        mutating the dict never touches the engine. The format
+        version lives in the session file around this dict, not
+        here.
         """
         return {
+            "dim": self.dim,
             "u": [row[:] for row in self.u],
             "v": [row[:] for row in self.v],
             "h_prev": (list(self.h_prev)
@@ -279,14 +382,23 @@ class Engine:
 
         Validates everything before touching the engine, so a bad
         file leaves the current session intact. Raises SessionError
-        with a plain message on anything malformed.
+        with a plain message on anything malformed. The state's
+        dim must match this engine's dim: a state saved at another
+        dim belongs to a different encoder, never load it into
+        this one. (v0.4 states carry no dim key; the app loads
+        those into a dim-64 engine, which is what they were.)
         """
         if not isinstance(state, dict):
             raise SessionError("the session data is not an object")
-        u = _checked_factors(state.get("u"), "u")
-        v = _checked_factors(state.get("v"), "v")
+        dim = state.get("dim")
+        if dim is not None and dim != self.dim:
+            raise SessionError(
+                "the session data is for a different embedding "
+                "size")
+        u = _checked_factors(state.get("u"), "u", self.dim)
+        v = _checked_factors(state.get("v"), "v", self.dim)
         h_prev = _checked_vector(state.get("h_prev"), "h_prev",
-                                 allow_none=True)
+                                 self.dim, allow_none=True)
         prev_resonance = state.get("prev_resonance")
         if (prev_resonance is not None
                 and not isinstance(prev_resonance, (int, float))):
@@ -298,7 +410,7 @@ class Engine:
                 or step_count < 0):
             raise SessionError("the session data has a bad step_count")
         trace = _checked_trace(state.get("trace"), step_count)
-        buffer = _checked_buffer(state.get("buffer"))
+        buffer = _checked_buffer(state.get("buffer"), self.dim)
         self.u = u
         self.v = v
         self.h_prev = h_prev
@@ -308,17 +420,33 @@ class Engine:
         self.buffer = buffer
 
     def w_norm(self):
-        return _frobenius(_materialize_w(self.u, self.v))
+        return _frobenius_uv(self.u, self.v)
 
-    def step(self, text, alpha=0.1, frozen=False, cap=1.0):
+    def step(self, text, alpha=0.1, frozen=False, cap=1.0, h=None):
         """Run one adaptive step on the given text.
 
         Returns the trace entry for this step. When frozen, W_t is
         not updated but the step is still logged. The first step is
         also logged without an update: with no previous state there
         is no drift to learn from and nothing to predict.
+
+        ``h`` is a precomputed embedding (from the local model
+        service); when it is None the built-in encoder runs. A
+        supplied h must match this engine's dim, and an engine
+        whose dim is not the built-in 64 has no built-in encoder
+        to fall back on: stepping it without h is a programming
+        error, and fails loudly instead of silently mixing dims.
         """
-        h = encode(text)
+        if h is None:
+            if self.dim != DIM:
+                raise ValueError(
+                    "engine dim %d needs a supplied embedding"
+                    % self.dim)
+            h = encode(text)
+        elif len(h) != self.dim:
+            raise ValueError(
+                "embedding dim %d does not match engine dim %d"
+                % (len(h), self.dim))
         if self.h_prev is None:
             delta = list(h)
         else:
@@ -333,11 +461,12 @@ class Engine:
             gated_alpha = alpha * min(1.0, delta_norm)
             self._update(self.h_prev, h, gated_alpha, cap)
 
-        # Materialize W_t once and reuse it for the norm and the
-        # dominant direction.
-        w = _materialize_w(self.u, self.v)
-        new_norm = _frobenius(w)
-        direction, top_eigen = _dominant_direction(w)
+        # Norm and dominant direction from the low-rank forms: no
+        # full matrix is ever formed, which is what keeps dim 768
+        # fast.
+        new_norm = _frobenius_uv(self.u, self.v)
+        direction, top_eigen = _dominant_direction_uv(self.u,
+                                                      self.v)
         if _norm(h) == 0.0:
             resonance = 0.0
         else:
@@ -394,7 +523,7 @@ class Engine:
         to it.
         """
         decay = 1.0 - 0.005
-        for i in range(DIM):
+        for i in range(self.dim):
             for k in range(RANK):
                 self.u[i][k] *= decay
                 self.v[i][k] *= decay
@@ -416,7 +545,7 @@ class Engine:
         else:
             scale = 1.0
         eff = alpha * scale
-        for i in range(DIM):
+        for i in range(self.dim):
             for k in range(RANK):
                 self.u[i][k] -= eff * du[i][k]
                 self.v[i][k] -= eff * dv[i][k]

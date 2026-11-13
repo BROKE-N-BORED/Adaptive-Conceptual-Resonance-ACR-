@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build acr-v0.4.zip with correct stored file modes.
+"""Build acr-v0.5.zip with correct stored file modes.
 
 Scripts and launchers are stored as 0o100755 (regular file + exec
 bits, so GUI extractors keep the exec bit); everything else is
@@ -12,8 +12,8 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.4"
-ZIP_NAME = "acr-v0.4.zip"
+VERSION = "0.5"
+ZIP_NAME = "acr-v0.5.zip"
 
 EXEC_FILES = {
     "install.sh",
@@ -25,6 +25,7 @@ EXEC_FILES = {
 PLAIN_FILES = [
     "acr_app.py",
     "acr_engine.py",
+    "local_encoder.py",
     "debug_log.py",
     "build_zip.py",
     "README.md",
@@ -38,6 +39,7 @@ PLAIN_FILES = [
     "tests/test_gui.py",
     "tests/test_viz.py",
     "tests/test_sessions.py",
+    "tests/test_local_encoder.py",
 ]
 
 

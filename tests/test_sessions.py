@@ -173,8 +173,8 @@ class WindowSessionTests(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual(data["format"], "acr-session")
-        self.assertEqual(data["version"], 1)
-        self.assertEqual(data["app_version"], "0.4")
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["app_version"], "0.5")
         self.assertIn("engine", data)
         self.assertIn("settings", data)
         self.assertIn("heat_history", data)

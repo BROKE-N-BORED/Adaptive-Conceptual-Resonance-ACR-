@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.4.
+"""ACR - Adaptive Contextual Resonance, v0.5.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -10,29 +10,42 @@ What this is: a real, runnable prototype of the blueprint's core
 loop (encoder, low-rank W_t updates, resonance detection, trace log).
 What it is not: a full self-evolving neural engine. That does not
 exist yet, and this app does not claim to be it.
+
+v0.5 adds an optional local-model encoder: when the local model
+service is running on this computer, its embeddings can replace
+the built-in encoder. The built-in encoder stays the default and
+the fallback. Switching encoders starts a fresh W_t, because the
+embedding sizes differ.
 """
 
 import csv
 import json
 import math
 import os
+import shutil
 import sys
+import time
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QProcess, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QListWidget, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSlider, QSpinBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QSlider, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from acr_engine import (BUFFER_SIZE, DIM, RANK, Engine,
                         SESSION_FORMAT_VERSION, SessionError)
 from debug_log import DebugLogger, check_ollama
+from local_encoder import (
+    MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
+    MSG_START_FAILED, LocalModelClient, LocalModelError,
+    pick_default_model)
 
 APP_NAME = "acr"
-VERSION = "0.4"
+VERSION = "0.5"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
@@ -49,22 +62,102 @@ HEAT_HIGH = QColor(31, 78, 121)
 def _row_change_norms(old_u, old_v, new_u, new_v):
     """Per-row Frobenius norm of W_new - W_old, where W = U V^T.
 
-    Row i of W is (u[i] . v[j]) over j, so each row's change is
-    computed directly from the factors without forming either full
-    matrix. Read-only: it never touches the engine's factors.
+    Row i of W_new - W_old is a combination of the columns of
+    V_new and V_old with coefficients (u_new[i], -u_old[i]), so
+    its squared norm is a quadratic form in the 2*rank Gram matrix
+    of those columns. Same numbers as the naive dim x dim form,
+    without forming either matrix: at dim 768 the naive form costs
+    seconds per step, this one costs milliseconds. Read-only: it
+    never touches the engine's factors.
     """
+    dim = len(old_u)
+    # Gram of the 2*rank columns [new_v | old_v].
+    cols = []
+    for k in range(RANK):
+        cols.append([new_v[i][k] for i in range(dim)])
+    for k in range(RANK):
+        cols.append([old_v[i][k] for i in range(dim)])
+    size = 2 * RANK
+    gram = [[0.0] * size for _ in range(size)]
+    for p in range(size):
+        for q in range(p, size):
+            total = 0.0
+            cp = cols[p]
+            cq = cols[q]
+            for i in range(dim):
+                total += cp[i] * cq[i]
+            gram[p][q] = total
+            gram[q][p] = total
     rows = []
-    for i in range(DIM):
+    for i in range(dim):
+        coeff = list(new_u[i]) + [-x for x in old_u[i]]
         total = 0.0
-        for j in range(DIM):
-            old = 0.0
-            new = 0.0
-            for k in range(RANK):
-                old += old_u[i][k] * old_v[j][k]
-                new += new_u[i][k] * new_v[j][k]
-            total += (new - old) ** 2
-        rows.append(math.sqrt(total))
+        for p in range(size):
+            inner = 0.0
+            row = gram[p]
+            for q in range(size):
+                inner += row[q] * coeff[q]
+            total += coeff[p] * inner
+        # Rounding leaves a zero change a hair off zero (either
+        # sign). Real row changes are orders of magnitude above
+        # 1e-12, so anything below it is no change at all -- and
+        # the heatmap's "did not move" message depends on exact
+        # zeros for frozen steps.
+        value = math.sqrt(max(0.0, total))
+        rows.append(value if value > 1e-12 else 0.0)
     return rows
+
+
+class LocalServiceManager:
+    """Starts the local model service from inside ACR.
+
+    Follows the DUO v0.10 server-manager shape: already running
+    (by anyone) counts as success, nothing is spawned twice, and
+    start() waits on the probe up to START_TIMEOUT. The service
+    runs detached (QProcess.startDetached), so it keeps running
+    after ACR closes and ACR never stops it: a service the user
+    started another way is never touched either. start() returns
+    (ok, message) with a plain-language message, and never raises.
+    It blocks while waiting, pumping the event loop so the window
+    stays alive.
+    """
+
+    START_TIMEOUT = 15.0
+    PROBE_INTERVAL = 0.5
+
+    def __init__(self, client):
+        self.client = client
+
+    def start(self, timeout=None):
+        """Start the service if it is not already answering."""
+        if timeout is None:
+            timeout = self.START_TIMEOUT
+        try:
+            if self.client.probe():
+                return True, "The local model service is running."
+        except Exception:
+            pass
+        if shutil.which("ollama") is None:
+            return False, MSG_SERVICE_NOT_INSTALLED
+        try:
+            result = QProcess.startDetached("ollama", ["serve"])
+        except Exception:
+            return False, MSG_START_FAILED
+        started = result[0] if isinstance(result, tuple) else result
+        if not started:
+            return False, MSG_START_FAILED
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+            try:
+                if self.client.probe(timeout=2):
+                    return True, "The local model service is running."
+            except Exception:
+                pass
+            time.sleep(self.PROBE_INTERVAL)
+        return False, MSG_START_FAILED
 
 
 class NormChart(QWidget):
@@ -150,11 +243,12 @@ class NormChart(QWidget):
 
 
 class ChangeHeatmap(QWidget):
-    """Per-row change of W_t for one step, as 64 bars.
+    """Per-row change of W_t for one step, one bar per row.
 
     One bar per row of W_t, longest and darkest for the rows that
     moved most on the step. The three biggest movers get their row
-    numbers. `values` holds the 64 per-row norms for `step_id`.
+    numbers. `values` holds the per-row norms for `step_id` (64
+    with the built-in encoder, more with a local model).
     """
 
     def __init__(self, parent=None):
@@ -234,12 +328,20 @@ class ChangeHeatmap(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, log_dir=None):
+    def __init__(self, log_dir=None, local_base_url=None):
         super().__init__()
         self.setWindowTitle("ACR - Adaptive Contextual Resonance")
         self.resize(1100, 680)
         self.engine = Engine()
-        # Heatmap history: one (step id, 64 per-row change norms)
+        # Encoder state: "builtin" (default) or "local". The local
+        # encoder needs the local model service; local_model is
+        # the model name, local_dim the dim it returns. The engine
+        # dim always matches the active encoder.
+        self.encoder_kind = "builtin"
+        self.local_model = None
+        self.client = LocalModelClient(local_base_url)
+        self.service = LocalServiceManager(self.client)
+        # Heatmap history: one (step id, per-row change norms)
         # entry per step, in step order. The heatmap shows the
         # latest step unless the user picks an older one.
         self._heat_history = []
@@ -277,6 +379,34 @@ class MainWindow(QMainWindow):
             "engine.")
         about.setWordWrap(True)
         left.addWidget(about)
+
+        # Encoder: built-in (default) or the local model service.
+        # Switching encoders starts a fresh W_t: the embedding
+        # sizes differ, so nothing carries over. Stated here, not
+        # hidden.
+        encoder_row = QHBoxLayout()
+        encoder_row.addWidget(QLabel("Encoder"))
+        self.encoder_combo = QComboBox()
+        self.encoder_combo.addItems(["Built-in", "Local model"])
+        self.encoder_combo.currentIndexChanged.connect(
+            self._on_encoder_changed)
+        encoder_row.addWidget(self.encoder_combo)
+        self.model_combo = QComboBox()
+        self.model_combo.setEnabled(False)
+        self.model_combo.currentTextChanged.connect(
+            self._on_model_changed)
+        encoder_row.addWidget(self.model_combo, 1)
+        self.start_button = QPushButton("Start service")
+        self.start_button.clicked.connect(self.on_start_service)
+        encoder_row.addWidget(self.start_button)
+        left.addLayout(encoder_row)
+        self.encoder_label = QLabel("Built-in encoder, dim 64.")
+        left.addWidget(self.encoder_label)
+        switch_note = QLabel(
+            "Switching encoders starts a fresh W_t (the embedding "
+            "sizes differ).")
+        switch_note.setWordWrap(True)
+        left.addWidget(switch_note)
 
         left.addWidget(QLabel("Input text"))
         self.input_edit = QPlainTextEdit()
@@ -442,11 +572,176 @@ class MainWindow(QMainWindow):
     def _on_alpha_changed(self, value):
         self.alpha_label.setText("Alpha: %.2f" % (value / 100.0))
 
+    # -- encoder ------------------------------------------------------
+    def _set_encoder_ui(self):
+        """Picker, model list, and label to match the encoder state."""
+        self.encoder_combo.blockSignals(True)
+        self.encoder_combo.setCurrentIndex(
+            1 if self.encoder_kind == "local" else 0)
+        self.encoder_combo.blockSignals(False)
+        if self.encoder_kind == "local":
+            self.model_combo.setEnabled(True)
+            self.encoder_label.setText(
+                "Local model: %s, dim %d."
+                % (self.local_model, self.engine.dim))
+        else:
+            # No model is running: clear the list so a stale name
+            # never sits in the disabled combo.
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            self.model_combo.blockSignals(False)
+            self.model_combo.setEnabled(False)
+            self.encoder_label.setText("Built-in encoder, dim 64.")
+
+    def _fresh_engine(self, dim):
+        """A fresh engine at the given dim, with views cleared."""
+        self.engine = Engine(dim=dim)
+        self._heat_history = []
+        self._heat_follow = True
+        self.logger.set_setting("dim", dim)
+
+    def _on_encoder_changed(self, index):
+        if index == 0:
+            if self.encoder_kind == "builtin":
+                return
+            self._switch_to_builtin(
+                "Back to the built-in encoder. W_t is fresh.")
+            return
+        if self.encoder_kind == "local":
+            return
+        self._switch_to_local()
+
+    def _switch_to_builtin(self, message):
+        self.encoder_kind = "builtin"
+        self.local_model = None
+        self._fresh_engine(DIM)
+        self.logger.set_setting("encoder", "built-in deterministic")
+        self._set_encoder_ui()
+        self._refresh_all()
+        self.status_label.setText(message)
+
+    def _switch_to_local(self):
+        """Pick the local encoder: health check, model list, then a
+        probe embedding to learn the model's dim. Any failure leaves
+        the built-in encoder in place with a plain message."""
+        if not self.client.probe():
+            self._set_encoder_ui()
+            self.status_label.setText(
+                MSG_SERVICE_DOWN + " Press Start service, or stay "
+                "on Built-in.")
+            return
+        try:
+            models = self.client.list_models()
+        except LocalModelError as exc:
+            self._set_encoder_ui()
+            self.status_label.setText(str(exc))
+            return
+        if not models:
+            self._set_encoder_ui()
+            self.status_label.setText(MSG_NO_MODELS)
+            return
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItems(models)
+        self.model_combo.blockSignals(False)
+        self._activate_local_model(pick_default_model(models))
+
+    def _activate_local_model(self, model):
+        """Make a local model the encoder, with a fresh W_t.
+
+        A probe embedding learns the model's dim first: the engine
+        is built at the dim the model actually returns. On failure
+        the built-in encoder stays in place with a plain message.
+        """
+        try:
+            probe = self.client.embed(model, "hello")
+        except LocalModelError as exc:
+            self._set_encoder_ui()
+            # A failed model switch leaves the old model active:
+            # put its name back in the list so the list never shows
+            # a model that is not running.
+            if self.encoder_kind == "local" and self.local_model:
+                self.model_combo.blockSignals(True)
+                self.model_combo.setCurrentText(self.local_model)
+                self.model_combo.blockSignals(False)
+            self.status_label.setText(str(exc))
+            return
+        self.encoder_kind = "local"
+        self.local_model = model
+        self._fresh_engine(len(probe))
+        self.logger.set_setting("encoder", "local model %s" % model)
+        self.model_combo.blockSignals(True)
+        self.model_combo.setCurrentText(model)
+        self.model_combo.blockSignals(False)
+        self._set_encoder_ui()
+        self._refresh_all()
+        self.status_label.setText(
+            "Local encoder: %s (dim %d). W_t is fresh."
+            % (model, len(probe)))
+
+    def _on_model_changed(self, name):
+        # Fires while the list is populated too; only a real change
+        # to another model while local re-activates (fresh W_t).
+        if (self.encoder_kind != "local" or not name
+                or name == self.local_model):
+            return
+        self._activate_local_model(name)
+
+    def on_start_service(self):
+        self.start_button.setEnabled(False)
+        try:
+            ok, message = self.service.start()
+        finally:
+            self.start_button.setEnabled(True)
+        if ok:
+            message += " Pick Local model to use it."
+        self.status_label.setText(message)
+
+    def _on_embed_retry(self, attempt, delay, kind):
+        # Called from the client's retry loop, on the UI thread:
+        # show the slow message live instead of after the fact.
+        self.status_label.setText(
+            "The local model service is slow, retrying "
+            "(attempt %d)..." % (attempt + 1))
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
     def on_step(self):
         text = self.input_edit.toPlainText().strip()
         if not text:
             self.status_label.setText("Type something first.")
             return
+        h = None
+        fallback_message = None
+        if self.encoder_kind == "local":
+            try:
+                h = self.client.embed(
+                    self.local_model, text,
+                    on_retry=self._on_embed_retry)
+            except LocalModelError as exc:
+                # Mid-session failure: fall back to the built-in
+                # encoder with a fresh W_t, and run this step on
+                # it. The user loses the local session, not the
+                # app, and the message says what happened.
+                self.logger.action(
+                    "local encoder failed (%s), fell back to "
+                    "built-in" % exc)
+                fallback_message = (
+                    "The local model service stopped. Back to the "
+                    "built-in encoder with a fresh W_t.")
+                self._switch_to_builtin(fallback_message)
+            else:
+                if len(h) != self.engine.dim:
+                    self.logger.action(
+                        "local model returned dim %d, engine is "
+                        "dim %d" % (len(h), self.engine.dim))
+                    fallback_message = (
+                        "The local model returned the wrong size. "
+                        "Back to the built-in encoder with a fresh "
+                        "W_t.")
+                    self._switch_to_builtin(fallback_message)
+                    h = None
         # Snapshot the factors before the step so the heatmap can
         # show which rows of W_t moved (read-only copies).
         old_u = [row[:] for row in self.engine.u]
@@ -455,7 +750,7 @@ class MainWindow(QMainWindow):
             entry = self.engine.step(
                 text, alpha=self._alpha(),
                 frozen=self.freeze_check.isChecked(),
-                cap=self.cap_spin.value())
+                cap=self.cap_spin.value(), h=h)
         except Exception:
             self.logger.exception("step failed")
             self.status_label.setText(
@@ -472,6 +767,10 @@ class MainWindow(QMainWindow):
         note = "Step %d done." % entry["id"]
         if entry["new_layer"]:
             note += " Resonance spike: new-layer candidate."
+        if fallback_message:
+            # The step ran on the fallback encoder: lead with what
+            # happened, so the fallback is never silent.
+            note = fallback_message + " " + note
         self.status_label.setText(note)
 
     def export_trace_to(self, path):
@@ -500,14 +799,21 @@ class MainWindow(QMainWindow):
         """The whole session as a JSON-ready dict.
 
         The engine state (W_t factors, previous embedding and
-        resonance, trace, buffer), the current settings, and the
-        heatmap history so the views tab restores exactly. The
-        format version lets later versions detect old saves.
+        resonance, trace, buffer), the encoder choice (kind, model,
+        dim -- a local session can only resume with the same
+        encoder), the current settings, and the heatmap history so
+        the views tab restores exactly. The format version lets
+        later versions detect old saves.
         """
         return {
             "format": "acr-session",
             "version": SESSION_FORMAT_VERSION,
             "app_version": VERSION,
+            "encoder": {
+                "kind": self.encoder_kind,
+                "model": self.local_model,
+                "dim": self.engine.dim,
+            },
             "engine": self.engine.state_dict(),
             "settings": {
                 "alpha": self._alpha(),
@@ -540,12 +846,19 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Session saved to %s" % path)
 
     def load_session_from(self, path):
-        """Load a session file, restoring engine, settings, views.
+        """Load a session file, restoring encoder, engine, settings,
+        views.
 
         Validates everything before applying it, so a bad file
         leaves the current session intact. Raises SessionError
         with a plain message on anything malformed; OSError on a
         file that cannot be read at all. Returns the path.
+
+        Version 1 files (no encoder block) load as built-in, dim
+        64. Version 2 files carry the encoder: a local session
+        only loads when the local service is running and the model
+        is installed -- otherwise it refuses with a plain message,
+        never a crash and never a silent wrong-dim load.
         """
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -560,16 +873,65 @@ class MainWindow(QMainWindow):
         if "version" not in data:
             raise SessionError(
                 "that session file has no version number")
-        if data["version"] != SESSION_FORMAT_VERSION:
+        version = data["version"]
+        if version not in (1, SESSION_FORMAT_VERSION):
             raise SessionError(
                 "that session file is version %s, this app reads "
-                "version %d" % (data["version"],
-                               SESSION_FORMAT_VERSION))
+                "versions 1 and %d" % (version,
+                                       SESSION_FORMAT_VERSION))
         if "engine" not in data:
             raise SessionError("that session file has no engine state")
+        # Encoder: v1 has none (built-in, dim 64); v2 names it.
+        encoder_kind = "builtin"
+        encoder_model = None
+        encoder_dim = DIM
+        models = None
+        if version == SESSION_FORMAT_VERSION:
+            encoder = data.get("encoder")
+            if not isinstance(encoder, dict):
+                raise SessionError(
+                    "that session file has no encoder")
+            encoder_kind = encoder.get("kind")
+            if encoder_kind not in ("builtin", "local"):
+                raise SessionError(
+                    "that session file has a bad encoder")
+            encoder_dim = encoder.get("dim")
+            if (not isinstance(encoder_dim, int)
+                    or isinstance(encoder_dim, bool)
+                    or not 8 <= encoder_dim <= 8192):
+                raise SessionError(
+                    "that session file has a bad encoder dim")
+            if encoder_kind == "builtin":
+                if encoder_dim != DIM:
+                    raise SessionError(
+                        "that session file has a bad encoder dim")
+            else:
+                encoder_model = encoder.get("model")
+                if (not isinstance(encoder_model, str)
+                        or not encoder_model):
+                    raise SessionError(
+                        "that session file has a bad encoder model")
+                # The session needs its encoder: refuse plainly
+                # when the service is down or the model is gone.
+                if not self.client.probe():
+                    raise SessionError(
+                        "this session needs the local encoder, "
+                        "which is not running - start it and try "
+                        "again")
+                try:
+                    models = self.client.list_models()
+                except LocalModelError:
+                    raise SessionError(
+                        "this session needs the local encoder, "
+                        "which is not running - start it and try "
+                        "again")
+                if encoder_model not in models:
+                    raise SessionError(
+                        "this session needs model %s, which is not "
+                        "installed" % encoder_model)
         # Validate the engine state on a spare engine first: a bad
         # file must not disturb the live session.
-        spare = Engine()
+        spare = Engine(dim=encoder_dim)
         spare.load_state_dict(data["engine"])
         settings = data.get("settings")
         if not isinstance(settings, dict):
@@ -590,19 +952,35 @@ class MainWindow(QMainWindow):
         if not isinstance(frozen, bool):
             raise SessionError(
                 "that session file has a bad freeze setting")
-        heat = self._checked_heat_history(data.get("heat_history"))
+        heat = self._checked_heat_history(data.get("heat_history"),
+                                          encoder_dim)
         # Everything checked: apply it.
+        self.encoder_kind = encoder_kind
+        self.local_model = encoder_model
         self.engine = spare
+        if encoder_kind == "local":
+            self.logger.set_setting(
+                "encoder", "local model %s" % encoder_model)
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            self.model_combo.setCurrentText(encoder_model)
+            self.model_combo.blockSignals(False)
+        else:
+            self.logger.set_setting("encoder",
+                                    "built-in deterministic")
+        self.logger.set_setting("dim", encoder_dim)
         self.alpha_slider.setValue(int(round(alpha * 100)))
         self.cap_spin.setValue(cap)
         self.freeze_check.setChecked(frozen)
         self._heat_history = heat
         self._heat_follow = True
+        self._set_encoder_ui()
         self.logger.action("session loaded from %s" % path)
         self._refresh_all()
         return path
 
-    def _checked_heat_history(self, value):
+    def _checked_heat_history(self, value, dim):
         """Validate the heatmap history, or return [] if absent."""
         if value is None:
             return []
@@ -615,7 +993,7 @@ class MainWindow(QMainWindow):
                     or not isinstance(item[0], int)
                     or isinstance(item[0], bool)
                     or not isinstance(item[1], list)
-                    or len(item[1]) != DIM
+                    or len(item[1]) != dim
                     or not all(isinstance(x, (int, float))
                                and not isinstance(x, bool)
                                for x in item[1])):
@@ -684,11 +1062,17 @@ class MainWindow(QMainWindow):
         """Write the session as readable text: the final state, then
         every input and trace entry in time order. Returns the path.
         """
+        if self.encoder_kind == "local":
+            encoder_line = ("  Encoder: local, %s (dim %d)"
+                            % (self.local_model, self.engine.dim))
+        else:
+            encoder_line = "  Encoder: built-in (dim 64)"
         lines = ["ACR session export",
                  "App version: %s" % VERSION,
                  "",
                  "Final state",
                  "  Steps: %d" % self.engine.step_count,
+                 encoder_line,
                  "  W norm: %.4f" % self.engine.w_norm()]
         if self.engine.trace:
             last = self.engine.trace[-1]

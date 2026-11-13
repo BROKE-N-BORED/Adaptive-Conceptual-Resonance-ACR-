@@ -7,8 +7,11 @@ step the loop, and watch the weight matrix adapt to what you type.
 
 A real, runnable prototype of the core idea from the blueprint:
 
-- An encoder turns your text into a vector (deterministic, offline,
-  no downloads, no model files).
+- An encoder turns your text into a vector. The built-in encoder is
+  deterministic, offline, no downloads, no model files. When the
+  local model service is running on this computer, you can switch
+  to its embeddings instead (see step 9 below); the built-in
+  encoder stays the default and the fallback.
 - A weight matrix W_t (low-rank, rank 8) updates a little on every
   step, learning to predict the next input from the previous one.
   The update is driven by the drift between the two (the residual
@@ -81,6 +84,19 @@ bash run.sh
    final state at the top.
 8. Reset asks first, then clears the session and puts W_t back to
    its start.
+9. Encoder: the picker offers Built-in or Local model. Local model
+   uses the embeddings of the local model service running on this
+   computer (Ollama, at http://127.0.0.1:11434). Pick a model
+   from the list; the embedding model is picked first when it is
+   installed. Start service starts the service for you if it is
+   not running, so you never need the terminal for it. Switching
+   encoders starts a fresh W_t, because the embedding sizes differ:
+   the trace and buffer clear, and the window says so. If the
+   service stops mid-session, ACR falls back to the built-in
+   encoder with a fresh W_t and says so plainly. Sessions remember
+   which encoder they used: a session saved with the local encoder
+   needs the service running (with that model installed) to load
+   back.
 
 ## If something breaks
 
@@ -117,6 +133,8 @@ DELTA-RULE-PROBE.md.
 
 - `acr_app.py` - the window and the resonance views
 - `acr_engine.py` - the adaptive loop (standard library only)
+- `local_encoder.py` - the local-model encoder client (standard
+  library only)
 - `DELTA-RULE-PROBE.md` - the probe numbers behind the v0.2 rule fix
 - `debug_log.py` - the debug log layer (standard library only)
 - `install.sh` / `run.sh` - install and run
@@ -128,3 +146,6 @@ DELTA-RULE-PROBE.md.
 
 Linux, Python 3.10 or newer. The installer puts the interface
 library in a private folder, so nothing else needs installing.
+The Local model encoder needs the local model service (Ollama)
+installed and running on this computer, with at least one model
+installed; everything else works without it.
