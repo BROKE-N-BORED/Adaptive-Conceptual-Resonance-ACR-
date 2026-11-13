@@ -14,7 +14,7 @@ from debug_log import DebugLogger  # noqa: E402
 class ScrubTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.log = DebugLogger("acr", "0.7",
+        self.log = DebugLogger("acr", "0.8",
                                log_dir=self.tmp.name)
 
     def tearDown(self):

@@ -1,4 +1,4 @@
-# ACR - Adaptive Contextual Resonance
+# ACR v0.8 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
@@ -20,7 +20,8 @@ A real, runnable prototype of the core idea from the blueprint:
 - Resonance is the match between your input and the dominant
   direction of W_t, from 0 to 1. A spike flags a new-layer candidate.
 - The trace log records every step: what went in, how far W_t moved,
-  the resonance, and the confidence.
+  the resonance, the confidence, and whether the cap clipped the
+  step (10 columns in all).
 
 ## What this is not
 
@@ -64,8 +65,9 @@ bash run.sh
 ## Use
 
 1. Type a sentence in the input box.
-2. Press Step. The readouts update, a row appears in the trace log,
-   and the synthesis head shows related past inputs.
+2. Press Step, or Enter in the input box. The readouts update, a
+   row appears in the trace log, and the synthesis head shows
+   related past inputs.
 3. Step a few sentences on one theme and watch the resonance climb.
    Switch themes and watch it drop.
 4. Alpha (the slider) sets the base learning rate: how fast W_t
@@ -128,6 +130,8 @@ bash run.sh
     kept for reverting; older steps age out. A loaded session
     starts its revert history from the loaded state.
 
+The window remembers its size and position between runs.
+
 ## If something breaks
 
 Press Generate debug report in the window. It writes one file with
@@ -168,7 +172,9 @@ session's own buffer and the resonance W_t reports; nothing comes
 from outside the session. A step counts as resonant when its
 resonance is at least 0.4: a fresh theme scores about 0.05-0.20
 and a settled theme holds about 0.45-0.55, so 0.4 sits between
-the noise and the plateau.
+the noise and the plateau. Every synthesis list shows each input
+once: repeated inputs are the same point, so they collapse to one
+line each instead of repeating.
 
 A note on v0.1: the first version updated W_t with a different rule
 (learning to reconstruct each input) because the first attempt at
@@ -186,8 +192,11 @@ DELTA-RULE-PROBE.md.
 - `local_encoder.py` - the local-model encoder client (standard
   library only)
 - `DELTA-RULE-PROBE.md` - the probe numbers behind the v0.2 rule fix
+- `CHANGELOG.md` - what changed in each version, in plain words
 - `debug_log.py` - the debug log layer (standard library only)
 - `install.sh` / `run.sh` - install and run
+- `build_zip.py` / `render_icons.py` - build the release zip; the
+  icons render from the SVG when they are missing
 - `ACR.desktop` / `Install-ACR.desktop` - menu and desktop launchers
 - `icons/` - icon source and images
 - `tests/` - the test suite (`python3 -m unittest discover -s tests`)

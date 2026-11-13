@@ -1,0 +1,18 @@
+# Python caches
+__pycache__/
+*.pyc
+
+# Private install folder (created by install.sh)
+.venv/
+
+# Built zips
+*.zip
+
+# Logs and debug reports
+logs/
+debug-report*.txt
+
+# Editor and OS leftovers
+.DS_Store
+*.swp
+*~

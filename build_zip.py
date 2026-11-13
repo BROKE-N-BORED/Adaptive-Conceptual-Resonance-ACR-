@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Build acr-v0.7.zip with correct stored file modes.
+"""Build acr-v0.8.zip with correct stored file modes.
 
 Scripts and launchers are stored as 0o100755 (regular file + exec
 bits, so GUI extractors keep the exec bit); everything else is
 0o100644. TASK-LIST.md, the venv, logs, and caches stay out.
+
+v0.8: the PNG icons are rendered from the SVG when they are
+missing, so the build works from a fresh clone (the repo holds
+only icons/acr.svg; the PNGs are zip-only). render_icons.py ships
+in the zip for exactly that: without it, a fresh clone would have
+nothing to render with.
 """
 
 import hashlib
@@ -12,8 +18,8 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.7"
-ZIP_NAME = "acr-v0.7.zip"
+VERSION = "0.8"
+ZIP_NAME = "acr-v0.8.zip"
 
 EXEC_FILES = {
     "install.sh",
@@ -28,7 +34,9 @@ PLAIN_FILES = [
     "local_encoder.py",
     "debug_log.py",
     "build_zip.py",
+    "render_icons.py",
     "README.md",
+    "CHANGELOG.md",
     "DELTA-RULE-PROBE.md",
     "icons/acr.svg",
     "icons/acr-48.png",
@@ -42,10 +50,43 @@ PLAIN_FILES = [
     "tests/test_local_encoder.py",
     "tests/test_synthesis.py",
     "tests/test_stability.py",
+    "tests/test_polish.py",
 ]
 
 
+def _ensure_icons():
+    """Render the PNG icons from the SVG when they are missing.
+
+    The repo holds only icons/acr.svg, so a fresh clone has no
+    PNGs and the build used to fail on them. Rendering needs the
+    interface library (render_icons.py does the work); when it
+    cannot run, the build stops with a plain message instead of
+    a bare MISSING line. Returns True when the PNGs are present
+    afterwards.
+    """
+    missing = [name for name in ("icons/acr-48.png",
+                                 "icons/acr-256.png")
+               if not os.path.exists(os.path.join(ROOT, name))]
+    if not missing:
+        return True
+    print("icons missing (%s), rendering from the SVG..."
+          % ", ".join(missing))
+    sys.path.insert(0, ROOT)
+    try:
+        import render_icons
+    except ImportError as exc:
+        print("cannot render icons: %s" % exc)
+        return False
+    try:
+        return render_icons.main() == 0
+    except Exception as exc:
+        print("icon render failed: %s" % exc)
+        return False
+
+
 def build():
+    if not _ensure_icons():
+        return 1
     zip_path = os.path.join(ROOT, ZIP_NAME)
     if os.path.exists(zip_path):
         os.remove(zip_path)

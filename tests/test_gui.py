@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -31,6 +31,10 @@ def setUpModule():
 
 class GuiDriveTests(unittest.TestCase):
     def setUp(self):
+        # v0.8: the window restores its saved geometry when one
+        # exists; clear it so the default-size test sees the
+        # default, whatever an earlier run saved.
+        QSettings("BrokeNBored", "ACR").clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.window = MainWindow(log_dir=self.tmp.name)
         self.window.show()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.7.
+"""ACR - Adaptive Contextual Resonance, v0.8.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -28,6 +28,12 @@ individual rank directions), learning-rate schedule presets
 next to the stability cap with a trace flag for steps the cap
 clipped, and revert: roll W_t back to any recent step from the
 trace log.
+
+v0.8 is polish only, no new features: the chart legend moves to
+the bottom-left (it used to overlap a red dot at the top-right),
+the neighbour lists show each text once, Enter steps the loop
+from the input box, the window carries its icon, and the window
+remembers its size and position between runs.
 """
 
 import csv
@@ -38,8 +44,8 @@ import shutil
 import sys
 import time
 
-from PySide6.QtCore import QProcess, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QEvent, QProcess, QRect, QSettings, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow,
@@ -59,7 +65,7 @@ from local_encoder import (
     pick_completion_model, pick_default_model)
 
 APP_NAME = "acr"
-VERSION = "0.7"
+VERSION = "0.8"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
@@ -68,6 +74,7 @@ TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
 
 CHART_LINE = QColor(31, 78, 121)
 CHART_SPIKE = QColor(192, 57, 43)
+LEGEND_TEXT = "red dot = new-layer candidate"
 CHART_GRID = QColor(220, 220, 220)
 CHART_AXIS = QColor(120, 120, 120)
 HEAT_LOW = QColor(220, 235, 250)
@@ -194,6 +201,19 @@ class NormChart(QWidget):
         self.flags = list(flags)
         self.update()
 
+    def legend_rect(self):
+        """Where the legend sits: bottom-left inside the plot
+        area, sized to the text. v0.8: it used to sit top-right,
+        where a red dot at the last step could land underneath
+        it and hide behind the red text."""
+        left, right = 48, 10
+        top, bottom = 10, 22
+        height = max(1, self.height() - top - bottom)
+        font = QFont()
+        font.setPointSize(8)
+        text_w = QFontMetrics(font).horizontalAdvance(LEGEND_TEXT)
+        return QRect(left, top + height - 18, text_w + 8, 16)
+
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.white)
@@ -252,9 +272,13 @@ class NormChart(QWidget):
                 painter.setPen(QPen(CHART_LINE, 2))
                 painter.setBrush(CHART_LINE)
                 painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        # Legend, bottom-left, on a white patch so the line and
+        # grid never show through the text.
+        rect = self.legend_rect()
+        painter.fillRect(rect, Qt.white)
         painter.setPen(CHART_SPIKE)
-        painter.drawText(left + width - 150, top + 10,
-                         "red dot = new-layer candidate")
+        painter.drawText(rect.left() + 4, rect.bottom() - 4,
+                         LEGEND_TEXT)
 
 
 class ChangeHeatmap(QWidget):
@@ -358,11 +382,32 @@ class ChangeHeatmap(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, log_dir=None, local_base_url=None):
         super().__init__()
-        self.setWindowTitle("ACR - Adaptive Contextual Resonance")
-        # v0.6: 700 tall, up from 680 -- the completion row under
-        # the synthesis panel pushed the layout's minimum height
-        # past 680. Still fits his 1366x768 screen.
-        self.resize(1100, 700)
+        self.setWindowTitle("ACR v%s - Adaptive Contextual "
+                            "Resonance" % VERSION)
+        # v0.8: the launcher's StartupWMClass is ACR, so the app
+        # says the same name: without it the desktop shows the
+        # running window as a separate icon instead of grouping
+        # it with the launcher.
+        QApplication.instance().setApplicationName("ACR")
+        # v0.8: the window carries its icon: the 48px render, or
+        # the SVG when the PNGs are missing (as in a fresh clone,
+        # where the repo holds only the SVG).
+        here = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(here, "icons", "acr-48.png")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(here, "icons", "acr.svg")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        # v0.8: the window remembers its size and position
+        # between runs (saved on close). First run, with no saved
+        # geometry, is 1100x700 -- v0.6: 700 tall, up from 680,
+        # the completion row under the synthesis panel pushed the
+        # layout's minimum height past 680. Still fits his
+        # 1366x768 screen.
+        self._settings = QSettings("BrokeNBored", "ACR")
+        geometry = self._settings.value("geometry")
+        if geometry is None or not self.restoreGeometry(geometry):
+            self.resize(1100, 700)
         self.engine = Engine()
         # Encoder state: "builtin" (default) or "local". The local
         # encoder needs the local model service; local_model is
@@ -398,6 +443,23 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_all()
 
+    def closeEvent(self, event):
+        # v0.8: remember the geometry for the next run.
+        self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.sync()
+        super().closeEvent(event)
+
+    def eventFilter(self, watched, event):
+        # v0.8: Enter in the input box steps the loop, like the
+        # Step button. Shift+Enter still makes a newline.
+        if (watched is self.input_edit
+                and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and not event.modifiers() & Qt.ShiftModifier):
+            self.on_step()
+            return True
+        return super().eventFilter(watched, event)
+
     # -- UI -----------------------------------------------------------
     def _build_ui(self):
         central = QWidget(self)
@@ -413,8 +475,8 @@ class MainWindow(QMainWindow):
 
         about = QLabel(
             "Small-scale prototype of the adaptive loop. Type text, "
-            "press Step, and W_t adapts. This is not a full neural "
-            "engine.")
+            "press Step or Enter, and W_t adapts. This is not a full "
+            "neural engine.")
         about.setWordWrap(True)
         left.addWidget(about)
 
@@ -449,11 +511,13 @@ class MainWindow(QMainWindow):
         left.addWidget(QLabel("Input text"))
         self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText(
-            "Type a sentence, then press Step...")
+            "Type a sentence, then press Enter or Step...")
         # v0.6: fixed at two lines. The input is one sentence; the
         # freed height goes to the synthesis panel below, which
         # now holds four sections plus the completion.
         self.input_edit.setFixedHeight(56)
+        # v0.8: Enter steps the loop; see eventFilter.
+        self.input_edit.installEventFilter(self)
         left.addWidget(self.input_edit)
 
         self.step_button = QPushButton("Step")

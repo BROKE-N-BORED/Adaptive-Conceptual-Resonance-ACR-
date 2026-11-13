@@ -79,6 +79,10 @@ the engine keeps a bounded snapshot history of (U, V) after each
 step, so W_t can be rolled back to any recent step. Snapshots are
 not saved in session files: a loaded session starts its revert
 history from the loaded state.
+
+v0.8 is polish only: the neighbour and midpoint lists show each
+text once (repeated inputs used to repeat their line), and
+nothing else in the engine changes.
 """
 
 import hashlib
@@ -806,7 +810,10 @@ class Engine:
         "result": (text, score)} or None, "counter_examples":
         [(text, score), ...]}. Neighbours and midpoint are scored
         as before (cosine to the latest input, and to the midpoint
-        of the top two neighbours). The analogy takes the two most
+        of the top two neighbours), and each list shows each text
+        once: repeated inputs are the same point, so duplicates
+        collapse to one entry at the best score. The analogy takes
+        the two most
         resonant past inputs A and B, forms the direction d =
         h_B - h_A, and finds the nearest other past input to
         h + d: like A is to B, the current input points at the
@@ -820,11 +827,21 @@ class Engine:
         if not self.buffer or self.h_prev is None:
             return {"neighbours": [], "midpoint": [],
                     "analogy": None, "counter_examples": []}
-        scored = []
+        # v0.8: distinct texts only. Repeated inputs are the same
+        # point, so each text appears once, at its best score;
+        # before, a repeated input repeated its line (up to 3x in
+        # the neighbours, 2x in the midpoint). The midpoint is now
+        # between the top two distinct neighbours, not a vector
+        # and itself.
+        best = {}
         for item in self.buffer:
-            scored.append((_dot(self.h_prev, item["vector"]),
-                           item["text"]))
-        scored.sort(reverse=True)
+            score = _dot(self.h_prev, item["vector"])
+            if (item["text"] not in best
+                    or score > best[item["text"]]):
+                best[item["text"]] = score
+        scored = sorted(((score, text)
+                         for text, score in best.items()),
+                        reverse=True)
         # Only positive cosine scores count as related: a negative
         # score means dissimilar, not a neighbour.
         neighbours = [(text, round(score, 4))
@@ -841,13 +858,18 @@ class Engine:
                 mid = _normalize([(a + b) / 2.0 for a, b in
                                   zip(top_vecs[0], top_vecs[1])])
                 top_texts = {text for _, text in scored[:2]}
-                mid_scored = []
+                mid_best = {}
                 for item in self.buffer:
                     if item["text"] in top_texts:
                         continue
-                    mid_scored.append((_dot(mid, item["vector"]),
-                                       item["text"]))
-                mid_scored.sort(reverse=True)
+                    score = _dot(mid, item["vector"])
+                    if (item["text"] not in mid_best
+                            or score > mid_best[item["text"]]):
+                        mid_best[item["text"]] = score
+                mid_scored = sorted(
+                    ((score, text)
+                     for text, score in mid_best.items()),
+                    reverse=True)
                 midpoint = [(text, round(score, 4))
                             for score, text in mid_scored[:2]
                             if score > 0.0]
