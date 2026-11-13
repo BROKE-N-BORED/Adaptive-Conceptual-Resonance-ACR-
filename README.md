@@ -68,6 +68,11 @@ bash run.sh
    logs steps without changing W_t. The stability cap bounds each
    update.
 5. Export trace JSON saves the whole trace log as a file.
+6. The Resonance views tab shows the W_t norm over time (red dots
+   are resonance spikes), the change heatmap for one step (pick a
+   step to look back, or leave it on the latest), and the layer
+   candidates: resonance spikes with the input that triggered them.
+   Click a candidate to see its trace entries.
 
 ## If something breaks
 
@@ -102,7 +107,7 @@ DELTA-RULE-PROBE.md.
 
 ## Files
 
-- `acr_app.py` - the window
+- `acr_app.py` - the window and the resonance views
 - `acr_engine.py` - the adaptive loop (standard library only)
 - `DELTA-RULE-PROBE.md` - the probe numbers behind the v0.2 rule fix
 - `debug_log.py` - the debug log layer (standard library only)
