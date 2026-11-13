@@ -1,4 +1,4 @@
-# ACR v0.8 - Adaptive Contextual Resonance
+# ACR v0.8.1 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.

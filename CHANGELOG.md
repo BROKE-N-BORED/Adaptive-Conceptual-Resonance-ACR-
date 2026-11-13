@@ -2,6 +2,13 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.8.1 (2026-11-13) - Launch fix
+
+- The desktop and menu icon now launch the app. It used to look
+  for the program in the wrong folder, so clicking the icon did
+  nothing. The icon now points straight at the installed program.
+- No new features, no change to the update rule.
+
 ## v0.8 (2026-11-13) - Final polish
 
 - README final pass: every number and claim checked against the

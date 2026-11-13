@@ -2,7 +2,7 @@
 Type=Application
 Name=ACR
 Comment=Adaptive Contextual Resonance - small-scale adaptive loop
-Exec=python3 -c "import os,subprocess,sys; u=sys.argv[1] if len(sys.argv)>1 else ''; u=u[7:] if u.startswith('file://') else u; d=os.path.dirname(u) if u else os.getcwd(); subprocess.call(['bash', os.path.join(d, 'run.sh')])" %k
+Exec=bash "__APP_DIR__/run.sh"
 Icon=__APP_DIR__/icons/acr-48.png
 Terminal=false
 Categories=Utility;Science;

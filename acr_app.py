@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.8.
+"""ACR - Adaptive Contextual Resonance, v0.8.1.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -34,6 +34,11 @@ the bottom-left (it used to overlap a red dot at the top-right),
 the neighbour lists show each text once, Enter steps the loop
 from the input box, the window carries its icon, and the window
 remembers its size and position between runs.
+
+v0.8.1 is a launch fix, no new features: the desktop and menu
+icon now start the app. It used to look for the program next to
+the icon file, which is the wrong folder once installed, so
+clicking the icon did nothing.
 """
 
 import csv
@@ -65,7 +70,7 @@ from local_encoder import (
     pick_completion_model, pick_default_model)
 
 APP_NAME = "acr"
-VERSION = "0.8"
+VERSION = "0.8.1"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
