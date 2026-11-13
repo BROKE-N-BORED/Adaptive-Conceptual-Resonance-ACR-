@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install ACR
+Comment=Install Adaptive Contextual Resonance
+Exec=python3 -c "import os,subprocess,sys; u=sys.argv[1] if len(sys.argv)>1 else ''; u=u[7:] if u.startswith('file://') else u; d=os.path.dirname(u) if u else os.getcwd(); e=dict(os.environ); e['ACR_GUI_INSTALL']='1'; subprocess.call(['bash', os.path.join(d, 'install.sh')], env=e)" %k
+Icon=system-software-install
+Terminal=true
+Categories=Utility;
