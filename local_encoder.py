@@ -2,8 +2,9 @@
 
 Talks to the local model service over localhost HTTP
 (http://127.0.0.1:11434): /api/tags for the installed model list,
-/api/embeddings for embeddings. The service is Ollama; the app
-calls it "the local model service" in user-facing text.
+/api/embeddings for embeddings, and since v0.6 /api/generate for
+the synthesis head's optional completion. The service is Ollama;
+the app calls it "the local model service" in user-facing text.
 
 Health, retry, and failure wording follow the DUO v0.10 pattern:
 a quick probe decides up vs down, transient failures retry a few
@@ -43,6 +44,12 @@ MSG_NO_MODELS = ("No models are installed in the local model "
 EMBED_MAX_ATTEMPTS = 3
 EMBED_RETRY_DELAYS = (2.0, 5.0)  # pause before attempt 2, then 3
 EMBED_TIMEOUT = 60  # first use loads the model, so allow a minute
+# Completion retry: the same shape. Generation takes longer than
+# an embedding (first use loads the model, then it writes), so
+# the timeout is longer.
+GENERATE_MAX_ATTEMPTS = 3
+GENERATE_RETRY_DELAYS = (2.0, 5.0)  # pause before attempt 2, then 3
+GENERATE_TIMEOUT = 120
 PROBE_TIMEOUT = 3
 
 # The embedding model to prefer when it is installed. Names carry
@@ -76,6 +83,21 @@ def pick_default_model(models):
     for name in ordered:
         if (name == EMBED_MODEL_DEFAULT
                 or name.startswith(EMBED_MODEL_DEFAULT + ":")):
+            return name
+    if ordered:
+        return ordered[0]
+    return None
+
+
+def pick_completion_model(models, encoder_model):
+    """The model to complete with: the first installed model that
+    is not the encoder model, alphabetically. When the encoder
+    model is the only one installed, it is the pick: the picker
+    shows its name, so nothing is presented as something it is
+    not. None when no model is installed at all."""
+    ordered = sorted(models)
+    for name in ordered:
+        if name != encoder_model:
             return name
     if ordered:
         return ordered[0]
@@ -140,30 +162,53 @@ class LocalModelClient:
         except Exception:
             raise LocalModelError(MSG_SERVICE_DOWN)
 
+    def _with_retries(self, attempt, max_attempts, delays,
+                      on_retry):
+        """Run attempt() (a zero-arg callable) with retries.
+
+        Transient failures (refused, timeout, connection cut
+        before the response) retry up to max_attempts times.
+        on_retry (optional) is called before each retry with
+        (attempt, delay_seconds, kind): attempt is the attempt that
+        just failed (1-based), kind is "down", "slow", or "error".
+        """
+        for n in range(1, max_attempts + 1):
+            try:
+                return attempt()
+            except _Retryable as exc:
+                if n >= max_attempts:
+                    raise self._final_error(exc)
+                delay = delays[n - 1]
+                if on_retry is not None:
+                    on_retry(n, delay, exc.kind)
+                time.sleep(delay)
+        raise LocalModelError(MSG_SERVICE_DOWN)  # unreachable
+
     def embed(self, model, text, timeout=EMBED_TIMEOUT,
               on_retry=None):
         """Embed text with the given model. Returns a list of floats.
 
-        Retries transient failures (refused, timeout, connection
-        cut before the response) up to EMBED_MAX_ATTEMPTS times.
-        on_retry (optional) is called before each retry with
-        (attempt, delay_seconds, kind): attempt is the attempt that
-        just failed (1-based), kind is "down", "slow", or "error".
-
+        Retries transient failures up to EMBED_MAX_ATTEMPTS times.
         Raises LocalModelError with a plain message on failure. A
         missing model is not retried: it will not fix itself.
         """
-        for attempt in range(1, EMBED_MAX_ATTEMPTS + 1):
-            try:
-                return self._embed_attempt(model, text, timeout)
-            except _Retryable as exc:
-                if attempt >= EMBED_MAX_ATTEMPTS:
-                    raise self._final_error(exc)
-                delay = EMBED_RETRY_DELAYS[attempt - 1]
-                if on_retry is not None:
-                    on_retry(attempt, delay, exc.kind)
-                time.sleep(delay)
-        raise LocalModelError(MSG_SERVICE_DOWN)  # unreachable
+        return self._with_retries(
+            lambda: self._embed_attempt(model, text, timeout),
+            EMBED_MAX_ATTEMPTS, EMBED_RETRY_DELAYS, on_retry)
+
+    def generate(self, model, prompt, timeout=GENERATE_TIMEOUT,
+                 on_retry=None):
+        """Complete a prompt with the given model. Returns the text.
+
+        Retries transient failures up to GENERATE_MAX_ATTEMPTS
+        times, with the same down-vs-slow final message as embed:
+        a service that answers the probe is slow or busy, never
+        "not running". Raises LocalModelError with a plain message
+        on failure. A missing model is not retried.
+        """
+        return self._with_retries(
+            lambda: self._generate_attempt(model, prompt, timeout),
+            GENERATE_MAX_ATTEMPTS, GENERATE_RETRY_DELAYS, on_retry)
 
     def _final_error(self, retryable):
         """The plain error for a call that exhausted its retries.
@@ -217,3 +262,45 @@ class LocalModelClient:
             raise LocalModelError(
                 "The local model returned a bad embedding.")
         return [float(x) for x in embedding]
+
+    def _generate_attempt(self, model, prompt, timeout):
+        """One try at a completion. Returns the response text.
+
+        Raises LocalModelError (model failure, or a bad response)
+        or _Retryable (a failure before any response arrived).
+        stream is false: the service answers with one JSON object
+        holding the whole completion, not a stream of pieces.
+        """
+        body = json.dumps(
+            {"model": model, "prompt": prompt,
+             "stream": False}).encode("utf-8")
+        req = urllib.request.Request(
+            self.base_url + "/api/generate", data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            # The service answered with a status: it is up, and a
+            # missing model will not fix itself by retrying.
+            try:
+                detail = json.loads(
+                    exc.read().decode("utf-8")).get("error", "")
+            except Exception:
+                detail = ""
+            if "not found" in detail.lower():
+                raise LocalModelError(MSG_MODEL_FAILED)
+            raise LocalModelError(MSG_MODEL_FAILED)
+        except Exception as exc:
+            raise _Retryable(exc, _failure_kind(exc))
+        try:
+            payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            resp.close()
+            raise LocalModelError(MSG_SERVICE_SLOW)
+        resp.close()
+        response = payload.get("response")
+        if not isinstance(response, str) or not response.strip():
+            raise LocalModelError(
+                "The local model returned a bad completion.")
+        return response

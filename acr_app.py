@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.5.
+"""ACR - Adaptive Contextual Resonance, v0.6.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -16,6 +16,11 @@ service is running on this computer, its embeddings can replace
 the built-in encoder. The built-in encoder stays the default and
 the fallback. Switching encoders starts a fresh W_t, because the
 embedding sizes differ.
+
+v0.6 upgrades the synthesis head: analogies and counter-examples
+built from the session's own buffer and resonance, plus an
+optional completion from another installed local model, labelled
+as that model's words.
 """
 
 import csv
@@ -42,10 +47,10 @@ from debug_log import DebugLogger, check_ollama
 from local_encoder import (
     MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
     MSG_START_FAILED, LocalModelClient, LocalModelError,
-    pick_default_model)
+    pick_completion_model, pick_default_model)
 
 APP_NAME = "acr"
-VERSION = "0.5"
+VERSION = "0.6"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
@@ -331,7 +336,10 @@ class MainWindow(QMainWindow):
     def __init__(self, log_dir=None, local_base_url=None):
         super().__init__()
         self.setWindowTitle("ACR - Adaptive Contextual Resonance")
-        self.resize(1100, 680)
+        # v0.6: 700 tall, up from 680 -- the completion row under
+        # the synthesis panel pushed the layout's minimum height
+        # past 680. Still fits his 1366x768 screen.
+        self.resize(1100, 700)
         self.engine = Engine()
         # Encoder state: "builtin" (default) or "local". The local
         # encoder needs the local model service; local_model is
@@ -346,6 +354,10 @@ class MainWindow(QMainWindow):
         # latest step unless the user picks an older one.
         self._heat_history = []
         self._heat_follow = True
+        # Last on-demand completion, shown in the synthesis panel
+        # until the session changes (reset, load, encoder switch).
+        self._completion_model = None
+        self._completion_text = None
 
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(
@@ -369,8 +381,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # Left: input, controls, readouts, synthesis.
+        # Left: input, controls, readouts, synthesis. Tighter
+        # spacing than the default: the column holds a lot now,
+        # and the saved pixels go to the synthesis panel.
         left = QVBoxLayout()
+        left.setSpacing(3)
         root.addLayout(left, 2)
 
         about = QLabel(
@@ -412,7 +427,10 @@ class MainWindow(QMainWindow):
         self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText(
             "Type a sentence, then press Step...")
-        self.input_edit.setMaximumHeight(90)
+        # v0.6: fixed at two lines. The input is one sentence; the
+        # freed height goes to the synthesis panel below, which
+        # now holds four sections plus the completion.
+        self.input_edit.setFixedHeight(56)
         left.addWidget(self.input_edit)
 
         self.step_button = QPushButton("Step")
@@ -453,12 +471,33 @@ class MainWindow(QMainWindow):
         left.addLayout(cap_row)
 
         left.addWidget(QLabel(
-            "Synthesis head (demo) - related past inputs from this "
-            "session. Not a language model."))
+            "Synthesis head - synthesis from this session's own "
+            "subspace, not general knowledge."))
         self.synthesis_text = QTextEdit()
         self.synthesis_text.setReadOnly(True)
-        self.synthesis_text.setMaximumHeight(150)
-        left.addWidget(self.synthesis_text)
+        self.synthesis_text.setMaximumHeight(200)
+        # Stretch 1: the panel takes spare height over the empty
+        # space at the bottom of the column.
+        left.addWidget(self.synthesis_text, 1)
+
+        # Optional local-model completion: on-demand only, and
+        # only while the local encoder is active. The picker lists
+        # every installed model, defaulting to the first that is
+        # not the encoder model; the picker always shows the model
+        # name, so nothing is presented as something it is not.
+        complete_row = QHBoxLayout()
+        self.complete_button = QPushButton("Complete with local model")
+        self.complete_button.clicked.connect(self.on_complete)
+        self.complete_button.setEnabled(False)
+        complete_row.addWidget(self.complete_button)
+        self.completion_combo = QComboBox()
+        self.completion_combo.setEnabled(False)
+        complete_row.addWidget(self.completion_combo, 1)
+        left.addLayout(complete_row)
+        self.completion_note = QLabel(
+            "Completion needs the Local model encoder.")
+        self.completion_note.setWordWrap(True)
+        left.addWidget(self.completion_note)
 
         btn_row = QHBoxLayout()
         self.export_button = QPushButton("Export trace JSON")
@@ -491,7 +530,8 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
         left.addWidget(self.status_label)
-        left.addStretch(1)
+        # No bottom stretch: the synthesis panel (stretch 1)
+        # takes the spare height instead, up to its 200 maximum.
 
         # Right: tabs for the trace log and the resonance views.
         self.tabs = QTabWidget()
@@ -592,12 +632,55 @@ class MainWindow(QMainWindow):
             self.model_combo.blockSignals(False)
             self.model_combo.setEnabled(False)
             self.encoder_label.setText("Built-in encoder, dim 64.")
+        self._refresh_completion_ui()
+
+    def _refresh_completion_ui(self):
+        """Completion button, picker, and note to match the encoder
+        state. The picker lists every installed model, defaulting
+        to the first that is not the encoder model (the encoder
+        model itself when it is the only one installed). The
+        user's pick is kept when it is still a choice. Runs from
+        _set_encoder_ui, which covers every encoder change,
+        session load, and failed switch."""
+        if self.encoder_kind != "local":
+            self.complete_button.setEnabled(False)
+            self.completion_combo.blockSignals(True)
+            self.completion_combo.clear()
+            self.completion_combo.blockSignals(False)
+            self.completion_combo.setEnabled(False)
+            self.completion_note.setText(
+                "Completion needs the Local model encoder.")
+            return
+        models = [self.model_combo.itemText(i)
+                  for i in range(self.model_combo.count())]
+        choices = list(models)
+        previous = self.completion_combo.currentText()
+        self.completion_combo.blockSignals(True)
+        self.completion_combo.clear()
+        self.completion_combo.addItems(choices)
+        if previous in choices:
+            self.completion_combo.setCurrentText(previous)
+        elif choices:
+            self.completion_combo.setCurrentText(
+                pick_completion_model(models, self.local_model))
+        self.completion_combo.blockSignals(False)
+        if not choices:
+            self.complete_button.setEnabled(False)
+            self.completion_combo.setEnabled(False)
+            self.completion_note.setText(
+                "No model is installed for completion.")
+        else:
+            self.complete_button.setEnabled(True)
+            self.completion_combo.setEnabled(True)
+            self.completion_note.setText("")
 
     def _fresh_engine(self, dim):
         """A fresh engine at the given dim, with views cleared."""
         self.engine = Engine(dim=dim)
         self._heat_history = []
         self._heat_follow = True
+        self._completion_model = None
+        self._completion_text = None
         self.logger.set_setting("dim", dim)
 
     def _on_encoder_changed(self, index):
@@ -697,7 +780,7 @@ class MainWindow(QMainWindow):
             message += " Pick Local model to use it."
         self.status_label.setText(message)
 
-    def _on_embed_retry(self, attempt, delay, kind):
+    def _on_service_retry(self, attempt, delay, kind):
         # Called from the client's retry loop, on the UI thread:
         # show the slow message live instead of after the fact.
         self.status_label.setText(
@@ -706,6 +789,53 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.processEvents()
+
+    def on_complete(self):
+        """Complete the session's theme with the local model.
+
+        The resonant buffer entries go in as context; the returned
+        text shows in the synthesis panel, labelled as the local
+        model's words. On-demand only: nothing is generated on
+        Step. A failed completion never falls back to the built-in
+        encoder: the session is fine, only the completion failed.
+        """
+        if self.encoder_kind != "local":
+            self.status_label.setText(
+                "Completion needs the Local model encoder.")
+            return
+        model = self.completion_combo.currentText()
+        if not model:
+            self.status_label.setText(
+                "No model is installed for completion.")
+            return
+        entries = self.engine.resonant_entries(5)
+        if not entries:
+            self.status_label.setText(
+                "No resonant inputs yet to complete from. Step a "
+                "few sentences on one theme first.")
+            return
+        prompt = ("These are the most resonant inputs from this "
+                  "session:\n")
+        for entry in entries:
+            prompt += "- %s\n" % entry[0]
+        prompt += "Continue the theme in one sentence."
+        try:
+            text = self.client.generate(
+                model, prompt, on_retry=self._on_service_retry)
+        except LocalModelError as exc:
+            self.logger.action("completion failed: %s" % exc)
+            self.status_label.setText(str(exc))
+            return
+        self._completion_model = model
+        self._completion_text = text.strip()
+        self.logger.action("completion from %s" % model)
+        self._refresh_synthesis()
+        # The completion sits at the bottom of the panel: scroll
+        # it into view, so the user sees the words they asked for
+        # instead of the top of the panel.
+        bar = self.synthesis_text.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self.status_label.setText("Completion from %s." % model)
 
     def on_step(self):
         text = self.input_edit.toPlainText().strip()
@@ -718,7 +848,7 @@ class MainWindow(QMainWindow):
             try:
                 h = self.client.embed(
                     self.local_model, text,
-                    on_retry=self._on_embed_retry)
+                    on_retry=self._on_service_retry)
             except LocalModelError as exc:
                 # Mid-session failure: fall back to the built-in
                 # encoder with a fresh W_t, and run this step on
@@ -975,6 +1105,10 @@ class MainWindow(QMainWindow):
         self.freeze_check.setChecked(frozen)
         self._heat_history = heat
         self._heat_follow = True
+        # A loaded session is a different session: the old
+        # completion does not carry over.
+        self._completion_model = None
+        self._completion_text = None
         self._set_encoder_ui()
         self.logger.action("session loaded from %s" % path)
         self._refresh_all()
@@ -1142,6 +1276,8 @@ class MainWindow(QMainWindow):
         self.engine.reset()
         self._heat_history = []
         self._heat_follow = True
+        self._completion_model = None
+        self._completion_text = None
         self.logger.action("session reset")
         self._refresh_all()
         self.status_label.setText("Reset. W_t is back to its start.")
@@ -1199,8 +1335,32 @@ class MainWindow(QMainWindow):
             self.buffer_list.addItem(item["text"])
 
     def _refresh_synthesis(self):
+        # Order: the analogy and counter-examples first, so the
+        # new sections are visible without scrolling; the
+        # neighbours and midpoint below them; the completion last
+        # (on_complete scrolls it into view when it arrives).
+        # setPlainText resets the scroll to the top, so after a
+        # step the panel always opens on the analogy.
         result = self.engine.synthesize()
         lines = []
+        if self.engine.buffer:
+            if result["analogy"] is not None:
+                lines.append(
+                    "Analogy - like \"%s\" is to \"%s\", your "
+                    "input points at:"
+                    % (result["analogy"]["a"],
+                       result["analogy"]["b"]))
+                text, score = result["analogy"]["result"]
+                lines.append("  %.3f  %s" % (score, text))
+            else:
+                lines.append(
+                    "Analogy: not enough resonant inputs yet "
+                    "(need two, plus another entry to point at).")
+            if result["counter_examples"]:
+                lines.append(
+                    "Counter-examples - what this session is not:")
+                for text, score in result["counter_examples"]:
+                    lines.append("  %.3f  %s" % (score, text))
         if result["neighbours"]:
             lines.append("Closest past inputs:")
             for text, score in result["neighbours"]:
@@ -1209,6 +1369,10 @@ class MainWindow(QMainWindow):
             lines.append("Midpoint neighbours:")
             for text, score in result["midpoint"]:
                 lines.append("  %.3f  %s" % (score, text))
+        if self._completion_text is not None:
+            lines.append("Local model (%s) said:"
+                         % self._completion_model)
+            lines.append("  %s" % self._completion_text)
         if not lines:
             lines.append("Step a few inputs and related past inputs "
                          "will show up here.")

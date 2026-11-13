@@ -25,10 +25,12 @@ A real, runnable prototype of the core idea from the blueprint:
 ## What this is not
 
 This is not a full self-evolving neural engine. There is no trained
-language model in here, and the synthesis head only surfaces related
-past inputs from your own session. It does not generate text from
-general knowledge. The honest label is in the window, and it stays
-there until a bigger engine actually exists.
+language model in here: the synthesis head surfaces related past
+inputs, analogies, and counter-examples from your own session, and
+the optional completion is the local model's own words, labelled
+with the model name in the panel. ACR itself does not generate text
+from general knowledge. The honest label is in the window, and it
+stays there until a bigger engine actually exists.
 
 ## Install
 
@@ -97,6 +99,17 @@ bash run.sh
    which encoder they used: a session saved with the local encoder
    needs the service running (with that model installed) to load
    back.
+10. The synthesis head shows more than neighbours now: an Analogy
+    (like one resonant input is to another, your input points at
+    a third past input), and Counter-examples (the past inputs
+    farthest from the current one: what this session is not).
+    When the Local model encoder is active, Complete with local
+    model asks another installed model to continue the theme from
+    the most resonant inputs; its words show in the panel,
+    labelled with the model name. The button is off while the
+    built-in encoder is active, and nothing is completed when no
+    other model is installed. The completion is on-demand only:
+    stepping never generates anything.
 
 ## If something breaks
 
@@ -119,6 +132,17 @@ previous sentence, so it is logged without an update. Resonance is
 the cosine between the sentence vector and the top direction of W_t,
 found by power iteration. Confidence is the share of W_t's energy in
 that top direction.
+
+The analogy takes the two most resonant past inputs (layer
+candidates first) and applies the direction between them to the
+current input: the nearest other past input to that point is the
+answer. Counter-examples are the past inputs with the lowest
+cosine to the current input. Both are built only from the
+session's own buffer and the resonance W_t reports; nothing comes
+from outside the session. A step counts as resonant when its
+resonance is at least 0.4: a fresh theme scores about 0.05-0.20
+and a settled theme holds about 0.45-0.55, so 0.4 sits between
+the noise and the plateau.
 
 A note on v0.1: the first version updated W_t with a different rule
 (learning to reconstruct each input) because the first attempt at

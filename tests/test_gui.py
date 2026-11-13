@@ -126,8 +126,10 @@ class GuiDriveTests(unittest.TestCase):
                          "Resonance: -")
 
     def test_window_size(self):
+        # v0.6: 700 tall, up from 680 -- the completion row under
+        # the synthesis panel pushed the layout past 680.
         self.assertEqual(self.window.width(), 1100)
-        self.assertEqual(self.window.height(), 680)
+        self.assertEqual(self.window.height(), 700)
 
 
 if __name__ == "__main__":

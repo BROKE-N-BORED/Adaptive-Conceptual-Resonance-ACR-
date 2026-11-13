@@ -50,8 +50,12 @@ steps). v0.1 shipped an auto-associative substitute while this was
 unresolved; v0.2 replaces it with the D-driven rule above.
 
 Nothing here trains a language model. The synthesis head in the app
-surfaces related past inputs from the session buffer; it does not
-generate text from general knowledge.
+surfaces related past inputs from the session buffer; since v0.6 it
+also builds analogies (the direction between the two most resonant
+inputs, applied to the current input) and counter-examples (the
+past inputs farthest from the current one). It does not generate
+text from general knowledge: the optional local-model completion
+is the local model's own words, labelled as such.
 
 A note on cost: at the built-in dim 64 the naive O(dim^2) math is
 fast, but a local embedding model returns dim 768, where forming
@@ -77,6 +81,13 @@ BUFFER_SIZE = 50
 SEED = 20261112
 RESONANCE_THRESHOLD = 0.75
 RESONANCE_JUMP = 0.25
+# v0.6: a step counts as resonant when its resonance is at least
+# this. A fresh theme scores about 0.05-0.20 and a settled theme
+# holds about 0.45-0.55 (16 theme steps, alpha 0.30: late steps
+# 0.46, 0.52, 0.48, 0.52; a mixed drive never passes 0.35), so 0.4
+# sits between the noise and the plateau. Resonant entries feed
+# the analogy and the local-model completion context.
+RESONANT_FLOOR = 0.4
 PREVIEW_LEN = 80
 SESSION_FORMAT_VERSION = 2
 
@@ -550,16 +561,65 @@ class Engine:
                 self.u[i][k] -= eff * du[i][k]
                 self.v[i][k] -= eff * dv[i][k]
 
+    def resonant_entries(self, count=None):
+        """Buffer entries from high-resonance steps, best first.
+
+        Returns [(text, vector, resonance, new_layer, step_id),
+        ...] for buffer entries whose step scored at least
+        RESONANT_FLOOR. Layer candidates (new-layer spikes) sort
+        first, then by resonance: the analogy prefers them.
+        Repeated inputs collapse to one entry each (the
+        best-ranked copy), so an analogy's two ends are always
+        two different inputs. `count` caps the list. The buffer
+        holds the last N inputs in step order, so buffer item j
+        is the trace entry for step (step_count - N + j + 1).
+        """
+        if not self.buffer:
+            return []
+        n = len(self.buffer)
+        ranked = []
+        for j, item in enumerate(self.buffer):
+            step_id = self.step_count - n + j + 1
+            entry = self.trace[step_id - 1]
+            if entry["resonance"] >= RESONANT_FLOOR:
+                ranked.append((item["text"], item["vector"],
+                               entry["resonance"],
+                               entry["new_layer"], step_id))
+        ranked.sort(key=lambda e: (e[3], e[2]), reverse=True)
+        out = []
+        seen = set()
+        for entry in ranked:
+            if entry[0] in seen:
+                continue
+            seen.add(entry[0])
+            out.append(entry)
+        if count is not None:
+            out = out[:count]
+        return out
+
     def synthesize(self):
-        """Demo synthesis head: neighbours + midpoint neighbours.
+        """Demo synthesis head: neighbours + midpoint + analogy +
+        counter-examples.
 
         Returns {"neighbours": [(text, score), ...], "midpoint":
-        [(text, score), ...]} scored by cosine to the latest input
-        vector (neighbours) and to the midpoint of the top two
-        neighbours (midpoint). Empty when the buffer is empty.
+        [(text, score), ...], "analogy": {"a": text, "b": text,
+        "result": (text, score)} or None, "counter_examples":
+        [(text, score), ...]}. Neighbours and midpoint are scored
+        as before (cosine to the latest input, and to the midpoint
+        of the top two neighbours). The analogy takes the two most
+        resonant past inputs A and B, forms the direction d =
+        h_B - h_A, and finds the nearest other past input to
+        h + d: like A is to B, the current input points at the
+        result. It is None when fewer than two resonant inputs
+        exist, or when no other input is left to point at: no
+        analogy is invented. Counter-examples are the distinct
+        past inputs farthest from the current input (lowest
+        cosine), up to three: what this session is not. Empty
+        when the buffer is empty.
         """
         if not self.buffer or self.h_prev is None:
-            return {"neighbours": [], "midpoint": []}
+            return {"neighbours": [], "midpoint": [],
+                    "analogy": None, "counter_examples": []}
         scored = []
         for item in self.buffer:
             scored.append((_dot(self.h_prev, item["vector"]),
@@ -591,4 +651,45 @@ class Engine:
                 midpoint = [(text, round(score, 4))
                             for score, text in mid_scored[:2]
                             if score > 0.0]
-        return {"neighbours": neighbours, "midpoint": midpoint}
+        analogy = None
+        resonant = self.resonant_entries(2)
+        if len(resonant) >= 2:
+            a_text, a_vec = resonant[0][0], resonant[0][1]
+            b_text, b_vec = resonant[1][0], resonant[1][1]
+            direction = [y - x for x, y in zip(a_vec, b_vec)]
+            target = _normalize([x + y for x, y in
+                                 zip(self.h_prev, direction)])
+            # Repeated inputs are the same point, so the analogy
+            # points at a different input: skip entries whose text
+            # is A, B, or the current input.
+            skip = {a_text, b_text, self.buffer[-1]["text"]}
+            target_scored = []
+            for item in self.buffer:
+                if item["text"] in skip:
+                    continue
+                target_scored.append(
+                    (_dot(target, item["vector"]), item["text"]))
+            if target_scored:
+                target_scored.sort(reverse=True)
+                score, text = target_scored[0]
+                analogy = {"a": a_text, "b": b_text,
+                           "result": (text, round(score, 4))}
+        # Counter-examples: the distinct past inputs farthest from
+        # the current input, lowest cosine first. Duplicates
+        # collapse to one entry each, so the three shown are three
+        # different inputs. The current input itself never counts.
+        current_text = self.buffer[-1]["text"]
+        farthest = {}
+        for item in self.buffer[:-1]:
+            if item["text"] == current_text:
+                continue
+            score = _dot(self.h_prev, item["vector"])
+            if (item["text"] not in farthest
+                    or score < farthest[item["text"]]):
+                farthest[item["text"]] = score
+        ranked = sorted(farthest.items(), key=lambda kv: kv[1])[:3]
+        counter_examples = [(text, round(score, 4))
+                            for text, score in ranked]
+        return {"neighbours": neighbours, "midpoint": midpoint,
+                "analogy": analogy,
+                "counter_examples": counter_examples}
