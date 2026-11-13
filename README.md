@@ -10,8 +10,10 @@ A real, runnable prototype of the core idea from the blueprint:
 - An encoder turns your text into a vector (deterministic, offline,
   no downloads, no model files).
 - A weight matrix W_t (low-rank, rank 8) updates a little on every
-  step, learning to reconstruct the input patterns it keeps seeing.
-  Repeated themes strengthen the direction they share.
+  step, learning to predict the next input from the previous one.
+  The update is driven by the drift between the two (the residual
+  signal from the blueprint), so repeated themes strengthen the
+  direction they share.
 - Resonance is the match between your input and the dominant
   direction of W_t, from 0 to 1. A spike flags a new-layer candidate.
 - The trace log records every step: what went in, how far W_t moved,
@@ -61,8 +63,10 @@ bash run.sh
    and the synthesis head shows related past inputs.
 3. Step a few sentences on one theme and watch the resonance climb.
    Switch themes and watch it drop.
-4. Alpha (the slider) sets how fast W_t adapts. Freeze weights logs
-   steps without changing W_t. The stability cap bounds each update.
+4. Alpha (the slider) sets how fast W_t adapts. It starts at 0.30,
+   the setting the resonance climb was verified at. Freeze weights
+   logs steps without changing W_t. The stability cap bounds each
+   update.
 5. Export trace JSON saves the whole trace log as a file.
 
 ## If something breaks
@@ -78,17 +82,29 @@ Each word gets a fixed vector from its hash, so the same text always
 encodes the same way. The sentence vector is the average of its word
 vectors. W_t starts random and small. On each step the program
 compares the new sentence vector with the last one (the drift), then
-takes a small gradient step so W_t gets better at reconstructing the
-patterns it sees, with the step size gated by the drift and a small
-decay so stale directions fade. Resonance is the cosine between the
-sentence vector and the top direction of W_t, found by power
-iteration. Confidence is the share of W_t's energy in that top
-direction.
+takes a small gradient step so W_t gets better at predicting the new
+sentence vector from the last one: the error driving the step is the
+unpredicted part of the drift. The step size is gated by the drift
+and a small decay fades stale directions. The first step has no
+previous sentence, so it is logged without an update. Resonance is
+the cosine between the sentence vector and the top direction of W_t,
+found by power iteration. Confidence is the share of W_t's energy in
+that top direction.
+
+A note on v0.1: the first version updated W_t with a different rule
+(learning to reconstruct each input) because the first attempt at
+the blueprint's drift-driven rule chased noise. v0.2 fixes the rule
+itself instead: the drift on its own is mostly word-sampling noise
+at this scale, so the working form of the rule predicts the next
+input from the previous one, with the drift as the signal that
+drives each update. The probe numbers behind that call are in
+DELTA-RULE-PROBE.md.
 
 ## Files
 
 - `acr_app.py` - the window
 - `acr_engine.py` - the adaptive loop (standard library only)
+- `DELTA-RULE-PROBE.md` - the probe numbers behind the v0.2 rule fix
 - `debug_log.py` - the debug log layer (standard library only)
 - `install.sh` / `run.sh` - install and run
 - `ACR.desktop` / `Install-ACR.desktop` - menu and desktop launchers

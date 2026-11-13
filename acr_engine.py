@@ -6,17 +6,43 @@ loop, not a full neural engine:
 - Encoder: deterministic hashed word vectors, dim 64. Same input
   always gives the same vector. No downloads, no model files.
 - Dynamic weight matrix W_t: low-rank U V^T, rank 8. Each input step
-  updates the factors by a gradient step on the auto-associative
-  loss L = 0.5 * ||W h - h||^2, so W_t learns to reconstruct the
-  input patterns it keeps seeing: repeated themes strengthen the
-  direction they share, and resonance climbs for them. The step
-  size is gated by the residual drift delta = h - h_prev (small
-  drift, small step: nothing new to learn), plus a small decay so
-  stale directions fade. The stability cap bounds every step.
+  updates the factors by the blueprint's rule (section 2, steps 2-3):
+  the residual signal is the drift D = h - h_prev, and the update is
+  a gradient step on L(D, theta). The blueprint's L is "alignment
+  between the predicted next token distribution and the observed D".
+  There is no token distribution at this scale, so L is defined in
+  the closest concrete form: L = -0.5 * ||W h_prev - h||^2, the
+  negative prediction error between the predicted next embedding
+  (W h_prev) and the observed next embedding (h = h_prev + D).
+  Ascending L is descending the prediction loss. The error driving
+  the update is (W h_prev - h) = (W h_prev - h_prev) - D: the
+  unpredicted part of the drift. So the update is driven by D, not
+  by reconstructing h: W_t learns the transition structure of the
+  input flow, and repeated themes strengthen the direction they
+  share, so resonance climbs for them. The step size is gated by
+  the drift size (small drift, small step: nothing new to learn),
+  plus a small decay so stale directions fade. The stability cap
+  bounds every step. The first step has no previous state, so it
+  is logged without an update: there is nothing to predict from.
 - Resonance: cosine between the input embedding and the dominant
   direction of W_t (found by power iteration on W^T W). A spike
   flags a new-layer candidate.
 - Trace log: every step records what changed and why.
+
+Why the loss is this form and not D as a direct target: v0.1 tried
+regressing W onto D itself (L = 0.5 * ||W h_prev - D||^2) and it
+failed. The probe numbers (see DELTA-RULE-PROBE.md) show why: at
+this scale the per-step drift is dominated by word-sampling noise
+(consecutive theme sentences share only cos 0.19-0.30, ||D|| is
+about 1.1), the drifts of one theme cycle point in mostly opposing
+directions and sum to exactly zero over the cycle, so a D-target
+update mostly cancels itself from step to step: resonance spiked
+and collapsed (late min 0.011, max 0.600, mean 0.298 over 30 theme
+steps) instead of climbing. The next-embedding form keeps the
+update driven by D while the theme's stable component accumulates
+(late mean 0.523, min 0.357, max 0.590, sustained through 60
+steps). v0.1 shipped an auto-associative substitute while this was
+unresolved; v0.2 replaces it with the D-driven rule above.
 
 Nothing here trains a language model. The synthesis head in the app
 surfaces related past inputs from the session buffer; it does not
@@ -158,7 +184,9 @@ class Engine:
         """Run one adaptive step on the given text.
 
         Returns the trace entry for this step. When frozen, W_t is
-        not updated but the step is still logged.
+        not updated but the step is still logged. The first step is
+        also logged without an update: with no previous state there
+        is no drift to learn from and nothing to predict.
         """
         h = encode(text)
         if self.h_prev is None:
@@ -168,12 +196,12 @@ class Engine:
         delta_norm = _norm(delta)
         old_norm = self.w_norm()
 
-        if not frozen:
+        if not frozen and self.h_prev is not None:
             # The residual gates the step: a big semantic drift
             # earns the full learning rate, a tiny drift earns
             # almost nothing.
             gated_alpha = alpha * min(1.0, delta_norm)
-            self._update(h, gated_alpha, cap)
+            self._update(self.h_prev, h, gated_alpha, cap)
 
         # Materialize W_t once and reuse it for the norm and the
         # dominant direction.
@@ -222,29 +250,34 @@ class Engine:
         self.prev_resonance = resonance
         return entry
 
-    def _update(self, h, alpha, cap):
-        """Gradient step on L = 0.5 * ||W h - h||^2, via U and V.
+    def _update(self, h_prev, h, alpha, cap):
+        """Gradient step on L = 0.5 * ||W h_prev - h||^2, via U and V.
 
-        A small decay is applied first so directions W_t has not
-        seen lately fade. The step size is capped: if alpha times
-        the update norm would exceed the stability cap, the update
-        is scaled down to it.
+        This is the blueprint's rule with L defined as next-embedding
+        alignment (see the module docstring): W_t predicts the next
+        embedding from the previous one, and the error
+        (W h_prev - h) is the unpredicted part of the drift
+        D = h - h_prev, so the update is driven by D. A small decay
+        is applied first so directions W_t has not seen lately fade.
+        The step size is capped: if alpha times the update norm
+        would exceed the stability cap, the update is scaled down
+        to it.
         """
         decay = 1.0 - 0.005
         for i in range(DIM):
             for k in range(RANK):
                 self.u[i][k] *= decay
                 self.v[i][k] *= decay
-        # a = V^T h, z = U a, err = z - h
+        # a = V^T h_prev, z = U a, err = z - h
         vt = _transpose(self.v)
-        a = _matvec(vt, h)
+        a = _matvec(vt, h_prev)
         z = _matvec(self.u, a)
         err = [zi - hi for zi, hi in zip(z, h)]
-        # dL/dU = err (x) a ; dL/dV = h (x) U^T err
+        # dL/dU = err (x) a ; dL/dV = h_prev (x) U^T err
         du = _outer(err, a)
         ut = _transpose(self.u)
         ut_err = _matvec(ut, err)
-        dv = _outer(h, ut_err)
+        dv = _outer(h_prev, ut_err)
         update_norm = math.sqrt(_frobenius(du) ** 2
                                 + _frobenius(dv) ** 2)
         step_size = alpha * update_norm

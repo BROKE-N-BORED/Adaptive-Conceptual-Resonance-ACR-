@@ -8,7 +8,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
-from acr_engine import BUFFER_SIZE, DIM, Engine, encode  # noqa: E402
+from acr_engine import (  # noqa: E402
+    BUFFER_SIZE, DIM, Engine, _frobenius, _materialize_w,
+    _matvec, encode)
 
 
 def _cosine(a, b):
@@ -38,8 +40,12 @@ class EncoderTests(unittest.TestCase):
 
 class StepTests(unittest.TestCase):
     def test_step_updates_w_norm(self):
+        # v0.2 note: the first step logs without an update (no
+        # previous state to predict from), so the update is checked
+        # on the second step.
         engine = Engine()
-        entry = engine.step("quantum entanglement is strange")
+        engine.step("quantum entanglement is strange")
+        entry = engine.step("entangled particles share a state")
         self.assertNotEqual(entry["old_norm"], entry["new_norm"])
 
     def test_resonance_and_confidence_in_range(self):
@@ -100,7 +106,10 @@ class StepTests(unittest.TestCase):
 class FreezeTests(unittest.TestCase):
     def test_frozen_step_keeps_w(self):
         engine = Engine()
+        # v0.2 note: two warm-up steps, because the first step logs
+        # without an update (no previous state to predict from).
         engine.step("warm up the weights")
+        engine.step("warm them up some more")
         before = engine.w_norm()
         entry = engine.step("frozen input", frozen=True)
         self.assertEqual(entry["old_norm"], entry["new_norm"])
@@ -166,6 +175,115 @@ class ResonanceTests(unittest.TestCase):
             entry = engine.step(texts[i % 4], alpha=0.3)
             flags += 1 if entry["new_layer"] else 0
         self.assertGreater(flags, 0)
+
+
+class DeltaRuleTests(unittest.TestCase):
+    """v0.2: the update is driven by the drift D = h - h_prev.
+
+    v0.1 shipped an auto-associative substitute (W learns to
+    reconstruct h) because the first attempt at the blueprint's
+    rule regressed W onto D itself and chased noise. v0.2 implements
+    the blueprint's rule with L defined as next-embedding alignment:
+    W predicts the next embedding from the previous one, and the
+    error driving the update is the unpredicted part of D. These
+    tests pin that behaviour, including the regression test that
+    would have caught the original failure.
+    """
+
+    def test_first_step_logs_without_update(self):
+        engine = Engine()
+        entry = engine.step("quantum entanglement is strange")
+        self.assertEqual(entry["id"], 1)
+        self.assertEqual(entry["old_norm"], entry["new_norm"])
+        self.assertEqual(len(engine.trace), 1)
+
+    def test_second_step_updates_w(self):
+        engine = Engine()
+        engine.step("quantum entanglement is strange")
+        entry = engine.step("entangled particles share a state")
+        self.assertNotEqual(entry["old_norm"], entry["new_norm"])
+
+    def test_update_reduces_prediction_error(self):
+        # The rule learns to predict the drifted-to state: after
+        # one update, ||W h_prev - h|| must be smaller than before.
+        x = "quantum entanglement links particles"
+        y = "baking bread needs warm dough"
+        engine = Engine()
+        engine.step(x, alpha=0.3)
+        h_prev, h = encode(x), encode(y)
+
+        def error():
+            w = _materialize_w(engine.u, engine.v)
+            pred = _matvec(w, h_prev)
+            return sum((p - t) ** 2
+                       for p, t in zip(pred, h)) ** 0.5
+
+        before = error()
+        engine.step(y, alpha=0.3)
+        self.assertLess(error(), before)
+
+    def test_update_follows_the_drift(self):
+        # Same first step, then a drifting second step vs the same
+        # text again (zero drift): the two W_t matrices must end up
+        # clearly different, because the update follows D.
+        x = "quantum entanglement links particles"
+        y = "baking bread needs warm dough"
+        drifting = Engine()
+        drifting.step(x, alpha=0.3)
+        drifting.step(y, alpha=0.3)
+        still = Engine()
+        still.step(x, alpha=0.3)
+        still.step(x, alpha=0.3)
+        wa = _materialize_w(drifting.u, drifting.v)
+        wb = _materialize_w(still.u, still.v)
+        diff = [[a - b for a, b in zip(ra, rb)]
+                for ra, rb in zip(wa, wb)]
+        self.assertGreater(_frobenius(diff), 0.1)
+
+    def test_repeated_theme_sustains_resonance(self):
+        # REGRESSION: the v0.1 drift-target attempt spiked and
+        # collapsed (30 theme steps, alpha 0.3: late mean 0.298,
+        # late min 0.011). The fixed rule climbs and stays up
+        # (late mean 0.523, late min 0.357). A max-only check would
+        # have passed the broken rule too (its max late was 0.600),
+        # so this pins the mean and the floor.
+        engine = Engine()
+        texts = ["quantum entanglement links particles",
+                 "entangled particles share a state",
+                 "quantum particles stay connected",
+                 "entanglement links distant particles"]
+        res = []
+        for i in range(30):
+            entry = engine.step(texts[i % 4], alpha=0.3)
+            res.append(entry["resonance"])
+        early, late = res[:5], res[20:]
+        self.assertGreater(max(late), max(early))
+        self.assertGreater(sum(late) / len(late), 0.4)
+        self.assertGreater(min(late), 0.3)
+
+    def test_theme_switch_drops_resonance(self):
+        engine = Engine()
+        theme_a = ["quantum entanglement links particles",
+                   "entangled particles share a state",
+                   "quantum particles stay connected",
+                   "entanglement links distant particles"]
+        theme_b = ["baking bread needs warm dough",
+                   "the oven glows hot at dawn",
+                   "flour dust covers the table",
+                   "knead the dough until smooth"]
+        late_a = []
+        for i in range(30):
+            entry = engine.step(theme_a[i % 4], alpha=0.3)
+            if i >= 20:
+                late_a.append(entry["resonance"])
+        first_b = []
+        for i in range(3):
+            entry = engine.step(theme_b[i], alpha=0.3)
+            first_b.append(entry["resonance"])
+        mean_a = sum(late_a) / len(late_a)
+        mean_b = sum(first_b) / len(first_b)
+        self.assertLess(mean_b, 0.2)
+        self.assertLess(mean_b, mean_a)
 
 
 class SynthesisTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.1.
+"""ACR - Adaptive Contextual Resonance, v0.2.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log.
@@ -26,7 +26,7 @@ from acr_engine import BUFFER_SIZE, DIM, RANK, Engine
 from debug_log import DebugLogger, check_ollama
 
 APP_NAME = "acr"
-VERSION = "0.1"
+VERSION = "0.2"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
@@ -87,7 +87,7 @@ class MainWindow(QMainWindow):
         self.step_label = QLabel("Step: 0")
         self.norm_label = QLabel("W norm: -")
         self.resonance_label = QLabel("Resonance: -")
-        self.alpha_label = QLabel("Alpha: 0.10")
+        self.alpha_label = QLabel("Alpha: 0.30")
         for label in (self.step_label, self.norm_label,
                       self.resonance_label, self.alpha_label):
             left.addWidget(label)
@@ -95,7 +95,7 @@ class MainWindow(QMainWindow):
         left.addWidget(QLabel("Learning rate (alpha)"))
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(1, 50)
-        self.alpha_slider.setValue(10)
+        self.alpha_slider.setValue(30)
         self.alpha_slider.setTickPosition(QSlider.TicksBelow)
         self.alpha_slider.setTickInterval(10)
         self.alpha_slider.valueChanged.connect(self._on_alpha_changed)

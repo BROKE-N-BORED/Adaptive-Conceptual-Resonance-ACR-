@@ -68,16 +68,25 @@ class GuiDriveTests(unittest.TestCase):
                          "Type something first.")
 
     def test_freeze_stops_norm_change(self):
+        # v0.2 note: two warm-up steps, because the first step logs
+        # without an update (no previous state to predict from).
         self._step_text("warm up the weights first")
+        self._step_text("warm them up some more")
         before = self.window.norm_label.text()
         self.window.freeze_check.setChecked(True)
         self._step_text("this step is frozen")
         self.assertEqual(self.window.norm_label.text(), before)
-        self.assertEqual(self.window.trace_table.rowCount(), 2)
+        self.assertEqual(self.window.trace_table.rowCount(), 3)
 
     def test_alpha_slider_updates_label(self):
         self.window.alpha_slider.setValue(25)
         self.assertEqual(self.window.alpha_label.text(), "Alpha: 0.25")
+
+    def test_default_alpha_is_030(self):
+        # v0.2: the default is 0.30, the setting the resonance
+        # climb was verified at; at 0.10 the climb is much slower.
+        self.assertEqual(self.window.alpha_slider.value(), 30)
+        self.assertEqual(self.window.alpha_label.text(), "Alpha: 0.30")
 
     def test_synthesis_shows_neighbours(self):
         self._step_text("quantum entanglement links particles")
