@@ -1,7 +1,8 @@
-# ACR v0.8.1 - Adaptive Contextual Resonance
+# ACR v0.9 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
+Or point the loop at a whole file and see what is in it.
 
 ## What this is
 
@@ -22,6 +23,10 @@ A real, runnable prototype of the core idea from the blueprint:
 - The trace log records every step: what went in, how far W_t moved,
   the resonance, the confidence, and whether the cap clipped the
   step (10 columns in all).
+- Analyze a file runs the same loop over every line of a text file
+  or a folder of them, and shows what is in it: the themes, the
+  core entries, the outliers, and where the topic changes. The
+  core entries export as a curated file, plain text or .jsonl.
 
 ## What this is not
 
@@ -64,17 +69,23 @@ bash run.sh
 
 ## Use
 
+The menu bar holds everything: File for sessions and exports, View
+for the windows, Help for the How to Use guide. The main window
+stays simple: encoder, input, Step, the key readouts, and the
+synthesis head. The rest lives in its own window, opened from View.
+
 1. Type a sentence in the input box.
 2. Press Step, or Enter in the input box. The readouts update, a
    row appears in the trace log, and the synthesis head shows
    related past inputs.
 3. Step a few sentences on one theme and watch the resonance climb.
    Switch themes and watch it drop.
-4. Alpha (the slider) sets the base learning rate: how fast W_t
-   adapts. It starts at 0.30, the setting the resonance climb was
-   verified at. The Schedule picker scales it: Steady keeps the
-   base, Fast-adapt starts at twice the base and settles back to
-   it over the first steps, Gentle runs at one third of the base.
+4. The Controls window holds the learning controls. Alpha (the
+   slider) sets the base learning rate: how fast W_t adapts. It
+   starts at 0.30, the setting the resonance climb was verified
+   at. The Schedule picker scales it: Steady keeps the base,
+   Fast-adapt starts at twice the base and settles back to it
+   over the first steps, Gentle runs at one third of the base.
    The Alpha readout shows the rate the next step will use, and
    the trace log records it per step. Freeze: Off adapts as
    usual; Whole W_t logs steps without changing W_t; Rank
@@ -82,14 +93,16 @@ bash run.sh
    the rest keep adapting. The stability cap bounds each update;
    the top singular value next to it is the size of W_t's
    strongest direction, and the Capped column in the trace log
-   marks steps the cap actually clipped.
+   marks steps the cap actually clipped. Every control explains
+   itself underneath.
 5. Export trace JSON saves the whole trace log as a file. Export
    trace CSV saves the same log as a spreadsheet-friendly file.
-6. The Resonance views tab shows the W_t norm over time (red dots
-   are resonance spikes), the change heatmap for one step (pick a
-   step to look back, or leave it on the latest), and the layer
-   candidates: resonance spikes with the input that triggered them.
-   Click a candidate to see its trace entries.
+   Both are on the File menu.
+6. The Resonance views window shows the W_t norm over time (red
+   dots are resonance spikes), the change heatmap for one step
+   (pick a step to look back, or leave it on the latest), and the
+   layer candidates: resonance spikes with the input that
+   triggered them. Click a candidate to see its trace entries.
 7. Save session writes the whole session (W_t, buffer, trace,
    settings) to one JSON file. Load session brings it back exactly
    where you left off. Export session writes the same session as
@@ -97,11 +110,14 @@ bash run.sh
    final state at the top.
 8. Reset asks first, then clears the session and puts W_t back to
    its start.
-9. Encoder: the picker offers Built-in or Local model. Local model
-   uses the embeddings of the local model service running on this
-   computer (Ollama, at http://127.0.0.1:11434). Pick a model
-   from the list; the embedding model is picked first when it is
-   installed. Start service starts the service for you if it is
+9. Encoder: the picker offers Built-in or Local model. Built-in
+   stays the default, because the app cannot run with no encoder
+   at all. Local model uses the embeddings of the local model
+   service running on this computer (Ollama, at
+   http://127.0.0.1:11434). Picking Local model lists every
+   installed model with what it does and whether it fits this PC;
+   nothing is picked for you, pick a model to use the local
+   encoder. Start service starts the service for you if it is
    not running, so you never need the terminal for it. Switching
    encoders starts a fresh W_t, because the embedding sizes differ:
    the trace and buffer clear, and the window says so. If the
@@ -109,28 +125,66 @@ bash run.sh
    encoder with a fresh W_t and says so plainly. Sessions remember
    which encoder they used: a session saved with the local encoder
    needs the service running (with that model installed) to load
-   back.
+   back. Local-model calls run in a worker thread, so the window
+   stays responsive while the model works; the busy light is lit
+   and Cancel is offered.
 10. The synthesis head shows more than neighbours now: an Analogy
     (like one resonant input is to another, your input points at
     a third past input), and Counter-examples (the past inputs
     farthest from the current one: what this session is not).
     When the Local model encoder is active, Complete with local
-    model asks another installed model to continue the theme from
-    the most resonant inputs; its words show in the panel,
-    labelled with the model name. The button is off while the
-    built-in encoder is active. The picker lists every installed
-    model and defaults to one that is not the encoder model; when
-    the encoder model is the only one installed, it is the pick.
-    The completion is on-demand only: stepping never generates
-    anything.
+    model asks an installed model to continue the theme from the
+    most resonant inputs; its words show in the panel, labelled
+    with the model name. The button is off until a model is picked
+    in its picker, which lists every installed model the same way
+    the encoder picker does. The completion is on-demand only:
+    stepping never generates anything.
 11. Revert: click a step in the trace log, then Revert W_t to
     selected step, to roll W_t back to its state after that
     step. It asks first, and the trace log keeps a revert entry
     so the history shows what happened. The last 200 steps are
-    kept for reverting; older steps age out. A loaded session
-    starts its revert history from the loaded state.
+    kept for reverting on an 8 GB machine; the limit adapts to
+    the machine's RAM (fewer on smaller machines, more on bigger
+    ones), because snapshots are real memory. Older steps age out.
+    A loaded session starts its revert history from the loaded
+    state.
+12. Analyze a file (the button on the main window, or View, then
+    Analyze a file) runs the same loop over every line of a text
+    file or a folder of them, in file order. Plain text, .md, and
+    .jsonl all work; a .jsonl record uses its text field. The
+    progress bar shows how far along it is, Cancel stops it, and
+    the steps it finished stay in the trace like typed ones. When
+    it finishes, the results land as tiles: one big tile for the
+    headline (themes found and the strongest theme), then tiles
+    for the resonance chart over the run, the themes found, the
+    core entries (the most resonant: the heart of the file), the
+    outliers (the noise and off-topic lines), and the theme shifts
+    (where the topic changes). Export curated file saves the core
+    entries as plain
+    text, one per line; Export curated .jsonl saves them as one
+    {"text": ...} object per line; Export report saves the whole
+    analysis as readable text. Export STELLA data pack writes one
+    training-data pack per theme found (a folder with a .jsonl
+    file of training rows, a README, and a manifest), plus one
+    off-topic pack for the entries that belong to no theme. The
+    packs teach a model what ACR found, not the raw text: theme
+    membership, closest matches, analogies, and resonance
+    judgments, all measured from the run. Every entry is verbatim
+    from the source: nothing is invented. STELLA needs 2 or more
+    rows per file, so a pack with fewer says so in its README.
 
-The window remembers its size and position between runs.
+Every window remembers its size and position between runs.
+Re-clicking the icon focuses the running app; it never starts a
+second copy.
+
+The app has a dark look drawn from its icon: deep dark surfaces,
+gold for resonance, blue as the secondary. When the loop flags a
+new layer, the chart dot lands with a spring settle, the resonance
+readout glows gold, and the trace row highlights, then everything
+rests. When a run or a pack export finishes, a checkmark draws
+itself next to the status line. The motion is one-shot and under
+half a second, and it marks real events only; when nothing is
+happening, the UI is still.
 
 ## If something breaks
 
@@ -176,6 +230,15 @@ the noise and the plateau. Every synthesis list shows each input
 once: repeated inputs are the same point, so they collapse to one
 line each instead of repeating.
 
+Two limits in the app have concrete reasons. The latent state
+buffer holds the last 50 inputs: the synthesis head works from
+recent context, and older inputs have faded from what W_t has
+learned, so keeping more would only slow the neighbour search.
+The revert history keeps the last 200 steps on an 8 GB machine
+(the limit scales with RAM): each snapshot is two factor
+matrices, so an unbounded history would grow with every step
+until the machine ran out of room.
+
 A note on v0.1: the first version updated W_t with a different rule
 (learning to reconstruct each input) because the first attempt at
 the blueprint's drift-driven rule chased noise. v0.2 fixes the rule
@@ -189,9 +252,13 @@ DELTA-RULE-PROBE.md.
 
 - `acr_app.py` - the window and the resonance views
 - `acr_engine.py` - the adaptive loop (standard library only)
+- `acr_packs.py` - the STELLA data pack writer: theme
+  membership, closest matches, analogies, and resonance
+  judgments as prompt/completion rows, one pack per theme
 - `local_encoder.py` - the local-model encoder client (standard
   library only)
 - `DELTA-RULE-PROBE.md` - the probe numbers behind the v0.2 rule fix
+- `HOW-TO-USE.md` - the How to Use guide, shown in the app's Help menu
 - `CHANGELOG.md` - what changed in each version, in plain words
 - `debug_log.py` - the debug log layer (standard library only)
 - `install.sh` / `run.sh` - install and run

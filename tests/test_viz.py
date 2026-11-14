@@ -39,7 +39,8 @@ class VizTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.window = MainWindow(log_dir=self.tmp.name)
         self.window.show()
-        self.window.tabs.setCurrentIndex(1)
+        # v0.9: the views live in their own window now, not a tab.
+        self.window.show_views_window()
 
     def tearDown(self):
         self.window.close()
@@ -194,11 +195,20 @@ class VizTests(unittest.TestCase):
                          "No steps yet.")
         self.assertFalse(self.window.heat_spin.isEnabled())
 
-    def test_views_tab_exists(self):
-        self.assertEqual(self.window.tabs.count(), 2)
-        self.assertEqual(self.window.tabs.tabText(0), "Trace log")
-        self.assertEqual(self.window.tabs.tabText(1),
-                         "Resonance views")
+    def test_views_window_exists(self):
+        # v0.9: the trace log and the resonance views are
+        # dedicated windows now, not tabs. Same widgets, same
+        # content, reachable from the View menu.
+        self.assertIsNotNone(self.window.trace_window)
+        self.assertIsNotNone(self.window.views_window)
+        self.assertIn("Trace log",
+                      self.window.trace_window.windowTitle())
+        self.assertIn("Resonance views",
+                      self.window.views_window.windowTitle())
+        self.assertIs(self.window.trace_table.parentWidget(),
+                      self.window.trace_window)
+        self.assertIs(self.window.norm_chart.parentWidget(),
+                      self.window.views_window)
 
 
 if __name__ == "__main__":

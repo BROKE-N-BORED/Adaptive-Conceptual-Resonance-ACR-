@@ -2,6 +2,58 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.9 (2026-11-13) - UI rebuild and Analyze a file
+
+- Analyze a file: point the loop at a text file or a folder and see
+  what is in it. Every line becomes one step, in file order, the
+  same way typing would. The results land as tiles: one big tile
+  for the headline (themes found and the strongest theme), then
+  tiles for the resonance chart, the themes found, the core
+  entries (the heart of the file), the outliers (the noise and
+  off-topic lines), and the theme shifts (where the topic
+  changes). The core entries export
+  as a curated file, plain text or .jsonl, and the whole analysis
+  exports as a readable report. Export STELLA data pack writes
+  one training-data pack per theme (a folder with a .jsonl file,
+  a README, and a manifest), plus one off-topic pack for the
+  entries that belong to no theme. The packs teach a model what
+  ACR found: theme membership, closest matches, analogies, and
+  resonance judgments, all measured from the run. It runs in the
+  background with a progress bar and Cancel, and the steps it
+  finishes stay in the trace like typed ones.
+- A real menu bar: File for sessions and exports, View for the
+  windows, Help for the How to Use guide.
+- The crowded single window is split into dedicated windows: Main
+  (encoder, input, Step, readouts, synthesis), Controls (learning
+  rate, freeze, schedule, cap), Trace log, Resonance views, and
+  Analyze a file. Nothing was removed, only reorganised. Every
+  window remembers its size and position.
+- How to Use window: the guide from the Help menu, with an index
+  of sections. It reads HOW-TO-USE.md, which ships in the release.
+- Re-clicking the icon focuses the running app instead of starting
+  a second copy.
+- A busy light next to the status line: gold while the app is
+  working, grey at rest.
+- Local-model calls run in a worker thread now, so the window stays
+  responsive while the model works, with Cancel offered.
+- The model picker starts unselected and shows what each model does
+  and whether it fits this PC. Nothing is picked for you.
+- Every field explains itself in plain words underneath it.
+- A real visual identity, drawn from the icon: a dark UI with deep
+  dark surfaces, gold as the resonance accent and blue as the
+  secondary. One look across every window.
+- The resonance moment: when the loop flags a new layer, the chart
+  dot lands with a spring settle, the resonance readout glows gold,
+  and the trace row highlights. When a run or a pack export
+  finishes, a checkmark draws itself next to the status line. All
+  motion is one-shot and under half a second; when nothing is
+  happening, the UI rests.
+- The revert history limit adapts to the machine's RAM: 200 steps
+  on an 8 GB machine, fewer on smaller machines, more on bigger
+  ones.
+- No change to the update rule: the 16-theme numbers are still
+  exact.
+
 ## v0.8.1 (2026-11-13) - Launch fix
 
 - The desktop and menu icon now launch the app. It used to look

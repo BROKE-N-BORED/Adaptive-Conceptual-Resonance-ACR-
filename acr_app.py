@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.8.1.
+"""ACR - Adaptive Contextual Resonance, v0.9.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -39,6 +39,16 @@ v0.8.1 is a launch fix, no new features: the desktop and menu
 icon now start the app. It used to look for the program next to
 the icon file, which is the wrong folder once installed, so
 clicking the icon did nothing.
+
+v0.9 is a UI rebuild to the design rules: a real menu bar, the
+crowded single window split into dedicated windows (Main,
+Controls, Trace log, Resonance views), a How to Use window that
+reads HOW-TO-USE.md, single instance, a busy light, local-model
+calls in a worker thread so the window never blocks, a guided
+model picker that starts unselected, plain-words explanations
+under every field, a restrained identity pass, and a snapshot
+limit that adapts to the machine's RAM. The engine is untouched:
+the 16-theme numbers are still exact.
 """
 
 import csv
@@ -47,43 +57,164 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 import time
 
-from PySide6.QtCore import QEvent, QProcess, QRect, QSettings, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PySide6.QtCore import (QEasingCurve, QEvent, QLockFile, QObject,
+                            QProcess, QPropertyAnimation, QRect,
+                            QSettings, Qt, QThread, Signal,
+                            QVariantAnimation, Property)
+from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon,
+                           QPainter, QPen, QTextCursor)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSlider, QSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+    QFrame, QGraphicsEffect, QGridLayout, QHBoxLayout, QHeaderView,
+    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QTableWidget, QTableWidgetItem, QTextBrowser, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
 from acr_engine import (BUFFER_SIZE, DIM, RANK, SCHEDULES,
                         SCHEDULE_STEADY, Engine,
                         SESSION_FORMAT_VERSION, SessionError,
-                        schedule_alpha)
+                        mem_total_bytes, schedule_alpha)
+from acr_packs import default_packs_dir, export_stella_packs
 from debug_log import DebugLogger, check_ollama
 from local_encoder import (
     MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
     MSG_START_FAILED, LocalModelClient, LocalModelError,
-    pick_completion_model, pick_default_model)
+    model_display_text)
 
 APP_NAME = "acr"
-VERSION = "0.8.1"
+VERSION = "0.9"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
+
+# v0.9 identity (U15): ACR's own dark look, drawn from the icon
+# (dark rounded square, gold dot, blue/gold arcs). Deep dark
+# surfaces, gold as the resonance accent, blue as the secondary.
+# One stylesheet, applied by main() to the whole app (and by any
+# verify harness that builds windows directly).
+THEME_BG = "#1d1d23"
+THEME_PANEL = "#26262e"
+THEME_INPUT = "#2e2e38"
+THEME_BORDER = "#3a3a44"
+THEME_TEXT = "#e9e9ec"
+THEME_DIM = "#a9a9b3"
+HEADER_COLOR = "#e3c565"
+ACCENT_GOLD = "#c9a227"
+ACCENT_GOLD_BRIGHT = "#e3c565"
+ACCENT_GOLD_DARK = "#8a6d1a"
+ACCENT_BLUE = "#6ea8d8"
+GLOW_GOLD = "#ffd75e"
+BUSY_OFF = "#4a4a54"
+
+DARK_STYLESHEET = """
+QMainWindow { background: #1d1d23; color: #e9e9ec; }
+QDialog { background: #1d1d23; color: #e9e9ec; }
+QWidget#subwindow { background: #1d1d23; color: #e9e9ec; }
+QLabel { color: #e9e9ec; }
+QPushButton { background: #33333e; color: #e9e9ec;
+    border: 1px solid #4a4a56; border-radius: 6px;
+    padding: 6px 14px; }
+QPushButton:hover { background: #3d3d49; }
+QPushButton:pressed { background: #2a2a32; }
+QPushButton:disabled { color: #77777f; background: #26262e;
+    border-color: #33333e; }
+QPushButton#primaryButton { background: #c9a227; color: #1d1d23;
+    font-weight: bold; border: 1px solid #c9a227; }
+QPushButton#primaryButton:hover { background: #d8b73a; }
+QPushButton#primaryButton:pressed { background: #a8861d; }
+QPushButton#primaryButton:disabled { background: #55553f;
+    color: #99998a; border-color: #55553f; }
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+QComboBox, QListWidget, QTableWidget, QTextBrowser {
+    background: #2e2e38; color: #e9e9ec;
+    border: 1px solid #3a3a44; border-radius: 6px; }
+QComboBox::drop-down { border: none; }
+QComboBox QAbstractItemView { background: #2e2e38; color: #e9e9ec;
+    selection-background-color: #8a6d1a; }
+QListWidget::item:selected, QTableWidget::item:selected {
+    background: #8a6d1a; color: #ffffff; }
+QHeaderView::section { background: #26262e; color: #e9e9ec;
+    border: 1px solid #3a3a44; padding: 4px; }
+QMenuBar { background: #1d1d23; color: #e9e9ec; }
+QMenuBar::item:selected { background: #33333e; }
+QMenu { background: #26262e; color: #e9e9ec;
+    border: 1px solid #3a3a44; }
+QMenu::item:selected { background: #8a6d1a; }
+QProgressBar { background: #2e2e38; border: 1px solid #3a3a44;
+    border-radius: 6px; text-align: center; color: #e9e9ec; }
+QProgressBar::chunk { background: #c9a227; border-radius: 6px; }
+QSlider::groove:horizontal { background: #2e2e38; height: 6px;
+    border-radius: 3px; }
+QSlider::handle:horizontal { background: #c9a227; width: 16px;
+    margin: -6px 0; border-radius: 8px; }
+QCheckBox::indicator { width: 16px; height: 16px;
+    border: 1px solid #4a4a56; border-radius: 4px;
+    background: #2e2e38; }
+QCheckBox::indicator:checked { background: #c9a227;
+    border-color: #c9a227; }
+QFrame#tile { background: #26262e; border: 1px solid #33333e;
+    border-radius: 14px; }
+QScrollBar:vertical { background: #26262e; width: 12px;
+    border-radius: 6px; }
+QScrollBar::handle:vertical { background: #4a4a56;
+    border-radius: 6px; min-height: 20px; }
+QScrollBar:horizontal { background: #26262e; height: 12px;
+    border-radius: 6px; }
+QScrollBar::handle:horizontal { background: #4a4a56;
+    border-radius: 6px; min-width: 20px; }
+QToolTip { background: #26262e; color: #e9e9ec;
+    border: 1px solid #3a3a44; }
+"""
+
+
+def apply_theme(app):
+    """Apply ACR's dark stylesheet to the whole app (v0.9, U15).
+    main() calls this. A verify harness that builds windows
+    directly must call it itself to see the true theme."""
+    app.setStyleSheet(DARK_STYLESHEET)
+
+
+REDUCED_MOTION_ENV = "ACR_REDUCED_MOTION"
+
+
+def reduced_motion():
+    """True when motion should be skipped: the ACR_REDUCED_MOTION
+    environment variable says so, or the user saved the choice in
+    settings. State changes still land (the flag still marks, the
+    checkmark still appears); only the motion is skipped."""
+    value = os.environ.get(REDUCED_MOTION_ENV, "").strip().lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    return QSettings("BrokeNBored", "ACR").value(
+        "reduced_motion", False, type=bool)
+
+# Single-instance names (U27). ACR_INSTANCE_NAME lets tests run a
+# private instance without touching a real one.
+INSTANCE_ENV = "ACR_INSTANCE_NAME"
+INSTANCE_DEFAULT = "acr"
 
 TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
                  "Resonance", "Alpha", "Confidence", "New layer",
                  "Capped"]
 
-CHART_LINE = QColor(31, 78, 121)
-CHART_SPIKE = QColor(192, 57, 43)
+CHART_BG = QColor(0x26, 0x26, 0x2e)
+CHART_LINE = QColor(110, 168, 216)
+CHART_SPIKE = QColor(224, 92, 80)
 LEGEND_TEXT = "red dot = new-layer candidate"
-CHART_GRID = QColor(220, 220, 220)
-CHART_AXIS = QColor(120, 120, 120)
-HEAT_LOW = QColor(220, 235, 250)
-HEAT_HIGH = QColor(31, 78, 121)
+CHART_GRID = QColor(58, 58, 68)
+CHART_AXIS = QColor(169, 169, 179)
+HEAT_LOW = QColor(0x26, 0x26, 0x2e)
+HEAT_HIGH = QColor(201, 162, 39)
+# The flagged trace row rests at a calm dark-red tint (the
+# chart's red-dot meaning, as a row); the fade starts brighter.
+FLAG_TINT = QColor(0x4a, 0x23, 0x20)
+FLAG_TINT_BRIGHT = QColor(0x7a, 0x32, 0x2b)
 
 
 def _row_change_norms(old_u, old_v, new_u, new_v):
@@ -200,10 +331,52 @@ class NormChart(QWidget):
         self.setMinimumHeight(130)
         self.values = []
         self.flags = []
+        self._pulse_index = None
+        self._pulse_scale = 1.0
+        self._pulse_anim = None
 
     def set_data(self, values, flags):
         self.values = list(values)
         self.flags = list(flags)
+        self.update()
+
+    def _get_pulse_scale(self):
+        return self._pulse_scale
+
+    def _set_pulse_scale(self, scale):
+        self._pulse_scale = scale
+        self.update()
+
+    pulseScale = Property(float, _get_pulse_scale, _set_pulse_scale)
+
+    def pulse_flag(self, index):
+        """The resonance moment (v0.9, technique 8): the flagged
+        dot lands with a spring settle, 1.8x down to normal over
+        300 ms. Under reduced motion the dot just appears:
+        set_data already drew it at normal size."""
+        if index is None or index >= len(self.values):
+            return
+        if self._pulse_anim is not None:
+            self._pulse_anim.stop()
+            self._pulse_anim = None
+        self._pulse_index = index
+        if reduced_motion():
+            self._pulse_scale = 1.0
+            self.update()
+            return
+        anim = QPropertyAnimation(self, b"pulseScale", self)
+        anim.setDuration(300)
+        anim.setEasingCurve(QEasingCurve.OutBack)
+        anim.setStartValue(1.8)
+        anim.setEndValue(1.0)
+        anim.finished.connect(self._pulse_done)
+        self._pulse_anim = anim
+        anim.start()
+
+    def _pulse_done(self):
+        self._pulse_index = None
+        self._pulse_scale = 1.0
+        self._pulse_anim = None
         self.update()
 
     def legend_rect(self):
@@ -221,7 +394,7 @@ class NormChart(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.white)
+        painter.fillRect(self.rect(), CHART_BG)
         if not self.values:
             painter.setPen(CHART_AXIS)
             painter.drawText(self.rect(), Qt.AlignCenter,
@@ -272,15 +445,19 @@ class NormChart(QWidget):
             if i < len(self.flags) and self.flags[i]:
                 painter.setPen(QPen(CHART_SPIKE, 2))
                 painter.setBrush(CHART_SPIKE)
-                painter.drawEllipse(int(x) - 4, int(y) - 4, 8, 8)
+                radius = 4
+                if i == self._pulse_index:
+                    radius = max(1, int(round(4 * self._pulse_scale)))
+                painter.drawEllipse(int(x) - radius, int(y) - radius,
+                                    radius * 2, radius * 2)
             else:
                 painter.setPen(QPen(CHART_LINE, 2))
                 painter.setBrush(CHART_LINE)
                 painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
-        # Legend, bottom-left, on a white patch so the line and
-        # grid never show through the text.
+        # Legend, bottom-left, on a patch of the chart background
+        # so the line and grid never show through the text.
         rect = self.legend_rect()
-        painter.fillRect(rect, Qt.white)
+        painter.fillRect(rect, CHART_BG)
         painter.setPen(CHART_SPIKE)
         painter.drawText(rect.left() + 4, rect.bottom() - 4,
                          LEGEND_TEXT)
@@ -320,7 +497,7 @@ class ChangeHeatmap(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.white)
+        painter.fillRect(self.rect(), CHART_BG)
         if not self.values:
             painter.setPen(CHART_AXIS)
             # A step with no recorded change data (a session
@@ -384,6 +561,1073 @@ class ChangeHeatmap(QWidget):
                                  "%.3f" % value)
 
 
+class PressDipEffect(QGraphicsEffect):
+    """The press dip (v0.9, technique 1): a button scales to 0.97
+    while pressed. A paint-time scale around the button's center:
+    the layout never moves, only the pixels do."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scale = 1.0
+
+    def _get_scale(self):
+        return self._scale
+
+    def _set_scale(self, scale):
+        self._scale = scale
+        self.update()
+
+    scale = Property(float, _get_scale, _set_scale)
+
+    def draw(self, painter):
+        if self._scale == 1.0:
+            self.drawSource(painter)
+            return
+        center = self.sourceBoundingRect().center()
+        painter.save()
+        painter.translate(center.x(), center.y())
+        painter.scale(self._scale, self._scale)
+        painter.translate(-center.x(), -center.y())
+        self.drawSource(painter)
+        painter.restore()
+
+
+def press_dip(button):
+    """Dip a button to 0.97 and back over 150 ms (technique 1).
+    User-caused motion, so it springs (OutBack). Reduced motion
+    skips it: the press still works, just without the dip.
+    Returns the animation, or None when motion is skipped."""
+    if reduced_motion():
+        return None
+    old = getattr(button, "_dip_anim", None)
+    if old is not None:
+        old.stop()
+    effect = PressDipEffect(button)
+    button.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"scale", button)
+    anim.setDuration(150)
+    anim.setEasingCurve(QEasingCurve.OutBack)
+    anim.setKeyValueAt(0.0, 1.0)
+    anim.setKeyValueAt(0.5, 0.97)
+    anim.setKeyValueAt(1.0, 1.0)
+
+    def _done():
+        if button.graphicsEffect() is effect:
+            button.setGraphicsEffect(None)
+
+    anim.finished.connect(_done)
+    button._dip_anim = anim
+    button._dip_effect = effect
+    anim.start()
+    return anim
+
+
+class CheckmarkWidget(QWidget):
+    """A checkmark that draws itself (v0.9, technique 8): the
+    completion moment. Two strokes, drawn progressively over
+    200 ms. Under reduced motion it appears fully drawn."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(18, 18)
+        self._progress = 0.0
+        self._anim = None
+        self.hide()
+
+    def _get_progress(self):
+        return self._progress
+
+    def _set_progress(self, value):
+        self._progress = value
+        self.update()
+
+    progress = Property(float, _get_progress, _set_progress)
+
+    def paintEvent(self, _event):
+        if self._progress <= 0.0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(ACCENT_GOLD), 2.5))
+        # The check: (3, 9) down to the bend (7.5, 13.5), then
+        # up to (15, 4.5). The first stroke is 35% of the length.
+        bend = 0.35
+        if self._progress < bend:
+            frac = self._progress / bend
+            x = 3 + (7.5 - 3) * frac
+            y = 9 + (13.5 - 9) * frac
+            painter.drawLine(3, 9, int(x), int(y))
+        else:
+            painter.drawLine(3, 9, 7, 13)
+            frac = (self._progress - bend) / (1.0 - bend)
+            x = 7.5 + (15 - 7.5) * frac
+            y = 13.5 + (4.5 - 13.5) * frac
+            painter.drawLine(7, 13, int(x), int(y))
+
+    def draw(self):
+        """Show the checkmark, drawing itself over 200 ms
+        (instantly, fully drawn, under reduced motion)."""
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+        if reduced_motion():
+            self._progress = 1.0
+            self.show()
+            self.update()
+            return
+        self._progress = 0.0
+        self.show()
+        anim = QPropertyAnimation(self, b"progress", self)
+        anim.setDuration(200)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.finished.connect(self._draw_done)
+        self._anim = anim
+        anim.start()
+
+    def _draw_done(self):
+        self._anim = None
+
+    def clear(self):
+        """Hide the mark: the next run or step starts fresh."""
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+        self._progress = 0.0
+        self.hide()
+
+
+class LocalCallWorker(QObject):
+    """One local-model call, off the UI thread (v0.9, U30).
+
+    kind is "embed" or "generate". The call runs in run(), on a
+    QThread owned by the window; finished carries the result (a
+    vector, or a string) or a LocalModelError. Retry notices come
+    back as progress strings: the worker never touches a widget
+    itself, so the window stays responsive while the call runs.
+    The window honours cancel by ignoring a finished result, not
+    by killing the thread: a network call in flight cannot be
+    stopped midway, but its answer can be thrown away.
+    """
+
+    finished = Signal(object)
+    progress = Signal(str)
+
+    def __init__(self, client, kind, model, text):
+        super().__init__()
+        self.client = client
+        self.kind = kind
+        self.model = model
+        self.text = text
+
+    def _on_retry(self, attempt, delay, kind):
+        self.progress.emit(
+            "The local model service is slow, retrying "
+            "(attempt %d)..." % (attempt + 1))
+
+    def run(self):
+        try:
+            if self.kind == "embed":
+                result = self.client.embed(
+                    self.model, self.text, on_retry=self._on_retry)
+            else:
+                result = self.client.generate(
+                    self.model, self.text, on_retry=self._on_retry)
+        except LocalModelError as exc:
+            self.finished.emit(exc)
+            return
+        except Exception as exc:  # never strand the window
+            self.finished.emit(LocalModelError(str(exc)))
+            return
+        self.finished.emit(result)
+
+
+# v0.9 Analyze: file types a folder run picks up, and how many
+# entries the core and outlier lists hold.
+BATCH_EXTENSIONS = (".txt", ".md", ".jsonl")
+ANALYSIS_TOP_N = 10
+# A theme shift is a step whose resonance falls into the noise
+# band (at or under SHIFT_LOW) by at least SHIFT_DROP from the
+# previous step, and stays low on the next step (at or under
+# SHIFT_STAYS_LOW). Within-theme dips recover at once; a real
+# topic change does not. Grounded by probe: a 16-theme run has no
+# shifts, a theme switch flags exactly the first off-theme step.
+SHIFT_LOW = 0.25
+SHIFT_DROP = 0.25
+SHIFT_STAYS_LOW = 0.35
+
+
+def extract_batch_text(line, is_jsonl):
+    """The step text for one line of a batch file, or None when
+    the line carries no usable text. Plain text lines are used as
+    they are. A .jsonl record uses its "text" field, else
+    "prompt", else "completion"; a record with none of those, or
+    a line that is not JSON at all, is skipped, never guessed."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if not is_jsonl:
+        return stripped
+    try:
+        record = json.loads(stripped)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    for key in ("text", "prompt", "completion"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def iter_batch_lines(paths, unreadable=None):
+    """Yield (text, skipped, path, line number) for every
+    candidate line in the given files, in order. text is None
+    when the line carries no usable text. The path and line
+    number are the step's source locator: the STELLA pack
+    manifest records where each entry came from. A file that
+    cannot be read is skipped whole and its name appended to
+    `unreadable` when one is given (U32: never silently skip)."""
+    for path in paths:
+        is_jsonl = path.lower().endswith(".jsonl")
+        try:
+            fh = open(path, "r", encoding="utf-8",
+                      errors="replace")
+        except OSError:
+            if unreadable is not None:
+                unreadable.append(os.path.basename(path))
+            continue
+        with fh:
+            for line_no, line in enumerate(fh, start=1):
+                text = extract_batch_text(line, is_jsonl)
+                yield text, text is None, path, line_no
+
+
+def collect_batch_files(folder):
+    """Text files in a folder for a batch run: the known types,
+    in name order, non-recursive."""
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [os.path.join(folder, name) for name in names
+            if name.lower().endswith(BATCH_EXTENSIONS)
+            and os.path.isfile(os.path.join(folder, name))]
+
+
+def summarize_run(trace, top_n=ANALYSIS_TOP_N):
+    """Themes, core entries, outliers, and theme shifts from a
+    trace log (v0.9, Analyze). Pure: no engine, no widgets.
+    Revert entries (marked reverted_to) are not steps, so they
+    never appear in any list. Core is the highest-resonance
+    entries, outliers the lowest, one line per distinct text."""
+    steps = [entry for entry in trace if "reverted_to" not in entry]
+    themes = [entry for entry in steps if entry.get("new_layer")]
+    core = []
+    seen = set()
+    for entry in sorted(steps, key=lambda e: e["resonance"],
+                        reverse=True):
+        if entry["input"] in seen:
+            continue
+        seen.add(entry["input"])
+        core.append(entry)
+        if len(core) >= top_n:
+            break
+    outliers = []
+    seen = set()
+    for entry in sorted(steps, key=lambda e: e["resonance"]):
+        if entry["input"] in seen:
+            continue
+        seen.add(entry["input"])
+        outliers.append(entry)
+        if len(outliers) >= top_n:
+            break
+    shifts = []
+    for i in range(1, len(steps)):
+        prev = steps[i - 1]
+        cur = steps[i]
+        if (cur["resonance"] <= SHIFT_LOW
+                and prev["resonance"] - cur["resonance"]
+                >= SHIFT_DROP):
+            nxt = steps[i + 1] if i + 1 < len(steps) else None
+            if nxt is None or nxt["resonance"] <= SHIFT_STAYS_LOW:
+                shifts.append(cur)
+    return {"themes": themes, "core": core, "outliers": outliers,
+            "shifts": shifts, "steps": len(steps)}
+
+
+def format_analysis_report(summary, version, text_of,
+                           source_note=""):
+    """The readable analysis report (v0.9, Analyze): themes, core
+    entries, outliers, and theme shifts, in plain words. text_of
+    maps a trace entry to its full text (the trace holds an
+    80-character preview)."""
+    lines = ["ACR analysis report",
+             "App version: %s" % version]
+    if source_note:
+        lines.append("Source: %s" % source_note)
+    lines.append("Steps: %d" % summary["steps"])
+    lines.append("")
+    lines.append("Themes found (%d)" % len(summary["themes"]))
+    if not summary["themes"]:
+        lines.append("  None yet. Step a few sentences on one "
+                     "theme and spikes will show up here.")
+    for entry in summary["themes"]:
+        lines.append("  Step %d: %s (resonance %.3f)"
+                     % (entry["id"], text_of(entry),
+                        entry["resonance"]))
+    lines.append("")
+    lines.append("Core entries (%d)" % len(summary["core"]))
+    lines.append("  The most resonant entries: the heart of the "
+                 "file.")
+    for entry in summary["core"]:
+        lines.append("  %.3f  %s" % (entry["resonance"],
+                                     text_of(entry)))
+    lines.append("")
+    lines.append("Outliers (%d)" % len(summary["outliers"]))
+    lines.append("  The lowest-resonance entries: the noise and "
+                 "off-topic lines.")
+    for entry in summary["outliers"]:
+        lines.append("  %.3f  %s" % (entry["resonance"],
+                                     text_of(entry)))
+    lines.append("")
+    lines.append("Theme shifts (%d)" % len(summary["shifts"]))
+    if not summary["shifts"]:
+        lines.append("  None found: no sharp resonance drop that "
+                     "stayed low.")
+    for entry in summary["shifts"]:
+        lines.append("  Step %d: resonance fell to %.3f"
+                     % (entry["id"], entry["resonance"]))
+    return "\n".join(lines) + "\n"
+
+
+def theme_window_entries(trace, step_id):
+    """The entries around a theme's trigger step: the step before,
+    the spike itself, and the step after, in trace order. This is
+    the window the Themes tab shows when a theme is clicked."""
+    wanted = {step_id - 1, step_id, step_id + 1}
+    return [entry for entry in trace
+            if entry["id"] in wanted
+            and "reverted_to" not in entry]
+
+
+class BatchWorker(QObject):
+    """A batch analysis run (v0.9, Analyze): every line of the
+    picked files becomes one Engine.step, in file order, on a
+    worker thread (U30). The step call is the same one manual
+    stepping uses, with the same parameters, so a batch over a
+    file of sentences ends in exactly the state typing them
+    would. The worker owns the engine for the run: the window
+    reads nothing from the engine until finished lands, and the
+    mutating actions refuse while a run is in flight.
+
+    progress carries (done, total, resonance, w_norm, skipped).
+    finished carries a result dict: steps, skipped, unreadable
+    (file names), heat (step id plus row norms, for the heatmap),
+    texts (step id to full text), locators (step id to (file
+    name, line number): where each step came from, for the
+    STELLA pack manifest), cancelled, error (a LocalModelError
+    or None). A local-embed failure stops the run with the
+    error: the steps completed so far stay, they are real steps.
+    """
+
+    progress = Signal(int, int, float, float, int)
+    finished = Signal(object)
+
+    def __init__(self, engine, client, encoder_kind, local_model,
+                 paths, preset, base_alpha, frozen, cap,
+                 frozen_ranks):
+        super().__init__()
+        self.engine = engine
+        self.client = client
+        self.encoder_kind = encoder_kind
+        self.local_model = local_model
+        self.paths = list(paths)
+        self.preset = preset
+        self.base_alpha = base_alpha
+        self.frozen = frozen
+        self.cap = cap
+        self.frozen_ranks = list(frozen_ranks)
+        self.cancelled = False
+
+    def run(self):
+        unreadable = []
+        total = 0
+        for _text, _skipped, _path, _line in iter_batch_lines(
+                self.paths, unreadable):
+            total += 1
+        done = 0
+        skipped = 0
+        heat = []
+        texts = {}
+        locators = {}
+        error = None
+        resonance = 0.0
+        w_norm = self.engine.w_norm()
+        for text, is_skipped, path, line_no in iter_batch_lines(
+                self.paths):
+            if self.cancelled:
+                break
+            done += 1
+            if is_skipped or text is None:
+                skipped += 1
+                self.progress.emit(done, total, resonance, w_norm,
+                                   skipped)
+                continue
+            h = None
+            if self.encoder_kind == "local":
+                try:
+                    h = self.client.embed(self.local_model, text)
+                except LocalModelError as exc:
+                    error = exc
+                    break
+            old_u = [row[:] for row in self.engine.u]
+            old_v = [row[:] for row in self.engine.v]
+            alpha = schedule_alpha(
+                self.preset, self.base_alpha,
+                self.engine.step_count + 1)
+            entry = self.engine.step(
+                text, alpha=alpha, frozen=self.frozen,
+                cap=self.cap, h=h,
+                frozen_ranks=self.frozen_ranks)
+            texts[entry["id"]] = text
+            locators[entry["id"]] = (os.path.basename(path),
+                                     line_no)
+            heat.append((entry["id"], _row_change_norms(
+                old_u, old_v, self.engine.u, self.engine.v)))
+            resonance = entry["resonance"]
+            w_norm = entry["new_norm"]
+            self.progress.emit(done, total, resonance, w_norm,
+                               skipped)
+        self.finished.emit({
+            "steps": len(texts),
+            "skipped": skipped,
+            "unreadable": unreadable,
+            "heat": heat,
+            "texts": texts,
+            "locators": locators,
+            "cancelled": self.cancelled,
+            "error": error,
+        })
+
+
+def _header_label(text):
+    """A section header: bold, in the bright gold (v0.9, U15)."""
+    label = QLabel(text)
+    label.setStyleSheet("font-weight: bold; color: %s;"
+                        % HEADER_COLOR)
+    return label
+
+
+def _note_label(text):
+    """A plain-words explanation under a field (v0.9, U20). Dim,
+    so it reads as secondary to the control above it."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet("color: %s;" % THEME_DIM)
+    return label
+
+
+class SubWindow(QWidget):
+    """One dedicated window (v0.9, U1): Controls, Trace log,
+    Resonance views, How to Use. Closing one hides it instead of
+    destroying it, so the View menu can open it again, and each
+    remembers its own geometry between runs (U5)."""
+
+    def __init__(self, title, settings_key, parent=None,
+                 default_width=900, default_height=600):
+        super().__init__(parent, Qt.Window)
+        self.setObjectName("subwindow")
+        self.setWindowTitle(title)
+        self._settings = QSettings("BrokeNBored", "ACR")
+        self._settings_key = settings_key
+        self._open_anim = None
+        geometry = self._settings.value(settings_key)
+        if geometry is None or not self.restoreGeometry(geometry):
+            self.resize(default_width, default_height)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Opening a window springs it in (v0.9, technique 2):
+        # 97% size, centered, settling on the restored geometry
+        # over 200 ms. The geometry memory still rules: the
+        # animation ends exactly where the window belongs.
+        # Reduced motion skips it. The main window does not
+        # spring: it opens once, at launch, at its saved size.
+        if reduced_motion():
+            return
+        if self._open_anim is not None:
+            self._open_anim.stop()
+            self._open_anim = None
+        end = self.geometry()
+        width = max(1, int(end.width() * 0.97))
+        height = max(1, int(end.height() * 0.97))
+        center = end.center()
+        start = QRect(center.x() - width // 2,
+                      center.y() - height // 2, width, height)
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(200)
+        anim.setEasingCurve(QEasingCurve.OutBack)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        anim.finished.connect(self._open_done)
+        self._open_anim = anim
+        anim.start()
+
+    def _open_done(self):
+        self._open_anim = None
+
+    def closeEvent(self, event):
+        self._settings.setValue(self._settings_key,
+                                self.saveGeometry())
+        self._settings.sync()
+        # Hide, do not destroy: the window reopens from the menu.
+        event.ignore()
+        self.hide()
+
+
+class HowToUseWindow(SubWindow):
+    """The How to Use window (v0.9, U22): an index of sections on
+    the left, the guide on the right. It reads HOW-TO-USE.md from
+    the app folder, so the file and the window can never drift
+    apart. Clicking a section jumps to it in the guide."""
+
+    def __init__(self, parent=None):
+        super().__init__("ACR - How to Use", "howto_geometry",
+                         parent)
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.guide_path = os.path.join(here, "HOW-TO-USE.md")
+        layout = QHBoxLayout(self)
+
+        self.index_list = QListWidget()
+        self.index_list.setMaximumWidth(220)
+        self.index_list.currentItemChanged.connect(
+            self._on_section_picked)
+        layout.addWidget(self.index_list)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(False)
+        layout.addWidget(self.browser, 1)
+
+        self.sections = []
+        self._load_guide()
+
+    def _load_guide(self):
+        try:
+            with open(self.guide_path, "r",
+                      encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            text = ("# How to Use\n\nThe guide file "
+                    "(HOW-TO-USE.md) is missing from the app "
+                    "folder.")
+        self.browser.setMarkdown(text)
+        self.sections = [line[3:].strip()
+                         for line in text.splitlines()
+                         if line.startswith("## ")]
+        self.index_list.clear()
+        for section in self.sections:
+            self.index_list.addItem(section)
+
+    def _on_section_picked(self, current, _previous):
+        if current is None:
+            return
+        # Jump to the section heading in the guide.
+        cursor = self.browser.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        self.browser.setTextCursor(cursor)
+        self.browser.find(current.text())
+
+
+class AnalyzeWindow(SubWindow):
+    """The Analyze window (v0.9): point the adaptive loop at a
+    whole file or folder and see what is in it. Toy-simple flow
+    (U34): pick a file, press Go, read the results. The results
+    are display, not controls (U37): the resonance chart over the
+    run, the themes found, the core entries, the outliers, and
+    the theme shifts. The window holds the pickers, the progress,
+    and the results; the run itself lives on the main window,
+    which owns the engine."""
+
+    def __init__(self, main):
+        super().__init__("ACR - Analyze a file", "analyze_geometry",
+                         main, default_width=1000,
+                         default_height=700)
+        self.main = main
+        self._paths = []
+        self._source_note = ""
+        self._summary = None
+        self._trace = []
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(_header_label("What to analyze"))
+        source_row = QHBoxLayout()
+        self.source_label = QLabel("No file picked yet.")
+        self.source_label.setWordWrap(True)
+        source_row.addWidget(self.source_label, 1)
+        self.pick_file_button = QPushButton("Pick a file")
+        self.pick_file_button.clicked.connect(self.on_pick_file)
+        source_row.addWidget(self.pick_file_button)
+        self.pick_folder_button = QPushButton("Pick a folder")
+        self.pick_folder_button.clicked.connect(self.on_pick_folder)
+        source_row.addWidget(self.pick_folder_button)
+        layout.addLayout(source_row)
+        layout.addWidget(_note_label(
+            "Each line becomes one step, in file order. .jsonl "
+            "records use their text field. A folder runs every "
+            "text file in it, in name order."))
+
+        go_row = QHBoxLayout()
+        self.go_button = QPushButton("Go")
+        self.go_button.setObjectName("primaryButton")
+        self.go_button.pressed.connect(
+            lambda: press_dip(self.go_button))
+        self.go_button.clicked.connect(self.on_go)
+        go_row.addWidget(self.go_button)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.on_cancel)
+        self.cancel_button.setEnabled(False)
+        go_row.addWidget(self.cancel_button)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        go_row.addWidget(self.progress_bar, 1)
+        layout.addLayout(go_row)
+        self.progress_label = QLabel("Nothing analyzed yet.")
+        self.progress_label.setWordWrap(True)
+        layout.addWidget(self.progress_label)
+
+        # Bento results (v0.9, technique 5): size is the
+        # hierarchy. One hero tile for the headline, then the
+        # chart, themes, core, outliers, and shifts as tiles
+        # with one job each. Rounded corners, uniform 16 px
+        # gaps, bigger tile for the more important finding.
+        def _tile():
+            frame = QFrame()
+            frame.setObjectName("tile")
+            return frame
+
+        results_grid = QGridLayout()
+        results_grid.setSpacing(16)
+        layout.addLayout(results_grid, 1)
+
+        self.hero_tile = _tile()
+        hero_layout = QVBoxLayout(self.hero_tile)
+        hero_layout.setContentsMargins(12, 8, 12, 8)
+        hero_layout.addWidget(_header_label("Results"))
+        self.hero_title = QLabel("Nothing analyzed yet.")
+        self.hero_title.setStyleSheet(
+            "font-size: 16px; font-weight: bold;")
+        hero_layout.addWidget(self.hero_title)
+        self.hero_theme = QLabel(
+            "Pick a file, press Go, and the findings land here.")
+        self.hero_theme.setWordWrap(True)
+        hero_layout.addWidget(self.hero_theme)
+        results_grid.addWidget(self.hero_tile, 0, 0, 1, 3)
+
+        chart_tile = _tile()
+        chart_layout = QVBoxLayout(chart_tile)
+        chart_layout.setContentsMargins(10, 8, 10, 10)
+        chart_layout.addWidget(_header_label("Chart"))
+        chart_layout.addWidget(_note_label(
+            "W_t norm over the whole run. Spikes are resonance "
+            "spikes."))
+        self.chart = NormChart()
+        chart_layout.addWidget(self.chart, 1)
+        results_grid.addWidget(chart_tile, 1, 0, 1, 2)
+
+        themes_tile = _tile()
+        themes_layout = QVBoxLayout(themes_tile)
+        themes_layout.setContentsMargins(10, 8, 10, 10)
+        themes_layout.addWidget(_header_label("Themes"))
+        themes_layout.addWidget(_note_label(
+            "Resonance spikes and the entry that triggered each "
+            "one."))
+        self.themes_list = QListWidget()
+        self.themes_list.setUniformItemSizes(True)
+        self.themes_list.currentItemChanged.connect(
+            self._on_theme_picked)
+        themes_layout.addWidget(self.themes_list, 1)
+        self.theme_detail = QTextEdit()
+        self.theme_detail.setReadOnly(True)
+        # Capped: an uncapped QTextEdit's minimum size squeezes
+        # the note label above it until its text clips, and
+        # starves the list. Floored at three lines: the detail
+        # always shows the trigger entry and its neighbours.
+        self.theme_detail.setMinimumHeight(55)
+        self.theme_detail.setMaximumHeight(80)
+        themes_layout.addWidget(self.theme_detail, 1)
+        results_grid.addWidget(themes_tile, 1, 2, 1, 1)
+
+        core_tile = _tile()
+        core_layout = QVBoxLayout(core_tile)
+        core_layout.setContentsMargins(10, 8, 10, 10)
+        core_layout.addWidget(_header_label("Core entries"))
+        core_layout.addWidget(_note_label(
+            "Core entries: the most resonant entries overall. "
+            "The heart of the file."))
+        self.core_list = QListWidget()
+        self.core_list.setUniformItemSizes(True)
+        core_layout.addWidget(self.core_list, 1)
+        results_grid.addWidget(core_tile, 2, 0, 1, 1)
+
+        outlier_tile = _tile()
+        outlier_layout = QVBoxLayout(outlier_tile)
+        outlier_layout.setContentsMargins(10, 8, 10, 10)
+        outlier_layout.addWidget(_header_label("Outliers"))
+        outlier_layout.addWidget(_note_label(
+            "Outliers: the lowest-resonance entries. The noise "
+            "and off-topic lines."))
+        self.outlier_list = QListWidget()
+        self.outlier_list.setUniformItemSizes(True)
+        outlier_layout.addWidget(self.outlier_list, 1)
+        results_grid.addWidget(outlier_tile, 2, 1, 1, 1)
+
+        shift_tile = _tile()
+        shift_layout = QVBoxLayout(shift_tile)
+        shift_layout.setContentsMargins(10, 8, 10, 10)
+        shift_layout.addWidget(_header_label("Theme shifts"))
+        shift_layout.addWidget(_note_label(
+            "Theme shifts: the steps where resonance drops "
+            "sharply and stays low. Topic boundaries."))
+        self.shift_list = QListWidget()
+        self.shift_list.setUniformItemSizes(True)
+        shift_layout.addWidget(self.shift_list, 1)
+        results_grid.addWidget(shift_tile, 2, 2, 1, 1)
+
+        results_grid.setRowStretch(0, 0)
+        results_grid.setRowStretch(1, 3)
+        results_grid.setRowStretch(2, 2)
+        results_grid.setColumnStretch(0, 1)
+        results_grid.setColumnStretch(1, 1)
+        results_grid.setColumnStretch(2, 1)
+
+        export_row = QHBoxLayout()
+        self.export_text_button = QPushButton(
+            "Export curated file")
+        self.export_text_button.clicked.connect(
+            self.on_export_curated_text)
+        self.export_text_button.setEnabled(False)
+        export_row.addWidget(self.export_text_button)
+        self.export_jsonl_button = QPushButton(
+            "Export curated .jsonl")
+        self.export_jsonl_button.clicked.connect(
+            self.on_export_curated_jsonl)
+        self.export_jsonl_button.setEnabled(False)
+        export_row.addWidget(self.export_jsonl_button)
+        self.export_report_button = QPushButton("Export report")
+        self.export_report_button.clicked.connect(
+            self.on_export_report)
+        self.export_report_button.setEnabled(False)
+        export_row.addWidget(self.export_report_button)
+        self.export_packs_button = QPushButton(
+            "Export STELLA data pack")
+        self.export_packs_button.clicked.connect(
+            self.on_export_stella_packs)
+        self.export_packs_button.setEnabled(False)
+        export_row.addWidget(self.export_packs_button)
+        export_row.addStretch(1)
+        layout.addLayout(export_row)
+        layout.addWidget(_note_label(
+            "A STELLA data pack teaches a model what ACR found: "
+            "themes, matches, analogies, judgments. One folder "
+            "per theme."))
+
+    # -- picking ------------------------------------------------------
+    def on_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pick a file to analyze", "",
+            "Text files (*.txt *.md *.jsonl);;All files (*)")
+        if not path:
+            return
+        self._paths = [path]
+        self._source_note = os.path.basename(path)
+        self.source_label.setText("File: %s" % path)
+
+    def on_pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick a folder to analyze", "")
+        if not folder:
+            return
+        paths = collect_batch_files(folder)
+        if not paths:
+            self.main.status_label.setText(
+                "No text files in that folder.")
+            return
+        self._paths = paths
+        self._source_note = ("folder %s (%d files)"
+                             % (os.path.basename(folder),
+                                len(paths)))
+        self.source_label.setText(
+            "Folder: %s (%d text files)" % (folder, len(paths)))
+
+    def on_go(self):
+        if not self._paths:
+            self.main.status_label.setText(
+                "Pick a file or a folder first.")
+            return
+        self.main.start_batch(self._paths, self._source_note)
+
+    def on_cancel(self):
+        self.main.on_cancel_batch()
+
+    # -- results ------------------------------------------------------
+    def show_results(self, summary, trace):
+        """Fill the bento results tiles from a summary and its
+        trace. Called on every refresh, so a loaded session
+        restores the analysis too: the results are computed from
+        the trace, and the trace is what a session saves."""
+        self._summary = summary
+        self._trace = list(trace)
+        self.chart.set_data(
+            [entry["new_norm"] for entry in trace],
+            [entry["new_layer"] for entry in trace])
+        steps = summary["steps"]
+        themes = summary["themes"]
+        if steps == 0:
+            self.hero_title.setText("Nothing analyzed yet.")
+            self.hero_theme.setText(
+                "Pick a file, press Go, and the findings land "
+                "here.")
+        else:
+            self.hero_title.setText(
+                "%d theme%s found in %d steps"
+                % (len(themes),
+                   "" if len(themes) == 1 else "s", steps))
+            if themes:
+                best = max(themes,
+                           key=lambda entry: entry["resonance"])
+                self.hero_theme.setText(
+                    "Strongest theme: \"%s\" (resonance %.3f, "
+                    "step %d)"
+                    % (self.main._entry_text(best),
+                       best["resonance"], best["id"]))
+            else:
+                self.hero_theme.setText(
+                    "No resonance spikes: nothing in this file "
+                    "hung together as a theme.")
+        selected = None
+        current = self.themes_list.currentItem()
+        if current is not None:
+            selected = current.data(Qt.UserRole)
+        self.themes_list.blockSignals(True)
+        self.themes_list.clear()
+        restore_row = -1
+        for entry in summary["themes"]:
+            self.themes_list.addItem(
+                "Step %d: %s (resonance %.3f)"
+                % (entry["id"], self.main._entry_text(entry),
+                   entry["resonance"]))
+            item = self.themes_list.item(
+                self.themes_list.count() - 1)
+            item.setData(Qt.UserRole, entry["id"])
+            if entry["id"] == selected:
+                restore_row = self.themes_list.count() - 1
+        self.themes_list.blockSignals(False)
+        if restore_row >= 0:
+            self.themes_list.setCurrentRow(restore_row)
+        elif self.themes_list.count() == 0:
+            self.theme_detail.setPlainText(
+                "No resonance spikes yet.")
+        elif current is None:
+            self.theme_detail.setPlainText(
+                "Click a theme to see its trace entries.")
+        self.core_list.clear()
+        for entry in summary["core"]:
+            self.core_list.addItem(
+                "%.3f  %s" % (entry["resonance"],
+                              self.main._entry_text(entry)))
+        self.outlier_list.clear()
+        for entry in summary["outliers"]:
+            self.outlier_list.addItem(
+                "%.3f  %s" % (entry["resonance"],
+                              self.main._entry_text(entry)))
+        self.shift_list.clear()
+        by_id = {entry["id"]: entry for entry in trace}
+        for entry in summary["shifts"]:
+            prev = by_id.get(entry["id"] - 1)
+            if prev is not None:
+                self.shift_list.addItem(
+                    "Step %d: resonance fell from %.3f to %.3f"
+                    % (entry["id"], prev["resonance"],
+                       entry["resonance"]))
+            else:
+                self.shift_list.addItem(
+                    "Step %d: resonance %.3f"
+                    % (entry["id"], entry["resonance"]))
+        has_steps = summary["steps"] > 0
+        self.export_text_button.setEnabled(has_steps)
+        self.export_jsonl_button.setEnabled(has_steps)
+        self.export_report_button.setEnabled(has_steps)
+        self.export_packs_button.setEnabled(has_steps)
+
+    def _on_theme_picked(self, current, _previous):
+        if current is None:
+            return
+        step_id = current.data(Qt.UserRole)
+        lines = []
+        for entry in self._trace:
+            if entry["id"] == step_id - 1:
+                lines.append(self.main._format_trace_entry(
+                    entry, "Step %d (before)" % entry["id"]))
+            elif entry["id"] == step_id:
+                lines.append(self.main._format_trace_entry(
+                    entry, "Step %d (spike)" % entry["id"]))
+            elif entry["id"] == step_id + 1:
+                lines.append(self.main._format_trace_entry(
+                    entry, "Step %d (after)" % entry["id"]))
+        if not lines:
+            self.theme_detail.setPlainText(
+                "No trace entries for step %d." % step_id)
+            return
+        self.theme_detail.setPlainText("\n".join(lines))
+
+    # -- exports ------------------------------------------------------
+    def _core_texts(self):
+        if not self._summary:
+            return []
+        return [self.main._entry_text(entry)
+                for entry in self._summary["core"]]
+
+    def export_curated_text_to(self, path):
+        """Write the core entries as plain text, one per line.
+        Returns the path. The parent folder is created when it
+        is missing, so a folder that vanished between picking
+        and writing still gets the export."""
+        texts = self._core_texts()
+        os.makedirs(os.path.dirname(os.path.abspath(path)),
+                    exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for text in texts:
+                fh.write(text + "\n")
+        self.main.logger.action(
+            "curated file exported to %s" % path)
+        return path
+
+    def export_curated_jsonl_to(self, path):
+        """Write the core entries as .jsonl, one {"text": ...}
+        object per line. Returns the path."""
+        texts = self._core_texts()
+        os.makedirs(os.path.dirname(os.path.abspath(path)),
+                    exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for text in texts:
+                fh.write(json.dumps({"text": text}) + "\n")
+        self.main.logger.action(
+            "curated .jsonl exported to %s" % path)
+        return path
+
+    def export_report_to(self, path):
+        """Write the readable analysis report. Returns the path."""
+        report = format_analysis_report(
+            self._summary, VERSION, self.main._entry_text,
+            self.main._batch_source_note)
+        os.makedirs(os.path.dirname(os.path.abspath(path)),
+                    exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(report)
+        self.main.logger.action(
+            "analysis report exported to %s" % path)
+        return path
+
+    def on_export_curated_text(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export curated file", "acr-curated.txt",
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            self.export_curated_text_to(path)
+        except OSError:
+            self.main.logger.exception("curated export failed")
+            self.main.status_label.setText(
+                "Export failed - could not write.")
+            return
+        self.main.status_label.setText(
+            "Curated file exported to %s" % path)
+
+    def on_export_curated_jsonl(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export curated .jsonl", "acr-curated.jsonl",
+            "JSONL files (*.jsonl)")
+        if not path:
+            return
+        try:
+            self.export_curated_jsonl_to(path)
+        except OSError:
+            self.main.logger.exception("curated export failed")
+            self.main.status_label.setText(
+                "Export failed - could not write.")
+            return
+        self.main.status_label.setText(
+            "Curated .jsonl exported to %s" % path)
+
+    def on_export_report(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export report", "acr-analysis.txt",
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            self.export_report_to(path)
+        except OSError:
+            self.main.logger.exception("report export failed")
+            self.main.status_label.setText(
+                "Export failed - could not write.")
+            return
+        self.main.status_label.setText(
+            "Report exported to %s" % path)
+
+    def export_stella_packs_to(self, dest_dir):
+        """Write the STELLA data packs for the current run under
+        dest_dir. Returns the export_stella_packs result dict:
+        {"packs": [(folder, rows, under_minimum)], "error": None
+        or a plain message}. Under-minimum packs are still
+        written, with the warning in their README."""
+        result = export_stella_packs(
+            self._summary, self.main._pack_item,
+            self.main._pack_context(), dest_dir,
+            self.main._batch_source_note)
+        for folder, rows, _under in result["packs"]:
+            self.main.logger.action(
+                "STELLA data pack exported to %s (%d rows)"
+                % (folder, rows))
+        return result
+
+    def on_export_stella_packs(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Where to save the STELLA data packs",
+            default_packs_dir())
+        if not folder:
+            return
+        try:
+            result = self.export_stella_packs_to(folder)
+        except OSError:
+            self.main.logger.exception("pack export failed")
+            self.main.status_label.setText(
+                "Export failed - could not write.")
+            return
+        if result["error"] is not None:
+            self.main.status_label.setText(result["error"])
+            return
+        count = len(result["packs"])
+        under = sum(1 for _f, _n, flag in result["packs"]
+                    if flag)
+        message = ("Wrote %d STELLA data pack%s to %s."
+                   % (count, "s" if count != 1 else "", folder))
+        if under == 1:
+            message += (" 1 pack has fewer than 2 rows: STELLA "
+                        "needs 2 or more, add more source "
+                        "material before importing.")
+        elif under > 1:
+            message += (" %d packs have fewer than 2 rows: "
+                        "STELLA needs 2 or more, add more source "
+                        "material before importing." % under)
+        self.main.status_label.setText(message)
+        self.main._show_completion_mark()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, log_dir=None, local_base_url=None):
         super().__init__()
@@ -431,6 +1675,50 @@ class MainWindow(QMainWindow):
         # until the session changes (reset, load, encoder switch).
         self._completion_model = None
         self._completion_text = None
+        # v0.9: the user picked "Local model" in the encoder
+        # picker but has not picked a model yet. The built-in
+        # encoder keeps running until a model is chosen: picking
+        # a mode is not picking a model, and nothing is selected
+        # by default (U6).
+        self._local_pending = False
+        # Embedding dims the app has actually seen, model name ->
+        # dim, from a real first embedding. Shown in the picker
+        # once known, never guessed (U39).
+        self._known_dims = {}
+        # The last model list from the service (info dicts, see
+        # parse_tags_info): the pickers rebuild their guided lines
+        # from this, so both pickers always agree.
+        self._model_infos = []
+        # v0.9: one local call at a time, in a worker thread
+        # (U30). _local_op is "step" or "complete"; the pending
+        # step text waits for its embedding to come back.
+        self._local_thread = None
+        self._local_worker = None
+        self._local_cancelled = False
+        self._local_op = None
+        self._local_model_name = None
+        self._pending_step_text = None
+        # Total RAM, for the model picker's fits-this-PC note.
+        self._total_ram = mem_total_bytes()
+        # v0.9 Analyze: one batch run at a time, in a worker
+        # thread. _full_texts maps step id to the full input text:
+        # the trace holds an 80-character preview, and the curated
+        # export needs the whole line. _locators maps step id to
+        # (file name, line number) for batch steps: where each
+        # step came from, for the STELLA pack manifest. Typed
+        # steps have no locator.
+        self._batch_thread = None
+        self._batch_worker = None
+        self._batch_cancelled = False
+        self._batch_source_note = ""
+        self._full_texts = {}
+        self._locators = {}
+        # The resonance moment (v0.9, technique 8): step ids
+        # already celebrated, so each flag fires the moment once.
+        self._known_flag_steps = set()
+        self._glow_anim = None
+        self._flag_anim = None
+        self._flag_anim_step = None
 
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(
@@ -452,6 +1740,21 @@ class MainWindow(QMainWindow):
         # v0.8: remember the geometry for the next run.
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.sync()
+        # v0.9: the dedicated windows close too (each saves its
+        # own geometry as it hides). A local call in flight is
+        # left to finish in the background; its answer is ignored
+        # because the window is gone.
+        self._local_cancelled = True
+        self._batch_cancelled = True
+        if self._batch_worker is not None:
+            try:
+                self._batch_worker.cancelled = True
+            except RuntimeError:
+                pass
+        for window in (self.controls_window, self.trace_window,
+                       self.views_window, self.howto_window,
+                       self.analyze_window):
+            window.close()
         super().closeEvent(event)
 
     def eventFilter(self, watched, event):
@@ -467,23 +1770,23 @@ class MainWindow(QMainWindow):
 
     # -- UI -----------------------------------------------------------
     def _build_ui(self):
+        self._build_menu()
         central = QWidget(self)
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setSpacing(4)
 
-        # Left: input, controls, readouts, synthesis. Tighter
-        # spacing than the default: the column holds a lot now,
-        # and the saved pixels go to the synthesis panel.
-        left = QVBoxLayout()
-        left.setSpacing(3)
-        root.addLayout(left, 2)
-
+        # Main is toy-simple (U34): encoder, input, Step, the key
+        # readouts, the synthesis head, and the status line. The
+        # controls live in the Controls window, the trace in the
+        # Trace log window, the charts in the Resonance views
+        # window: nothing was removed, only reorganised (U1).
         about = QLabel(
             "Small-scale prototype of the adaptive loop. Type text, "
             "press Step or Enter, and W_t adapts. This is not a full "
             "neural engine.")
         about.setWordWrap(True)
-        left.addWidget(about)
+        root.addWidget(about)
 
         # Encoder: built-in (default) or the local model service.
         # Switching encoders starts a fresh W_t: the embedding
@@ -498,60 +1801,255 @@ class MainWindow(QMainWindow):
         encoder_row.addWidget(self.encoder_combo)
         self.model_combo = QComboBox()
         self.model_combo.setEnabled(False)
-        self.model_combo.currentTextChanged.connect(
+        self.model_combo.setPlaceholderText("Pick a model")
+        self.model_combo.currentIndexChanged.connect(
             self._on_model_changed)
         encoder_row.addWidget(self.model_combo, 1)
         self.start_button = QPushButton("Start service")
         self.start_button.clicked.connect(self.on_start_service)
         encoder_row.addWidget(self.start_button)
-        left.addLayout(encoder_row)
+        root.addLayout(encoder_row)
         self.encoder_label = QLabel("Built-in encoder, dim 64.")
-        left.addWidget(self.encoder_label)
+        root.addWidget(self.encoder_label)
+        root.addWidget(_note_label(
+            "The model list shows what each model does and whether "
+            "it fits this PC. Nothing is picked for you."))
         switch_note = QLabel(
             "Switching encoders starts a fresh W_t (the embedding "
             "sizes differ).")
         switch_note.setWordWrap(True)
-        left.addWidget(switch_note)
+        root.addWidget(switch_note)
 
-        left.addWidget(QLabel("Input text"))
+        root.addWidget(_header_label("Input text"))
         self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText(
             "Type a sentence, then press Enter or Step...")
         # v0.6: fixed at two lines. The input is one sentence; the
         # freed height goes to the synthesis panel below, which
-        # now holds four sections plus the completion.
+        # holds four sections plus the completion.
         self.input_edit.setFixedHeight(56)
         # v0.8: Enter steps the loop; see eventFilter.
         self.input_edit.installEventFilter(self)
-        left.addWidget(self.input_edit)
+        root.addWidget(self.input_edit)
 
+        step_row = QHBoxLayout()
         self.step_button = QPushButton("Step")
+        self.step_button.setObjectName("primaryButton")
+        self.step_button.pressed.connect(
+            lambda: press_dip(self.step_button))
         self.step_button.clicked.connect(self.on_step)
-        left.addWidget(self.step_button)
+        step_row.addWidget(self.step_button, 1)
+        # v0.9 Analyze: the one entry point on the main window.
+        # One-at-a-time stepping stays as the explore mode.
+        self.analyze_button = QPushButton("Analyze a file")
+        self.analyze_button.clicked.connect(self.show_analyze_window)
+        step_row.addWidget(self.analyze_button)
+        root.addLayout(step_row)
 
+        readout_row = QHBoxLayout()
         self.step_label = QLabel("Step: 0")
         self.norm_label = QLabel("W norm: -")
         self.resonance_label = QLabel("Resonance: -")
         self.alpha_label = QLabel("Alpha: 0.30")
         for label in (self.step_label, self.norm_label,
                       self.resonance_label, self.alpha_label):
-            left.addWidget(label)
+            readout_row.addWidget(label)
+        readout_row.addStretch(1)
+        root.addLayout(readout_row)
 
-        left.addWidget(QLabel("Learning rate (alpha)"))
+        root.addWidget(_header_label(
+            "Synthesis head - synthesis from this session's own "
+            "subspace, not general knowledge."))
+        self.synthesis_text = QTextEdit()
+        self.synthesis_text.setReadOnly(True)
+        # A compact panel, not a window-filler: the synthesis head
+        # is one readout among several on the main window. Without
+        # the cap it takes all the spare height and the completion
+        # scroll-to-bottom has nothing to scroll.
+        self.synthesis_text.setMaximumHeight(170)
+        root.addWidget(self.synthesis_text, 1)
+
+        # Optional local-model completion: on-demand only, and
+        # only while the local encoder is active. The picker lists
+        # every installed model with the same guided lines as the
+        # encoder picker, and starts unselected (U6): the button
+        # enables once a model is picked.
+        complete_row = QHBoxLayout()
+        self.complete_button = QPushButton("Complete with local model")
+        self.complete_button.clicked.connect(self.on_complete)
+        self.complete_button.setEnabled(False)
+        complete_row.addWidget(self.complete_button)
+        self.completion_combo = QComboBox()
+        self.completion_combo.setEnabled(False)
+        self.completion_combo.setPlaceholderText("Pick a model")
+        self.completion_combo.currentIndexChanged.connect(
+            self._on_completion_model_changed)
+        complete_row.addWidget(self.completion_combo, 1)
+        root.addLayout(complete_row)
+        self.completion_note = QLabel(
+            "Completion needs the Local model encoder.")
+        self.completion_note.setWordWrap(True)
+        root.addWidget(self.completion_note)
+
+        # Status row: the busy light (U16) plus the status text,
+        # and a Cancel button that only appears while a local call
+        # is running (U26).
+        status_row = QHBoxLayout()
+        self.busy_light = QLabel()
+        self.busy_light.setFixedSize(12, 12)
+        self._set_busy(False)
+        status_row.addWidget(self.busy_light)
+        self.status_label = QLabel("Ready.")
+        self.status_label.setWordWrap(True)
+        status_row.addWidget(self.status_label, 1)
+        self.completion_mark = CheckmarkWidget()
+        status_row.addWidget(self.completion_mark)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.on_cancel_local)
+        self.cancel_button.hide()
+        status_row.addWidget(self.cancel_button)
+        root.addLayout(status_row)
+
+        self._build_controls_window()
+        self._build_trace_window()
+        self._build_views_window()
+        self.howto_window = HowToUseWindow(self)
+        self.analyze_window = AnalyzeWindow(self)
+
+    def _set_busy(self, busy):
+        """The busy light (v0.9, U16): gold while the app is
+        working, grey at rest."""
+        color = ACCENT_GOLD if busy else BUSY_OFF
+        self.busy_light.setStyleSheet(
+            "background-color: %s; border-radius: 6px;" % color)
+
+    def _build_menu(self):
+        """A real menu bar (v0.9, U38): every function reachable
+        from the menu, not only from buttons."""
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("File")
+        self.action_save_session = QAction("Save session", self)
+        self.action_save_session.triggered.connect(
+            self.on_save_session)
+        file_menu.addAction(self.action_save_session)
+        self.action_load_session = QAction("Load session", self)
+        self.action_load_session.triggered.connect(
+            self.on_load_session)
+        file_menu.addAction(self.action_load_session)
+        file_menu.addSeparator()
+        self.action_export_json = QAction("Export trace JSON", self)
+        self.action_export_json.triggered.connect(self.on_export)
+        file_menu.addAction(self.action_export_json)
+        self.action_export_csv = QAction("Export trace CSV", self)
+        self.action_export_csv.triggered.connect(self.on_export_csv)
+        file_menu.addAction(self.action_export_csv)
+        self.action_export_session = QAction("Export session", self)
+        self.action_export_session.triggered.connect(
+            self.on_export_session)
+        file_menu.addAction(self.action_export_session)
+        file_menu.addSeparator()
+        self.action_debug_report = QAction(
+            "Generate debug report", self)
+        self.action_debug_report.triggered.connect(
+            self.on_debug_report)
+        file_menu.addAction(self.action_debug_report)
+        self.action_reset = QAction("Reset", self)
+        self.action_reset.triggered.connect(self.on_reset)
+        file_menu.addAction(self.action_reset)
+        file_menu.addSeparator()
+        self.action_quit = QAction("Quit", self)
+        self.action_quit.triggered.connect(self.close)
+        file_menu.addAction(self.action_quit)
+
+        view_menu = menu_bar.addMenu("View")
+        self.action_show_controls = QAction("Controls", self)
+        self.action_show_controls.triggered.connect(
+            self.show_controls_window)
+        view_menu.addAction(self.action_show_controls)
+        self.action_show_trace = QAction("Trace log", self)
+        self.action_show_trace.triggered.connect(
+            self.show_trace_window)
+        view_menu.addAction(self.action_show_trace)
+        self.action_show_views = QAction("Resonance views", self)
+        self.action_show_views.triggered.connect(
+            self.show_views_window)
+        view_menu.addAction(self.action_show_views)
+        self.action_show_analyze = QAction("Analyze a file", self)
+        self.action_show_analyze.triggered.connect(
+            self.show_analyze_window)
+        view_menu.addAction(self.action_show_analyze)
+
+        help_menu = menu_bar.addMenu("Help")
+        self.action_how_to_use = QAction("How to Use", self)
+        self.action_how_to_use.triggered.connect(
+            self.show_howto_window)
+        help_menu.addAction(self.action_how_to_use)
+        self.action_about = QAction("About", self)
+        self.action_about.triggered.connect(self.on_about)
+        help_menu.addAction(self.action_about)
+
+    def show_controls_window(self):
+        self.controls_window.show()
+        self.controls_window.raise_()
+        self.controls_window.activateWindow()
+
+    def show_trace_window(self):
+        self.trace_window.show()
+        self.trace_window.raise_()
+        self.trace_window.activateWindow()
+
+    def show_views_window(self):
+        self.views_window.show()
+        self.views_window.raise_()
+        self.views_window.activateWindow()
+
+    def show_howto_window(self):
+        self.howto_window.show()
+        self.howto_window.raise_()
+        self.howto_window.activateWindow()
+
+    def show_analyze_window(self):
+        self.analyze_window.show()
+        self.analyze_window.raise_()
+        self.analyze_window.activateWindow()
+
+    def on_about(self):
+        QMessageBox.about(
+            self, "About ACR",
+            "ACR v%s - Adaptive Contextual Resonance\n\n"
+            "A small-scale working model of an adaptive neural "
+            "loop. Type text, step the loop, and watch the weight "
+            "matrix adapt to what you type.\n\n"
+            "This is not a full self-evolving neural engine."
+            % VERSION)
+
+    def _build_controls_window(self):
+        """The Controls window (v0.9, U1): everything that tunes
+        how W_t adapts. Moved out of the main window whole: the
+        widgets keep their names, so the behaviour is unchanged."""
+        window = SubWindow("ACR - Controls", "controls_geometry",
+                           self, default_width=700,
+                           default_height=420)
+        layout = QVBoxLayout(window)
+
+        layout.addWidget(_header_label("Learning rate (alpha)"))
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(1, 50)
         self.alpha_slider.setValue(30)
         self.alpha_slider.setTickPosition(QSlider.TicksBelow)
         self.alpha_slider.setTickInterval(10)
         self.alpha_slider.valueChanged.connect(self._on_alpha_changed)
-        left.addWidget(self.alpha_slider)
+        layout.addWidget(self.alpha_slider)
+        layout.addWidget(_note_label(
+            "How fast W_t adapts. Higher learns faster but can "
+            "overshoot. 0.30 is the setting the resonance climb "
+            "was verified at."))
 
         # v0.7: freeze mode and learning-rate schedule share one
-        # row: both are adaptation controls, and the column is
-        # full. Freeze Off adapts as usual; Whole W_t logs steps
-        # without changing W_t; Rank directions freezes only the
-        # checked directions below. The slider sets the base
-        # alpha the schedule scales from.
+        # row: both are adaptation controls. Freeze Off adapts as
+        # usual; Whole W_t logs steps without changing W_t; Rank
+        # directions freezes only the checked directions below.
+        # The slider sets the base alpha the schedule scales from.
         control_row = QHBoxLayout()
         control_row.addWidget(QLabel("Freeze"))
         self.freeze_combo = QComboBox()
@@ -567,7 +2065,15 @@ class MainWindow(QMainWindow):
         self.schedule_combo.currentIndexChanged.connect(
             self._on_schedule_changed)
         control_row.addWidget(self.schedule_combo, 1)
-        left.addLayout(control_row)
+        layout.addLayout(control_row)
+        layout.addWidget(_note_label(
+            "Freeze Off adapts as usual. Whole W_t logs steps "
+            "without changing W_t. Rank directions freezes only "
+            "the checked directions below."))
+        layout.addWidget(_note_label(
+            "Schedule scales the learning rate: Steady keeps it, "
+            "Fast-adapt starts at twice the base and settles back, "
+            "Gentle runs at one third of the base."))
 
         # Rank-direction toggles, live only in Rank directions
         # mode. Checked means frozen: that component holds still
@@ -581,7 +2087,10 @@ class MainWindow(QMainWindow):
             self.rank_checks.append(check)
             rank_row.addWidget(check)
         rank_row.addStretch(1)
-        left.addLayout(rank_row)
+        layout.addLayout(rank_row)
+        layout.addWidget(_note_label(
+            "Checked directions hold still while the rest adapt. "
+            "Live only in Rank directions mode."))
 
         cap_row = QHBoxLayout()
         cap_row.addWidget(QLabel("Stability cap"))
@@ -595,78 +2104,23 @@ class MainWindow(QMainWindow):
         self.spectral_label = QLabel("Top singular value: -")
         cap_row.addWidget(self.spectral_label)
         cap_row.addStretch(1)
-        left.addLayout(cap_row)
+        layout.addLayout(cap_row)
+        layout.addWidget(_note_label(
+            "The cap limits how big one step can be. Steps it "
+            "clipped show Capped in the trace log. The top "
+            "singular value is the size of W_t's strongest "
+            "direction."))
+        layout.addStretch(1)
+        self.controls_window = window
 
-        left.addWidget(QLabel(
-            "Synthesis head - synthesis from this session's own "
-            "subspace, not general knowledge."))
-        self.synthesis_text = QTextEdit()
-        self.synthesis_text.setReadOnly(True)
-        self.synthesis_text.setMaximumHeight(200)
-        # Stretch 1: the panel takes spare height over the empty
-        # space at the bottom of the column.
-        left.addWidget(self.synthesis_text, 1)
-
-        # Optional local-model completion: on-demand only, and
-        # only while the local encoder is active. The picker lists
-        # every installed model, defaulting to the first that is
-        # not the encoder model; the picker always shows the model
-        # name, so nothing is presented as something it is not.
-        complete_row = QHBoxLayout()
-        self.complete_button = QPushButton("Complete with local model")
-        self.complete_button.clicked.connect(self.on_complete)
-        self.complete_button.setEnabled(False)
-        complete_row.addWidget(self.complete_button)
-        self.completion_combo = QComboBox()
-        self.completion_combo.setEnabled(False)
-        complete_row.addWidget(self.completion_combo, 1)
-        left.addLayout(complete_row)
-        self.completion_note = QLabel(
-            "Completion needs the Local model encoder.")
-        self.completion_note.setWordWrap(True)
-        left.addWidget(self.completion_note)
-
-        btn_row = QHBoxLayout()
-        self.export_button = QPushButton("Export trace JSON")
-        self.export_button.clicked.connect(self.on_export)
-        self.export_csv_button = QPushButton("Export trace CSV")
-        self.export_csv_button.clicked.connect(self.on_export_csv)
-        self.report_button = QPushButton("Generate debug report")
-        self.report_button.clicked.connect(self.on_debug_report)
-        btn_row.addWidget(self.export_button)
-        btn_row.addWidget(self.export_csv_button)
-        btn_row.addWidget(self.report_button)
-        left.addLayout(btn_row)
-
-        session_row = QHBoxLayout()
-        self.save_button = QPushButton("Save session")
-        self.save_button.clicked.connect(self.on_save_session)
-        self.load_button = QPushButton("Load session")
-        self.load_button.clicked.connect(self.on_load_session)
-        self.export_session_button = QPushButton("Export session")
-        self.export_session_button.clicked.connect(
-            self.on_export_session)
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.clicked.connect(self.on_reset)
-        session_row.addWidget(self.save_button)
-        session_row.addWidget(self.load_button)
-        session_row.addWidget(self.export_session_button)
-        session_row.addWidget(self.reset_button)
-        left.addLayout(session_row)
-
-        self.status_label = QLabel("Ready.")
-        self.status_label.setWordWrap(True)
-        left.addWidget(self.status_label)
-        # No bottom stretch: the synthesis panel (stretch 1)
-        # takes the spare height instead, up to its 200 maximum.
-
-        # Right: tabs for the trace log and the resonance views.
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs, 3)
-
-        trace_page = QWidget()
-        trace_layout = QVBoxLayout(trace_page)
-        trace_layout.addWidget(QLabel("Trace log - every weight change"))
+    def _build_trace_window(self):
+        """The Trace log window (v0.9, U1): the trace table, the
+        revert button, and the latent state buffer."""
+        window = SubWindow("ACR - Trace log", "trace_geometry",
+                           self)
+        layout = QVBoxLayout(window)
+        layout.addWidget(_header_label(
+            "Trace log - every weight change"))
         self.trace_table = QTableWidget(0, len(TRACE_COLUMNS))
         self.trace_table.setHorizontalHeaderLabels(TRACE_COLUMNS)
         self.trace_table.setEditTriggers(
@@ -674,7 +2128,7 @@ class MainWindow(QMainWindow):
         # The Step column already numbers the rows, so the row
         # numbers add nothing. Numeric columns size to their
         # contents; the Input column takes the leftover width so
-        # all nine columns fit without scrolling.
+        # all ten columns fit without scrolling.
         self.trace_table.verticalHeader().setVisible(False)
         header = self.trace_table.horizontalHeader()
         for col in range(len(TRACE_COLUMNS)):
@@ -684,7 +2138,7 @@ class MainWindow(QMainWindow):
             else:
                 header.setSectionResizeMode(
                     col, QHeaderView.ResizeToContents)
-        trace_layout.addWidget(self.trace_table, 3)
+        layout.addWidget(self.trace_table, 3)
 
         # v0.7: roll W_t back to the state after a selected step.
         revert_row = QHBoxLayout()
@@ -693,24 +2147,31 @@ class MainWindow(QMainWindow):
         self.revert_button.clicked.connect(self.on_revert)
         revert_row.addWidget(self.revert_button)
         revert_row.addStretch(1)
-        trace_layout.addLayout(revert_row)
+        layout.addLayout(revert_row)
+        layout.addWidget(_note_label(
+            "Click a step in the table, then Revert, to roll W_t "
+            "back to its state after that step. It asks first."))
 
-        trace_layout.addWidget(QLabel(
+        layout.addWidget(_header_label(
             "Latent state buffer - last %d inputs, newest first"
             % BUFFER_SIZE))
         self.buffer_list = QListWidget()
-        trace_layout.addWidget(self.buffer_list, 1)
-        self.tabs.addTab(trace_page, "Trace log")
+        layout.addWidget(self.buffer_list, 1)
+        self.trace_window = window
 
-        views_page = QWidget()
-        views_layout = QVBoxLayout(views_page)
+    def _build_views_window(self):
+        """The Resonance views window (v0.9, U1): the norm chart,
+        the change heatmap, and the layer candidates."""
+        window = SubWindow("ACR - Resonance views",
+                           "views_geometry", self)
+        layout = QVBoxLayout(window)
 
-        views_layout.addWidget(QLabel(
+        layout.addWidget(_header_label(
             "W_t norm over time - spikes are resonance spikes"))
         self.norm_chart = NormChart()
-        views_layout.addWidget(self.norm_chart, 2)
+        layout.addWidget(self.norm_chart, 2)
 
-        views_layout.addWidget(QLabel(
+        layout.addWidget(_header_label(
             "W_t change per step - which rows moved most"))
         heat_row = QHBoxLayout()
         heat_row.addWidget(QLabel("Step"))
@@ -723,23 +2184,23 @@ class MainWindow(QMainWindow):
         self.heat_summary = QLabel("No steps yet.")
         self.heat_summary.setWordWrap(True)
         heat_row.addWidget(self.heat_summary, 1)
-        views_layout.addLayout(heat_row)
+        layout.addLayout(heat_row)
         self.heatmap = ChangeHeatmap()
-        views_layout.addWidget(self.heatmap, 2)
+        layout.addWidget(self.heatmap, 2)
 
-        views_layout.addWidget(QLabel(
+        layout.addWidget(_header_label(
             "Layer candidates - resonance spikes and the input "
             "that triggered them"))
         self.layer_list = QListWidget()
         self.layer_list.setMaximumHeight(90)
         self.layer_list.currentItemChanged.connect(
             self._on_layer_selected)
-        views_layout.addWidget(self.layer_list)
+        layout.addWidget(self.layer_list)
         self.layer_detail = QTextEdit()
         self.layer_detail.setReadOnly(True)
         self.layer_detail.setMaximumHeight(110)
-        views_layout.addWidget(self.layer_detail)
-        self.tabs.addTab(views_page, "Resonance views")
+        layout.addWidget(self.layer_detail)
+        self.views_window = window
 
     # -- actions ------------------------------------------------------
     def _alpha(self):
@@ -790,20 +2251,47 @@ class MainWindow(QMainWindow):
         self.logger.action("freeze mode: %s" % mode)
 
     # -- encoder ------------------------------------------------------
+    def _model_names(self):
+        """Model names in the encoder picker, by stored data (the
+        visible lines are guided text, not bare names)."""
+        return [self.model_combo.itemData(i)
+                for i in range(self.model_combo.count())]
+
+    def _fill_model_combo(self, infos):
+        """Fill the encoder picker with guided lines (v0.9, U39):
+        what each model does and whether it fits this PC. Starts
+        unselected, with a "Pick a model" prompt (U6)."""
+        self._model_infos = list(infos)
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for info in infos:
+            known = self._known_dims.get(info["name"])
+            self.model_combo.addItem(
+                model_display_text(info, self._total_ram, known),
+                info["name"])
+        self.model_combo.setCurrentIndex(-1)
+        self.model_combo.blockSignals(False)
+
     def _set_encoder_ui(self):
         """Picker, model list, and label to match the encoder state."""
         self.encoder_combo.blockSignals(True)
         self.encoder_combo.setCurrentIndex(
-            1 if self.encoder_kind == "local" else 0)
+            1 if (self.encoder_kind == "local"
+                  or self._local_pending) else 0)
         self.encoder_combo.blockSignals(False)
         if self.encoder_kind == "local":
             self.model_combo.setEnabled(True)
             self.encoder_label.setText(
                 "Local model: %s, dim %d."
                 % (self.local_model, self.engine.dim))
+        elif self._local_pending:
+            self.model_combo.setEnabled(True)
+            self.encoder_label.setText(
+                "Pick a model above to use the local encoder.")
         else:
             # No model is running: clear the list so a stale name
             # never sits in the disabled combo.
+            self._model_infos = []
             self.model_combo.blockSignals(True)
             self.model_combo.clear()
             self.model_combo.blockSignals(False)
@@ -813,12 +2301,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_completion_ui(self):
         """Completion button, picker, and note to match the encoder
-        state. The picker lists every installed model, defaulting
-        to the first that is not the encoder model (the encoder
-        model itself when it is the only one installed). The
-        user's pick is kept when it is still a choice. Runs from
-        _set_encoder_ui, which covers every encoder change,
-        session load, and failed switch."""
+        state. The picker lists every installed model with the
+        same guided lines as the encoder picker, and starts
+        unselected (U6): the button enables once a model is
+        picked. The user's pick is kept when it is still a
+        choice. Runs from _set_encoder_ui, which covers every
+        encoder change, session load, and failed switch."""
         if self.encoder_kind != "local":
             self.complete_button.setEnabled(False)
             self.completion_combo.blockSignals(True)
@@ -828,62 +2316,90 @@ class MainWindow(QMainWindow):
             self.completion_note.setText(
                 "Completion needs the Local model encoder.")
             return
-        models = [self.model_combo.itemText(i)
-                  for i in range(self.model_combo.count())]
-        choices = list(models)
-        previous = self.completion_combo.currentText()
+        previous = self.completion_combo.currentData()
         self.completion_combo.blockSignals(True)
         self.completion_combo.clear()
-        self.completion_combo.addItems(choices)
-        if previous in choices:
-            self.completion_combo.setCurrentText(previous)
-        elif choices:
-            self.completion_combo.setCurrentText(
-                pick_completion_model(models, self.local_model))
+        for info in self._model_infos:
+            known = self._known_dims.get(info["name"])
+            self.completion_combo.addItem(
+                model_display_text(info, self._total_ram, known),
+                info["name"])
+        if previous in [info["name"]
+                        for info in self._model_infos]:
+            index = self.completion_combo.findData(previous)
+            self.completion_combo.setCurrentIndex(index)
+        else:
+            self.completion_combo.setCurrentIndex(-1)
         self.completion_combo.blockSignals(False)
-        if not choices:
+        if self.completion_combo.count() == 0:
             self.complete_button.setEnabled(False)
             self.completion_combo.setEnabled(False)
             self.completion_note.setText(
                 "No model is installed for completion.")
         else:
-            self.complete_button.setEnabled(True)
             self.completion_combo.setEnabled(True)
-            self.completion_note.setText("")
+            self.complete_button.setEnabled(
+                self.completion_combo.currentIndex() >= 0)
+            self.completion_note.setText(
+                "Pick a model to continue the theme from the most "
+                "resonant inputs.")
+
+    def _on_completion_model_changed(self, index):
+        # The button enables only once a model is picked: nothing
+        # is selected by default (U6).
+        if self.encoder_kind == "local":
+            self.complete_button.setEnabled(index >= 0)
 
     def _fresh_engine(self, dim):
         """A fresh engine at the given dim, with views cleared."""
         self.engine = Engine(dim=dim)
         self._heat_history = []
         self._heat_follow = True
+        self._full_texts = {}
+        self._locators = {}
+        self._batch_source_note = ""
         self._completion_model = None
         self._completion_text = None
+        self._known_flag_steps = set()
         self.logger.set_setting("dim", dim)
 
     def _on_encoder_changed(self, index):
+        if self._refuse_if_batch_running():
+            # Put the picker back: the encoder cannot change
+            # while the worker owns the engine.
+            self._set_encoder_ui()
+            return
         if index == 0:
-            if self.encoder_kind == "builtin":
-                return
-            self._switch_to_builtin(
-                "Back to the built-in encoder. W_t is fresh.")
+            if self.encoder_kind == "local":
+                self._switch_to_builtin(
+                    "Back to the built-in encoder. W_t is fresh.")
+            elif self._local_pending:
+                # Only peeked at the local picker: nothing changed,
+                # so W_t stays as it is.
+                self._local_pending = False
+                self._set_encoder_ui()
+                self.status_label.setText("Built-in encoder.")
             return
-        if self.encoder_kind == "local":
+        if self.encoder_kind == "local" or self._local_pending:
             return
-        self._switch_to_local()
+        self._offer_local_models()
 
     def _switch_to_builtin(self, message):
         self.encoder_kind = "builtin"
         self.local_model = None
+        self._local_pending = False
         self._fresh_engine(DIM)
         self.logger.set_setting("encoder", "built-in deterministic")
         self._set_encoder_ui()
         self._refresh_all()
         self.status_label.setText(message)
 
-    def _switch_to_local(self):
-        """Pick the local encoder: health check, model list, then a
-        probe embedding to learn the model's dim. Any failure leaves
-        the built-in encoder in place with a plain message."""
+    def _offer_local_models(self):
+        """Pick the Local model mode: health check, then fill the
+        model picker with guided lines. Nothing is activated yet:
+        the user picks a model, and that pick activates the local
+        encoder. Any failure leaves the built-in encoder in place
+        with a plain message."""
         if not self.client.probe():
             self._set_encoder_ui()
             self.status_label.setText(
@@ -891,20 +2407,20 @@ class MainWindow(QMainWindow):
                 "on Built-in.")
             return
         try:
-            models = self.client.list_models()
+            infos = self.client.list_model_info()
         except LocalModelError as exc:
             self._set_encoder_ui()
             self.status_label.setText(str(exc))
             return
-        if not models:
+        if not infos:
             self._set_encoder_ui()
             self.status_label.setText(MSG_NO_MODELS)
             return
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        self.model_combo.addItems(models)
-        self.model_combo.blockSignals(False)
-        self._activate_local_model(pick_default_model(models))
+        self._local_pending = True
+        self._fill_model_combo(infos)
+        self._set_encoder_ui()
+        self.status_label.setText(
+            "Pick a model to use the local encoder.")
 
     def _activate_local_model(self, model):
         """Make a local model the encoder, with a fresh W_t.
@@ -919,19 +2435,32 @@ class MainWindow(QMainWindow):
             self._set_encoder_ui()
             # A failed model switch leaves the old model active:
             # put its name back in the list so the list never shows
-            # a model that is not running.
+            # a model that is not running. A failed first pick
+            # leaves the picker unselected, so it can be picked
+            # again.
             if self.encoder_kind == "local" and self.local_model:
+                index = self.model_combo.findData(self.local_model)
                 self.model_combo.blockSignals(True)
-                self.model_combo.setCurrentText(self.local_model)
+                self.model_combo.setCurrentIndex(index)
+                self.model_combo.blockSignals(False)
+            else:
+                self.model_combo.blockSignals(True)
+                self.model_combo.setCurrentIndex(-1)
                 self.model_combo.blockSignals(False)
             self.status_label.setText(str(exc))
             return
         self.encoder_kind = "local"
         self.local_model = model
+        self._local_pending = False
+        self._known_dims[model] = len(probe)
         self._fresh_engine(len(probe))
         self.logger.set_setting("encoder", "local model %s" % model)
+        # Rebuild the picker lines so the active model shows its
+        # now-known dim, and keep it selected.
+        self._fill_model_combo(self._model_infos)
+        index = self.model_combo.findData(model)
         self.model_combo.blockSignals(True)
-        self.model_combo.setCurrentText(model)
+        self.model_combo.setCurrentIndex(index)
         self.model_combo.blockSignals(False)
         self._set_encoder_ui()
         self._refresh_all()
@@ -939,116 +2468,165 @@ class MainWindow(QMainWindow):
             "Local encoder: %s (dim %d). W_t is fresh."
             % (model, len(probe)))
 
-    def _on_model_changed(self, name):
-        # Fires while the list is populated too; only a real change
-        # to another model while local re-activates (fresh W_t).
-        if (self.encoder_kind != "local" or not name
-                or name == self.local_model):
+    def _on_model_changed(self, index):
+        # Fires while the list is populated too; only a real pick
+        # activates. While pending, any pick starts the local
+        # encoder; while local, picking another model switches to
+        # it (fresh W_t).
+        if index < 0:
             return
-        self._activate_local_model(name)
+        name = self.model_combo.itemData(index)
+        if not name:
+            return
+        if self.encoder_kind == "local" and name == self.local_model:
+            return
+        if self._local_pending or self.encoder_kind == "local":
+            self._activate_local_model(name)
 
     def on_start_service(self):
         self.start_button.setEnabled(False)
+        self._set_busy(True)
         try:
             ok, message = self.service.start()
         finally:
             self.start_button.setEnabled(True)
+            self._set_busy(False)
         if ok:
             message += " Pick Local model to use it."
         self.status_label.setText(message)
 
-    def _on_service_retry(self, attempt, delay, kind):
-        # Called from the client's retry loop, on the UI thread:
-        # show the slow message live instead of after the fact.
+    # -- local calls in a worker thread (v0.9, U30) -------------------
+    def _start_local_call(self, kind, model, text):
+        """Run one local-model call off the UI thread. The busy
+        light goes on, the Step and completion buttons go off (one
+        local call at a time), and Cancel appears. Returns False
+        when a call is already running."""
+        if self._local_thread is not None:
+            self.status_label.setText(
+                "A local model call is already running.")
+            return False
+        self._local_cancelled = False
+        self._local_op = "step" if kind == "embed" else "complete"
+        # The model name, kept on the window: the worker object is
+        # deleted when its thread winds down, possibly before the
+        # queued finished handler runs, so the handler must never
+        # read it back off the worker.
+        self._local_model_name = model
+        self._set_busy(True)
+        self.step_button.setEnabled(False)
+        self.complete_button.setEnabled(False)
+        self.cancel_button.show()
         self.status_label.setText(
-            "The local model service is slow, retrying "
-            "(attempt %d)..." % (attempt + 1))
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
+            "Asking the local model..." if kind == "generate"
+            else "Getting the embedding from the local model...")
+        # The thread is unparented on purpose: if the window
+        # closes mid-call, the call finishes in the background
+        # and its answer is ignored, instead of Qt destroying a
+        # running thread with the window.
+        thread = QThread()
+        worker = LocalCallWorker(self.client, kind, model, text)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_local_progress)
+        worker.finished.connect(self._on_local_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # The thread reference clears only once the thread has
+        # actually stopped: dropping it in the finished handler
+        # destroys a still-running QThread.
+        thread.finished.connect(self._clear_local_thread)
+        self._local_thread = thread
+        self._local_worker = worker
+        thread.start()
+        return True
 
-    def on_complete(self):
-        """Complete the session's theme with the local model.
+    def _clear_local_thread(self):
+        """Drop the local-call thread once it has stopped."""
+        self._local_thread = None
+        self._local_worker = None
 
-        The resonant buffer entries go in as context; the returned
-        text shows in the synthesis panel, labelled as the local
-        model's words. On-demand only: nothing is generated on
-        Step. A failed completion never falls back to the built-in
-        encoder: the session is fine, only the completion failed.
-        """
-        if self.encoder_kind != "local":
-            self.status_label.setText(
-                "Completion needs the Local model encoder.")
-            return
-        model = self.completion_combo.currentText()
-        if not model:
-            self.status_label.setText(
-                "No model is installed for completion.")
-            return
-        entries = self.engine.resonant_entries(5)
-        if not entries:
-            self.status_label.setText(
-                "No resonant inputs yet to complete from. Step a "
-                "few sentences on one theme first.")
-            return
-        prompt = ("These are the most resonant inputs from this "
-                  "session:\n")
-        for entry in entries:
-            prompt += "- %s\n" % entry[0]
-        prompt += "Continue the theme in one sentence."
-        try:
-            text = self.client.generate(
-                model, prompt, on_retry=self._on_service_retry)
-        except LocalModelError as exc:
-            self.logger.action("completion failed: %s" % exc)
-            self.status_label.setText(str(exc))
-            return
-        self._completion_model = model
-        self._completion_text = text.strip()
-        self.logger.action("completion from %s" % model)
-        self._refresh_synthesis()
-        # The completion sits at the bottom of the panel: scroll
-        # it into view, so the user sees the words they asked for
-        # instead of the top of the panel.
-        bar = self.synthesis_text.verticalScrollBar()
-        bar.setValue(bar.maximum())
-        self.status_label.setText("Completion from %s." % model)
+    def _on_local_progress(self, message):
+        self.status_label.setText(message)
 
-    def on_step(self):
-        text = self.input_edit.toPlainText().strip()
-        if not text:
-            self.status_label.setText("Type something first.")
+    def on_cancel_local(self):
+        """Cancel the running local call (U26): its answer is
+        thrown away when it arrives. The buttons stay off until
+        the call returns, so a second call cannot pile on top."""
+        if self._local_thread is None:
             return
-        h = None
-        fallback_message = None
-        if self.encoder_kind == "local":
-            try:
-                h = self.client.embed(
-                    self.local_model, text,
-                    on_retry=self._on_service_retry)
-            except LocalModelError as exc:
-                # Mid-session failure: fall back to the built-in
-                # encoder with a fresh W_t, and run this step on
-                # it. The user loses the local session, not the
-                # app, and the message says what happened.
+        self._local_cancelled = True
+        self.cancel_button.hide()
+        self.status_label.setText("Cancelling, one moment...")
+
+    def _finish_local_call(self):
+        """Shared cleanup when a local call lands: light off,
+        buttons back, Cancel gone. The thread reference stays
+        until the thread has actually stopped (see
+        _clear_local_thread)."""
+        self._set_busy(False)
+        self.step_button.setEnabled(True)
+        self.cancel_button.hide()
+        self._local_op = None
+        # The completion button's state depends on the picker.
+        self._refresh_completion_ui()
+
+    def _on_local_finished(self, result):
+        """A worker call landed, on the UI thread. Cancelled calls
+        are thrown away. Errors on a step fall back to the
+        built-in encoder; errors on a completion just say so."""
+        op = self._local_op
+        cancelled = self._local_cancelled
+        text = self._pending_step_text
+        model = self._local_model_name
+        self._pending_step_text = None
+        self._finish_local_call()
+        if cancelled:
+            self.status_label.setText("Cancelled.")
+            return
+        if isinstance(result, LocalModelError):
+            if op == "step":
                 self.logger.action(
                     "local encoder failed (%s), fell back to "
-                    "built-in" % exc)
-                fallback_message = (
+                    "built-in" % result)
+                message = (
                     "The local model service stopped. Back to the "
                     "built-in encoder with a fresh W_t.")
-                self._switch_to_builtin(fallback_message)
+                self._switch_to_builtin(message)
+                self._run_step(text, None, message)
             else:
-                if len(h) != self.engine.dim:
-                    self.logger.action(
-                        "local model returned dim %d, engine is "
-                        "dim %d" % (len(h), self.engine.dim))
-                    fallback_message = (
-                        "The local model returned the wrong size. "
-                        "Back to the built-in encoder with a fresh "
-                        "W_t.")
-                    self._switch_to_builtin(fallback_message)
-                    h = None
+                self.logger.action("completion failed: %s" % result)
+                self.status_label.setText(str(result))
+            return
+        if op == "step":
+            if len(result) != self.engine.dim:
+                self.logger.action(
+                    "local model returned dim %d, engine is "
+                    "dim %d" % (len(result), self.engine.dim))
+                message = (
+                    "The local model returned the wrong size. "
+                    "Back to the built-in encoder with a fresh "
+                    "W_t.")
+                self._switch_to_builtin(message)
+                self._run_step(text, None, message)
+            else:
+                self._run_step(text, result, None)
+        else:
+            self._completion_model = model
+            self._completion_text = result.strip()
+            self.logger.action("completion from %s" % model)
+            self._refresh_synthesis()
+            # The completion sits at the bottom of the panel:
+            # scroll it into view, so the user sees the words they
+            # asked for instead of the top of the panel.
+            bar = self.synthesis_text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            self.status_label.setText(
+                "Completion from %s." % model)
+
+    def _run_step(self, text, h, fallback_message):
+        """Run one engine step on the UI thread (fast, always):
+        snapshot the factors for the heatmap, step, refresh."""
         # Snapshot the factors before the step so the heatmap can
         # show which rows of W_t moved (read-only copies).
         old_u = [row[:] for row in self.engine.u]
@@ -1067,6 +2645,7 @@ class MainWindow(QMainWindow):
         self._heat_history.append(
             (entry["id"], _row_change_norms(
                 old_u, old_v, self.engine.u, self.engine.v)))
+        self._full_texts[entry["id"]] = text
         self.logger.action(
             "step %d: resonance %.3f, W norm %.3f -> %.3f"
             % (entry["id"], entry["resonance"],
@@ -1081,6 +2660,260 @@ class MainWindow(QMainWindow):
             note = fallback_message + " " + note
         self.status_label.setText(note)
 
+    def on_step(self):
+        text = self.input_edit.toPlainText().strip()
+        if not text:
+            self.status_label.setText("Type something first.")
+            return
+        if self._refuse_if_batch_running():
+            return
+        self._clear_completion_mark()
+        if self._local_thread is not None:
+            self.status_label.setText(
+                "Wait for the local model call to finish.")
+            return
+        if self.encoder_kind == "local":
+            # The embedding comes from the worker thread (U30):
+            # the window stays responsive while the model works.
+            self._pending_step_text = text
+            self._start_local_call("embed", self.local_model, text)
+            return
+        self._run_step(text, None, None)
+
+    def on_complete(self):
+        """Complete the session's theme with the local model.
+
+        The resonant buffer entries go in as context; the returned
+        text shows in the synthesis panel, labelled as the local
+        model's words. On-demand only: nothing is generated on
+        Step. A failed completion never falls back to the built-in
+        encoder: the session is fine, only the completion failed.
+        The call runs in a worker thread (U30), so the window
+        stays responsive while the model writes.
+        """
+        if self._refuse_if_batch_running():
+            return
+        if self.encoder_kind != "local":
+            self.status_label.setText(
+                "Completion needs the Local model encoder.")
+            return
+        model = self.completion_combo.currentData()
+        if not model:
+            self.status_label.setText(
+                "Pick a model for completion first.")
+            return
+        entries = self.engine.resonant_entries(5)
+        if not entries:
+            self.status_label.setText(
+                "No resonant inputs yet to complete from. Step a "
+                "few sentences on one theme first.")
+            return
+        if self._local_thread is not None:
+            self.status_label.setText(
+                "Wait for the local model call to finish.")
+            return
+        prompt = ("These are the most resonant inputs from this "
+                  "session:\n")
+        for entry in entries:
+            prompt += "- %s\n" % entry[0]
+        prompt += "Continue the theme in one sentence."
+        self._start_local_call("generate", model, prompt)
+
+    # -- batch analysis (v0.9, Analyze) -------------------------------
+    def _batch_running(self):
+        return self._batch_thread is not None
+
+    def _refuse_if_batch_running(self):
+        """True when a batch run is in flight: the mutating
+        actions say so and do nothing, because the worker owns
+        the engine until the run lands."""
+        if self._batch_running():
+            self.status_label.setText(
+                "Wait for the analysis to finish.")
+            return True
+        return False
+
+    def _entry_text(self, entry):
+        """The full input text for a trace entry: the trace holds
+        an 80-character preview, and the curated export needs the
+        whole line."""
+        return self._full_texts.get(entry["id"], entry["input"])
+
+    def _pack_item(self, entry):
+        """The manifest item for one trace entry: its source,
+        its locator (step number and source line number), and
+        its full text. Typed steps have no file or line: their
+        source is "typed in this session" and the locator says
+        so."""
+        locator = self._locators.get(entry["id"])
+        if locator is not None:
+            source, line_no = locator
+            text = ("Step %d, line %d"
+                    % (entry["id"], line_no))
+        else:
+            source = "typed in this session"
+            text = "Step %d (typed)" % entry["id"]
+        return {"source": source, "locator": text,
+                "text": self._entry_text(entry)}
+
+    def _pack_context(self):
+        """Everything the pack writer needs from the engine:
+        "vectors" (step id to embedding, for the steps still in
+        the buffer), "pool" (distinct full text to embedding, the
+        neighbour candidates), and "resonant" (the (full text,
+        vector) most resonant entries, best first, for the
+        analogy's A and B). The buffer holds the last 50 steps in
+        step order, so buffer item j is the j-th of the last 50
+        real steps: the same mapping Engine.resonant_entries
+        uses (revert entries are not steps and are filtered out
+        first)."""
+        steps = [e for e in self.engine.trace
+                 if "reverted_to" not in e]
+        count = len(self.engine.buffer)
+        vectors = {}
+        pool = {}
+        for j, item in enumerate(self.engine.buffer):
+            entry = steps[len(steps) - count + j]
+            vectors[entry["id"]] = item["vector"]
+            text = self._entry_text(entry)
+            if text not in pool:
+                pool[text] = item["vector"]
+        resonant = []
+        for text, vector, _res, _new, step_id in (
+                self.engine.resonant_entries(2)):
+            resonant.append((self._full_texts.get(step_id, text),
+                             vector))
+        return {"vectors": vectors, "pool": pool,
+                "resonant": resonant}
+
+    def start_batch(self, paths, source_note=""):
+        """Run a batch analysis: every line of the picked files
+        becomes one step, in file order, in a worker thread. The
+        step parameters are snapshotted from the Controls window
+        at the start, so changing a control mid-run never bends
+        a run halfway through. Returns False when another
+        operation is already running."""
+        if (self._local_thread is not None
+                or self._batch_thread is not None):
+            self.status_label.setText(
+                "Wait for the current operation to finish.")
+            return False
+        if not paths:
+            self.status_label.setText("Pick a file or a folder "
+                                      "first.")
+            return False
+        self._batch_cancelled = False
+        self._batch_source_note = source_note
+        self._clear_completion_mark()
+        self._set_busy(True)
+        self.step_button.setEnabled(False)
+        self.complete_button.setEnabled(False)
+        self.analyze_window.go_button.setEnabled(False)
+        self.analyze_window.cancel_button.setEnabled(True)
+        self.analyze_window.progress_bar.setValue(0)
+        self.analyze_window.progress_label.setText("Starting...")
+        self.status_label.setText("Analyzing...")
+        thread = QThread()
+        worker = BatchWorker(
+            self.engine, self.client, self.encoder_kind,
+            self.local_model, paths, self._preset(), self._alpha(),
+            self._freeze_mode() == "whole", self.cap_spin.value(),
+            self._frozen_ranks())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_batch_progress)
+        worker.finished.connect(self._on_batch_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # The thread reference clears only once the thread has
+        # actually stopped: dropping it in the finished handler
+        # destroys a still-running QThread.
+        thread.finished.connect(self._clear_batch_thread)
+        self._batch_thread = thread
+        self._batch_worker = worker
+        self.logger.action("batch analysis started: %s"
+                           % (source_note or ", ".join(paths)))
+        thread.start()
+        return True
+
+    def _on_batch_progress(self, done, total, resonance, w_norm,
+                           skipped):
+        bar = self.analyze_window.progress_bar
+        bar.setMaximum(max(1, total))
+        bar.setValue(done)
+        steps = done - skipped
+        self.analyze_window.progress_label.setText(
+            "Line %d of %d (%d steps, %d skipped). Resonance "
+            "%.3f, W norm %.3f."
+            % (done, total, steps, skipped, resonance, w_norm))
+
+    def _clear_batch_thread(self):
+        """Drop the batch thread once it has stopped."""
+        self._batch_thread = None
+        self._batch_worker = None
+
+    def _on_batch_finished(self, result):
+        """A batch run landed, on the UI thread. The heat history
+        and full texts join the session, every view refreshes
+        (including the analysis), and the buttons come back. A
+        cancelled or failed run keeps the steps it completed:
+        they are real steps."""
+        self._heat_history.extend(result["heat"])
+        self._full_texts.update(result["texts"])
+        self._locators.update(result["locators"])
+        self._set_busy(False)
+        self.step_button.setEnabled(True)
+        self.analyze_window.go_button.setEnabled(True)
+        self.analyze_window.cancel_button.setEnabled(False)
+        self._refresh_all()
+        self._refresh_completion_ui()
+        steps = result["steps"]
+        skipped = result["skipped"]
+        unreadable = result["unreadable"]
+        if result["cancelled"]:
+            note = ("Analysis stopped at %d steps." % steps)
+            self._clear_completion_mark()
+        elif result["error"] is not None:
+            note = ("The local model service stopped. The "
+                    "analysis stopped at %d steps." % steps)
+            self._clear_completion_mark()
+        else:
+            note = ("Analysis done: %d steps." % steps)
+            if skipped:
+                note += " %d lines skipped." % skipped
+            self._show_completion_mark()
+        if unreadable:
+            note += (" Could not read: %s."
+                     % ", ".join(unreadable))
+        self.analyze_window.progress_label.setText(note)
+        self.status_label.setText(note)
+        self.logger.action("batch analysis finished: %s" % note)
+
+    def on_cancel_batch(self):
+        """Stop the batch run (U26): the worker stops between
+        lines, and the steps completed so far stay."""
+        if self._batch_worker is None:
+            return
+        self._batch_cancelled = True
+        try:
+            self._batch_worker.cancelled = True
+        except RuntimeError:
+            # The worker is already gone: the run has landed.
+            pass
+        self.analyze_window.cancel_button.setEnabled(False)
+        self.analyze_window.progress_label.setText(
+            "Stopping the analysis...")
+        self.status_label.setText("Stopping the analysis...")
+        self._clear_completion_mark()
+
+    def _refresh_analysis(self):
+        """Recompute the analysis from the current trace and show
+        it in the Analyze window. A loaded session restores the
+        analysis too, because the trace is what a session saves."""
+        summary = summarize_run(self.engine.trace)
+        self.analyze_window.show_results(summary, self.engine.trace)
+
     def export_trace_to(self, path):
         """Write the trace log as JSON. Returns the path."""
         with open(path, "w", encoding="utf-8") as fh:
@@ -1089,6 +2922,8 @@ class MainWindow(QMainWindow):
         return path
 
     def on_export(self):
+        if self._refuse_if_batch_running():
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export trace JSON", "acr-trace.json",
             "JSON files (*.json)")
@@ -1135,6 +2970,26 @@ class MainWindow(QMainWindow):
             },
             "heat_history": [[step_id, list(rows)]
                              for step_id, rows in self._heat_history],
+            # Full input texts, by step id: the trace holds an
+            # 80-character preview, and the curated export needs
+            # the whole line. JSON keys are strings; loading
+            # turns them back into step ids. Optional: files
+            # without it load fine, with previews only.
+            "full_texts": {str(step_id): text
+                           for step_id, text
+                           in self._full_texts.items()},
+            # Step locators, by step id: [file name, line number]
+            # for batch steps, for the STELLA pack manifest.
+            # Optional: files without it load fine, with typed
+            # locators for every step.
+            "locators": {str(step_id): [name, line_no]
+                         for step_id, (name, line_no)
+                         in self._locators.items()},
+            # The source of the last batch run ("fixture.txt",
+            # or "folder data (3 files)"), for the Analyze
+            # exports' labels. Optional: files without it load
+            # with no source note.
+            "source_note": self._batch_source_note,
         }
 
     def save_session_to(self, path):
@@ -1145,6 +3000,8 @@ class MainWindow(QMainWindow):
         return path
 
     def on_save_session(self):
+        if self._refuse_if_batch_running():
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save session", "acr-session.json",
             "JSON files (*.json)")
@@ -1198,7 +3055,7 @@ class MainWindow(QMainWindow):
         encoder_kind = "builtin"
         encoder_model = None
         encoder_dim = DIM
-        models = None
+        infos = None
         if version == SESSION_FORMAT_VERSION:
             encoder = data.get("encoder")
             if not isinstance(encoder, dict):
@@ -1232,13 +3089,14 @@ class MainWindow(QMainWindow):
                         "which is not running - start it and try "
                         "again")
                 try:
-                    models = self.client.list_models()
+                    infos = self.client.list_model_info()
                 except LocalModelError:
                     raise SessionError(
                         "this session needs the local encoder, "
                         "which is not running - start it and try "
                         "again")
-                if encoder_model not in models:
+                if encoder_model not in [info["name"]
+                                         for info in infos]:
                     raise SessionError(
                         "this session needs model %s, which is not "
                         "installed" % encoder_model)
@@ -1288,17 +3146,28 @@ class MainWindow(QMainWindow):
                 "that session file has a bad schedule preset")
         heat = self._checked_heat_history(data.get("heat_history"),
                                           encoder_dim)
+        full_texts = self._checked_full_texts(
+            data.get("full_texts"))
+        locators = self._checked_locators(data.get("locators"))
+        source_note = data.get("source_note", "")
+        if not isinstance(source_note, str):
+            source_note = ""
         # Everything checked: apply it.
         self.encoder_kind = encoder_kind
         self.local_model = encoder_model
         self.engine = spare
+        self._full_texts = full_texts
+        self._locators = locators
+        self._batch_source_note = source_note
         if encoder_kind == "local":
             self.logger.set_setting(
                 "encoder", "local model %s" % encoder_model)
+            # The saved dim is a known dim: the picker shows it.
+            self._known_dims[encoder_model] = encoder_dim
+            self._fill_model_combo(infos)
+            index = self.model_combo.findData(encoder_model)
             self.model_combo.blockSignals(True)
-            self.model_combo.clear()
-            self.model_combo.addItems(models)
-            self.model_combo.setCurrentText(encoder_model)
+            self.model_combo.setCurrentIndex(index)
             self.model_combo.blockSignals(False)
         else:
             self.logger.set_setting("encoder",
@@ -1318,10 +3187,62 @@ class MainWindow(QMainWindow):
         # completion does not carry over.
         self._completion_model = None
         self._completion_text = None
+        # A loaded session's flags are old news: mark them known
+        # so the resonance moment does not fire for them.
+        self._known_flag_steps = {
+            entry["id"] for entry in self.engine.trace
+            if entry["new_layer"]}
         self._set_encoder_ui()
         self.logger.action("session loaded from %s" % path)
         self._refresh_all()
         return path
+
+    def _checked_full_texts(self, value):
+        """Validate the full input texts, or return {} if absent.
+
+        The map is step id (as a JSON string key) to full text.
+        Entries with a bad key or a non-string value are dropped,
+        not fatal: a file with a damaged full-text map still
+        loads, with previews for those steps."""
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise SessionError(
+                "that session file has bad full texts")
+        out = {}
+        for key, text in value.items():
+            try:
+                step_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(text, str):
+                out[step_id] = text
+        return out
+
+    def _checked_locators(self, value):
+        """Validate the step locators, or return {} if absent.
+
+        The map is step id (as a JSON string key) to [file name,
+        line number]. Entries with a bad key or a malformed value
+        are dropped, not fatal: a file with a damaged locator
+        map still loads, with typed locators for those steps."""
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise SessionError(
+                "that session file has bad locators")
+        out = {}
+        for key, locator in value.items():
+            try:
+                step_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(locator, list) and len(locator) == 2
+                    and isinstance(locator[0], str)
+                    and isinstance(locator[1], int)
+                    and not isinstance(locator[1], bool)):
+                out[step_id] = (locator[0], locator[1])
+        return out
 
     def _checked_heat_history(self, value, dim):
         """Validate the heatmap history, or return [] if absent."""
@@ -1346,6 +3267,8 @@ class MainWindow(QMainWindow):
         return out
 
     def on_load_session(self):
+        if self._refuse_if_batch_running():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Load session", "", "JSON files (*.json)")
         if not path:
@@ -1389,6 +3312,8 @@ class MainWindow(QMainWindow):
         return path
 
     def on_export_csv(self):
+        if self._refuse_if_batch_running():
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export trace CSV", "acr-trace.csv",
             "CSV files (*.csv)")
@@ -1456,6 +3381,8 @@ class MainWindow(QMainWindow):
         return path
 
     def on_export_session(self):
+        if self._refuse_if_batch_running():
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export session", "acr-session.txt",
             "Text files (*.txt)")
@@ -1492,13 +3419,20 @@ class MainWindow(QMainWindow):
         self.engine.reset()
         self._heat_history = []
         self._heat_follow = True
+        self._full_texts = {}
+        self._locators = {}
+        self._batch_source_note = ""
         self._completion_model = None
         self._completion_text = None
+        self._known_flag_steps = set()
+        self._clear_completion_mark()
         self.logger.action("session reset")
         self._refresh_all()
         self.status_label.setText("Reset. W_t is back to its start.")
 
     def on_reset(self):
+        if self._refuse_if_batch_running():
+            return
         answer = QMessageBox.question(
             self, "Reset",
             "Clear the session and reset W_t?",
@@ -1513,6 +3447,8 @@ class MainWindow(QMainWindow):
         Reset. Nothing is selected, or the step has aged out of
         the revert history, and the status line says so plainly.
         """
+        if self._refuse_if_batch_running():
+            return
         row = self.trace_table.currentRow()
         if row < 0 or row >= len(self.engine.trace):
             self.status_label.setText(
@@ -1546,6 +3482,7 @@ class MainWindow(QMainWindow):
         self._heat_history.append(
             (entry["id"], _row_change_norms(
                 old_u, old_v, self.engine.u, self.engine.v)))
+        self._full_texts[entry["id"]] = entry["input"]
         self.logger.action(
             "reverted W_t to step %d: W norm %.3f -> %.3f"
             % (step_id, entry["old_norm"], entry["new_norm"]))
@@ -1574,6 +3511,114 @@ class MainWindow(QMainWindow):
         self._refresh_chart()
         self._refresh_heatmap()
         self._refresh_layers()
+        self._refresh_analysis()
+        self._celebrate_new_flags()
+
+    def _celebrate_new_flags(self):
+        """The resonance moment (v0.9, technique 8): when a step
+        flags a new-layer candidate, the chart dot springs in,
+        the resonance readout glows gold, and the trace row
+        highlights. Called after every refresh; each flag is
+        celebrated once. Under reduced motion the state still
+        lands (dot, tint, readout) with no motion."""
+        flagged = {entry["id"] for entry in self.engine.trace
+                   if entry["new_layer"]}
+        new = flagged - self._known_flag_steps
+        self._known_flag_steps |= flagged
+        if not new:
+            return
+        latest = max(new)
+        index = None
+        for i, entry in enumerate(self.engine.trace):
+            if entry["id"] == latest:
+                index = i
+                break
+        self.norm_chart.pulse_flag(index)
+        self.analyze_window.chart.pulse_flag(index)
+        self._glow_resonance()
+        self._highlight_flag_row(latest)
+
+    def _glow_resonance(self):
+        """The resonance readout glows gold briefly when a flag
+        lands. Autonomous motion, so plain easing (OutCubic),
+        300 ms, then the readout rests at its normal color."""
+        if self._glow_anim is not None:
+            self._glow_anim.stop()
+            self._glow_anim = None
+        if reduced_motion():
+            return
+        anim = QVariantAnimation(self)
+        anim.setDuration(300)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(QColor(GLOW_GOLD))
+        anim.setEndValue(QColor(THEME_TEXT))
+        anim.valueChanged.connect(self._on_glow_frame)
+        anim.finished.connect(self._on_glow_done)
+        self._glow_anim = anim
+        anim.start()
+
+    def _on_glow_frame(self, color):
+        self.resonance_label.setStyleSheet(
+            "color: %s;" % color.name())
+
+    def _on_glow_done(self):
+        self.resonance_label.setStyleSheet("")
+        self._glow_anim = None
+
+    def _trace_row_for_step(self, step_id):
+        """The trace table row for one step id, or None. Rows
+        are in trace order, so the row is the trace index."""
+        for i, entry in enumerate(self.engine.trace):
+            if entry["id"] == step_id:
+                return i
+        return None
+
+    def _highlight_flag_row(self, step_id):
+        """The flagged trace row fades from a bright tint to the
+        calm resting tint over 250 ms. The resting tint is the
+        state (applied by _refresh_trace_table); the fade is
+        only the motion."""
+        if self._flag_anim is not None:
+            self._flag_anim.stop()
+            self._flag_anim = None
+        if reduced_motion():
+            return
+        self._flag_anim_step = step_id
+        anim = QVariantAnimation(self)
+        anim.setDuration(250)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(FLAG_TINT_BRIGHT)
+        anim.setEndValue(FLAG_TINT)
+        anim.valueChanged.connect(self._on_flag_frame)
+        anim.finished.connect(self._on_flag_done)
+        self._flag_anim = anim
+        anim.start()
+
+    def _on_flag_frame(self, color):
+        # Re-look the row up every frame: a refresh rebuilds
+        # the table's items, so a stored item would go stale.
+        row = self._trace_row_for_step(self._flag_anim_step)
+        if row is None or row >= self.trace_table.rowCount():
+            return
+        for col in range(self.trace_table.columnCount()):
+            item = self.trace_table.item(row, col)
+            if item is not None:
+                item.setBackground(color)
+
+    def _on_flag_done(self):
+        self._flag_anim = None
+        self._flag_anim_step = None
+
+    def _show_completion_mark(self):
+        """The completion moment (v0.9, technique 8): a
+        checkmark draws itself next to the status text when a
+        run finishes or a pack is written."""
+        self.completion_mark.draw()
+
+    def _clear_completion_mark(self):
+        """Hide the completion mark: the next run or step starts
+        fresh."""
+        self.completion_mark.clear()
 
     def _refresh_trace_table(self):
         trace = self.engine.trace
@@ -1592,8 +3637,12 @@ class MainWindow(QMainWindow):
                 "yes" if entry.get("capped") else "",
             ]
             for col, value in enumerate(values):
-                self.trace_table.setItem(
-                    row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if entry["new_layer"]:
+                    # The flagged row rests at the calm tint
+                    # (the chart's red-dot meaning, as a row).
+                    item.setBackground(FLAG_TINT)
+                self.trace_table.setItem(row, col, item)
         if trace:
             self.trace_table.scrollToBottom()
 
@@ -1784,9 +3833,53 @@ class MainWindow(QMainWindow):
         self.layer_detail.setPlainText("\n".join(lines))
 
 
+def _instance_name():
+    """Single-instance name: ACR_INSTANCE_NAME lets tests run a
+    private instance without touching a real one."""
+    return os.environ.get(INSTANCE_ENV, INSTANCE_DEFAULT)
+
+
 def main(argv=None):
     app = QApplication(sys.argv if argv is None else argv)
+    # v0.9 identity (U15): the dark look, on the whole app.
+    apply_theme(app)
+    # v0.9 single instance (U27): re-clicking the icon focuses the
+    # running app, never starts a second copy. QLockFile plus a
+    # QLocalServer: the second launch asks the first to raise,
+    # then exits 0. tryLock takes its timeout argument: the bare
+    # call raises TypeError in this PySide6 build. removeServer
+    # first, or a crashed run leaves its socket behind and the
+    # next listen fails.
+    name = _instance_name()
+    lock_path = os.path.join(tempfile.gettempdir(),
+                             "acr-%s.lock" % name)
+    lock = QLockFile(lock_path)
+    lock.setStaleLockTime(1000)
+    if not lock.tryLock(0):
+        socket = QLocalSocket()
+        socket.connectToServer("ACR-" + name)
+        if socket.waitForConnected(2000):
+            socket.write(b"raise")
+            socket.waitForBytesWritten(2000)
+        socket.disconnectFromServer()
+        return 0
+    QLocalServer.removeServer("ACR-" + name)
+    server = QLocalServer()
+    server.listen("ACR-" + name)
     window = MainWindow()
+
+    def _on_raise_request():
+        sock = server.nextPendingConnection()
+        if sock is not None:
+            sock.waitForReadyRead(1000)
+            sock.readAll()
+            sock.disconnectFromServer()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        window.logger.action("single-instance raise requested")
+
+    server.newConnection.connect(_on_raise_request)
     window.show()
     return app.exec()
 

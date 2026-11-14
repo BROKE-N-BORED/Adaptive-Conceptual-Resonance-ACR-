@@ -74,6 +74,74 @@ def parse_tags_payload(payload):
     return sorted(names)
 
 
+def parse_tags_info(payload):
+    """Parse an /api/tags JSON payload into per-model info dicts.
+
+    Each entry holds what the service actually reports, nothing
+    invented: "name", "size" (bytes on disk, or None when the
+    service does not say), and "parameter_size" (e.g. "2.0B", or
+    None). Sorted by name. Missing or odd fields become None,
+    never a crash: older or minimal services report names only.
+    """
+    infos = []
+    for entry in payload.get("models", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        size = entry.get("size")
+        if not isinstance(size, int) or isinstance(size, bool):
+            size = None
+        details = entry.get("details") or {}
+        parameter_size = details.get("parameter_size")
+        if not isinstance(parameter_size, str):
+            parameter_size = None
+        infos.append({"name": name, "size": size,
+                      "parameter_size": parameter_size})
+    infos.sort(key=lambda info: info["name"])
+    return infos
+
+
+def _format_bytes(size):
+    """Bytes as a short human size: 274 MB, 1.3 GB."""
+    if size >= 1024 ** 3:
+        return "%.1f GB" % (size / float(1024 ** 3))
+    if size >= 1024 ** 2:
+        return "%d MB" % (size // (1024 ** 2))
+    return "%d KB" % (size // 1024)
+
+
+def model_display_text(info, total_ram_bytes, known_dim=None):
+    """One line for the model picker (v0.9, U39): what the model
+    does and whether it fits this PC.
+
+    Kind comes from the name: a model with "embed" in its name is
+    an embedding model, anything else is a text model. Size and
+    parameter count come from the service's own list. "Fits this
+    PC" compares the model's size on disk against this machine's
+    RAM: a model loads roughly its own size into memory, so a
+    model bigger than RAM cannot load here. The embedding dim is
+    shown only once it is known, from a real embedding (never
+    guessed). A service that reports names only still gets a
+    useful line: name and kind, no invented numbers.
+    """
+    name = info["name"]
+    kind = ("embedding model" if "embed" in name.lower()
+            else "text model")
+    parts = [kind]
+    if info.get("parameter_size"):
+        parts.append("%s parameters" % info["parameter_size"])
+    if info.get("size"):
+        parts.append(_format_bytes(info["size"]))
+    if info.get("size") and total_ram_bytes:
+        if info["size"] <= total_ram_bytes:
+            parts.append("fits this PC")
+        else:
+            parts.append("too big for this PC")
+    if known_dim is not None:
+        parts.append("dim %d" % known_dim)
+    return "%s (%s)" % (name, ", ".join(parts))
+
+
 def pick_default_model(models):
     """The model to use first: the embedding model when installed,
     else the first available model, else None. "First" means first
@@ -158,6 +226,19 @@ class LocalModelClient:
             req = urllib.request.Request(self.base_url + "/api/tags")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return parse_tags_payload(
+                    json.loads(resp.read().decode("utf-8")))
+        except Exception:
+            raise LocalModelError(MSG_SERVICE_DOWN)
+
+    def list_model_info(self, timeout=5):
+        """Return per-model info dicts (see parse_tags_info), or
+        raise LocalModelError. One /api/tags call: the picker
+        shows what each model does and whether it fits this PC
+        from this, never from a second guess."""
+        try:
+            req = urllib.request.Request(self.base_url + "/api/tags")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return parse_tags_info(
                     json.loads(resp.read().decode("utf-8")))
         except Exception:
             raise LocalModelError(MSG_SERVICE_DOWN)

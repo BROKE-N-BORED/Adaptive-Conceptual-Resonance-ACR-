@@ -21,6 +21,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -590,63 +591,111 @@ class LocalWindowCase(FakeServerCase):
         self.tmp.cleanup()
         super().tearDown()
 
+    def _wait_idle(self, timeout=25.0):
+        # v0.9: local steps and completions run in a worker
+        # thread. Built-in steps are synchronous, so this returns
+        # at once for them.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if (self.window._local_thread is None
+                    and self.window._batch_thread is None):
+                return True
+            QTest.qWait(50)
+        return False
+
     def _step_text(self, text):
         self.window.input_edit.setPlainText(text)
         QTest.mouseClick(self.window.step_button, Qt.LeftButton)
+        self.assertTrue(self._wait_idle(), "local step did not land")
 
     def _step_theme(self, count):
         for i in range(count):
             self._step_text(THEME[i % 4])
 
     def _switch_local(self):
+        # v0.9: picking "Local model" only OFFERS the models. The
+        # encoder stays built-in until a model is picked (U39+U6).
         self.window.encoder_combo.setCurrentIndex(1)
+
+    def _pick_model(self, name):
+        combo = self.window.model_combo
+        index = combo.findData(name)
+        self.assertNotEqual(index, -1, "model %r not listed" % name)
+        combo.setCurrentIndex(index)
+
+    def _pick_completion(self, name):
+        combo = self.window.completion_combo
+        index = combo.findData(name)
+        self.assertNotEqual(index, -1,
+                            "model %r not listed" % name)
+        combo.setCurrentIndex(index)
+
+    def _go_local(self, name="nomic-embed-text:latest"):
+        self._switch_local()
+        self._pick_model(name)
+
+    def _complete(self):
+        QTest.mouseClick(self.window.complete_button,
+                         Qt.LeftButton)
+        self.assertTrue(self._wait_idle(),
+                        "completion did not land")
 
     def _synthesis(self):
         return self.window.synthesis_text.toPlainText()
 
 
 class CompletionPickerTests(LocalWindowCase):
-    def test_picker_defaults_away_from_encoder(self):
-        self._switch_local()
+    def test_picker_lists_all_models_unselected(self):
+        # v0.9: nothing is picked for you (U6). The picker lists
+        # every installed model; the button enables once a model
+        # is picked.
+        self._go_local()
         self.assertEqual(self.window.local_model,
                          "nomic-embed-text:latest")
         combo = self.window.completion_combo
-        items = [combo.itemText(i) for i in range(combo.count())]
+        items = [combo.itemData(i) for i in range(combo.count())]
         self.assertEqual(items, ["nomic-embed-text:latest",
                                  "other:1b"])
-        self.assertEqual(combo.currentText(), "other:1b")
+        self.assertEqual(combo.currentIndex(), -1)
         self.assertTrue(combo.isEnabled())
+        self.assertFalse(self.window.complete_button.isEnabled())
+        self.assertIn("Pick a model",
+                      self.window.completion_note.text())
+        self._pick_completion("other:1b")
         self.assertTrue(self.window.complete_button.isEnabled())
-        self.assertEqual(self.window.completion_note.text(), "")
 
     def test_picker_refreshes_when_encoder_model_changes(self):
-        self._switch_local()
-        self.window.model_combo.setCurrentText("other:1b")
+        self._go_local()
+        self._pick_completion("other:1b")
+        self._pick_model("other:1b")
         self.assertEqual(self.window.local_model, "other:1b")
         combo = self.window.completion_combo
-        items = [combo.itemText(i) for i in range(combo.count())]
+        items = [combo.itemData(i) for i in range(combo.count())]
         self.assertEqual(items, ["nomic-embed-text:latest",
                                  "other:1b"])
         # The standing pick is kept: the picker is independent of
         # the encoder choice.
-        self.assertEqual(combo.currentText(), "other:1b")
+        self.assertEqual(combo.currentData(), "other:1b")
         self.assertTrue(self.window.complete_button.isEnabled())
 
     def test_only_encoder_installed_still_completes(self):
         FakeLocalHandler.models = ["nomic-embed-text:latest"]
-        self._switch_local()
+        self._go_local()
         self.assertEqual(self.window.encoder_kind, "local")
         combo = self.window.completion_combo
-        items = [combo.itemText(i) for i in range(combo.count())]
+        items = [combo.itemData(i) for i in range(combo.count())]
         self.assertEqual(items, ["nomic-embed-text:latest"])
-        self.assertEqual(combo.currentText(),
-                         "nomic-embed-text:latest")
+        self.assertEqual(combo.currentIndex(), -1)
         self.assertTrue(combo.isEnabled())
+        self.assertFalse(self.window.complete_button.isEnabled())
+        self._pick_completion("nomic-embed-text:latest")
         self.assertTrue(self.window.complete_button.isEnabled())
-        self.assertEqual(self.window.completion_note.text(), "")
+        self.assertIn("Pick a model",
+                      self.window.completion_note.text())
 
     def test_back_to_builtin_disables_completion(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self.assertTrue(self.window.complete_button.isEnabled())
         self.window.encoder_combo.setCurrentIndex(0)
         self.assertFalse(self.window.complete_button.isEnabled())
@@ -658,10 +707,10 @@ class CompletionPickerTests(LocalWindowCase):
 
 class CompletionTests(LocalWindowCase):
     def test_complete_shows_local_model_words(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         text = self._synthesis()
         self.assertIn("Local model (other:1b) said:", text)
         self.assertIn("Canned completion from the fake service.",
@@ -676,19 +725,19 @@ class CompletionTests(LocalWindowCase):
         # The completion sits at the bottom of the panel: after
         # completing, the panel is scrolled to it, not left on
         # the neighbours at the top.
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         bar = self.window.synthesis_text.verticalScrollBar()
         self.assertGreater(bar.maximum(), 0)
         self.assertEqual(bar.value(), bar.maximum())
 
     def test_complete_prompt_has_resonant_context(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         self.assertEqual(len(FakeLocalHandler.generate_prompts), 1)
         prompt = FakeLocalHandler.generate_prompts[0]
         self.assertIn("most resonant inputs", prompt)
@@ -697,7 +746,8 @@ class CompletionTests(LocalWindowCase):
                             for sentence in THEME))
 
     def test_complete_needs_resonant_entries(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(2)
         QTest.mouseClick(self.window.complete_button,
                          Qt.LeftButton)
@@ -708,12 +758,12 @@ class CompletionTests(LocalWindowCase):
                          self._synthesis())
 
     def test_complete_service_down_plain_message(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
         self.server.shutdown()
         self.server.server_close()
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         self.assertIn("not running",
                       self.window.status_label.text())
         # A failed completion never falls back: the local session
@@ -723,10 +773,10 @@ class CompletionTests(LocalWindowCase):
         self.assertNotIn("Local model", self._synthesis())
 
     def test_completion_clears_on_reset(self):
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         self.assertIn("Canned completion", self._synthesis())
         self.window.do_reset()
         self.assertNotIn("Canned completion", self._synthesis())
@@ -735,10 +785,10 @@ class CompletionTests(LocalWindowCase):
         # The completion is the local model's words about the
         # session; later steps refresh the neighbours but do not
         # wipe it. A reset or a load does.
-        self._switch_local()
+        self._go_local()
+        self._pick_completion("other:1b")
         self._step_theme(16)
-        QTest.mouseClick(self.window.complete_button,
-                         Qt.LeftButton)
+        self._complete()
         self._step_text("quantum entanglement links particles")
         self.assertIn("Canned completion", self._synthesis())
 

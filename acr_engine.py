@@ -109,7 +109,17 @@ SESSION_FORMAT_VERSION = 2
 # snapshot is two dim x rank factor matrices; at dim 768 that is
 # about 100 KB per step in plain floats, so 200 steps is a
 # reasonable bound on an 8 GB machine.
+# v0.9: the bound now adapts to the machine's RAM (U35): 200 stays
+# the value on an 8 GB machine, fewer on smaller machines, more on
+# bigger ones. See default_snapshot_limit. The limit has a
+# concrete reason (U7): snapshots are real memory, and an
+# unbounded history would grow with every step until the machine
+# ran out of room.
 SNAPSHOT_LIMIT = 200
+# Bounds for the RAM-adapted snapshot limit: never fewer than 50
+# steps of revert history, never more than 1000.
+SNAPSHOT_LIMIT_MIN = 50
+SNAPSHOT_LIMIT_MAX = 1000
 # v0.7: learning-rate schedule presets. Steady is the current
 # behaviour (constant base alpha). Fast-adapt starts at twice the
 # base and decays toward it over the first steps. Gentle runs at
@@ -132,6 +142,36 @@ class SessionError(ValueError):
     """
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def mem_total_bytes(meminfo_path="/proc/meminfo"):
+    """Total RAM in bytes, from /proc/meminfo. None when it cannot
+    be read (not Linux, or an unreadable file): callers fall back
+    to their fixed defaults, never crash."""
+    try:
+        with open(meminfo_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def default_snapshot_limit(meminfo_path="/proc/meminfo"):
+    """How many revert snapshots to keep on this machine (v0.9,
+    U35: the backend configures itself). The limit scales with
+    RAM: 200 on an 8 GB machine, half that on 4 GB, double on
+    16 GB, clamped to 50..1000. A machine whose RAM cannot be
+    read keeps 200."""
+    total = mem_total_bytes(meminfo_path)
+    if total is None:
+        return SNAPSHOT_LIMIT
+    gib = total / float(1024 ** 3)
+    limit = int(SNAPSHOT_LIMIT * gib / 8.0)
+    return max(SNAPSHOT_LIMIT_MIN,
+               min(SNAPSHOT_LIMIT_MAX, limit))
 
 
 # ---------------------------------------------------------------- vectors
@@ -412,9 +452,14 @@ class Engine:
     cannot run at another.
     """
 
-    def __init__(self, dim=DIM, snapshot_limit=SNAPSHOT_LIMIT):
+    def __init__(self, dim=DIM, snapshot_limit=None):
         self.dim = dim
-        self.snapshot_limit = snapshot_limit
+        # v0.9: None means "fit this machine" (U35): the limit
+        # scales with RAM, 200 on an 8 GB machine. An explicit
+        # limit still wins, so tests and callers can pin one.
+        self.snapshot_limit = (default_snapshot_limit()
+                               if snapshot_limit is None
+                               else snapshot_limit)
         self.reset()
 
     def reset(self):

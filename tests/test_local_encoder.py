@@ -404,9 +404,21 @@ class WindowCase(FakeServerCase):
         self.tmp.cleanup()
         super().tearDown()
 
+    def _wait_idle(self, timeout=25.0):
+        # v0.9: local steps run in a worker thread. Built-in steps
+        # are synchronous, so this returns at once for them.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if (self.window._local_thread is None
+                    and self.window._batch_thread is None):
+                return True
+            QTest.qWait(50)
+        return False
+
     def _step_text(self, text):
         self.window.input_edit.setPlainText(text)
         QTest.mouseClick(self.window.step_button, Qt.LeftButton)
+        self.assertTrue(self._wait_idle(), "local step did not land")
 
     def _step_theme(self, count):
         theme = ["quantum entanglement links particles",
@@ -417,7 +429,19 @@ class WindowCase(FakeServerCase):
             self._step_text(theme[i % 4])
 
     def _switch_local(self):
+        # v0.9: picking "Local model" only OFFERS the models. The
+        # encoder stays built-in until a model is picked (U39+U6).
         self.window.encoder_combo.setCurrentIndex(1)
+
+    def _pick_model(self, name):
+        combo = self.window.model_combo
+        index = combo.findData(name)
+        self.assertNotEqual(index, -1, "model %r not listed" % name)
+        combo.setCurrentIndex(index)
+
+    def _go_local(self, name="nomic-embed-text:latest"):
+        self._switch_local()
+        self._pick_model(name)
 
     def _path(self, name):
         return os.path.join(self.tmp.name, name)
@@ -439,15 +463,32 @@ class EncoderSwitchTests(WindowCase):
             "Switching encoders starts a fresh W_t" in text
             for text in labels))
 
-    def test_switch_to_local(self):
+    def test_switch_to_local_offers_models_unselected(self):
+        # v0.9: nothing is picked for you (U6). Switching offers the
+        # models; the encoder stays built-in until a model is picked.
         self._switch_local()
+        self.assertEqual(self.window.encoder_kind, "builtin")
+        self.assertTrue(self.window.model_combo.isEnabled())
+        self.assertEqual(self.window.model_combo.currentIndex(), -1)
+        self.assertEqual(self.window.model_combo.count(), 2)
+        self.assertEqual(
+            self.window.model_combo.itemData(0),
+            "nomic-embed-text:latest")
+        self.assertEqual(self.window.model_combo.itemData(1),
+                         "other:1b")
+        self.assertIn("Pick a model", self.window.status_label.text())
+        self.assertEqual(self.window.engine.dim, DIM)
+
+    def test_pick_model_activates_local(self):
+        self._go_local()
         self.assertEqual(self.window.encoder_kind, "local")
         self.assertEqual(self.window.local_model,
                          "nomic-embed-text:latest")
         self.assertEqual(self.window.engine.dim, self.DIM)
         self.assertTrue(self.window.model_combo.isEnabled())
         self.assertEqual(
-            self.window.model_combo.currentText(),
+            self.window.model_combo.itemData(
+                self.window.model_combo.currentIndex()),
             "nomic-embed-text:latest")
         self.assertIn("Local encoder", self.window.status_label.text())
         self.assertIn("fresh", self.window.status_label.text())
@@ -455,9 +496,13 @@ class EncoderSwitchTests(WindowCase):
                       self.window.encoder_label.text())
         self.assertIn("dim 16", self.window.encoder_label.text())
 
-    def test_switch_to_local_picks_first_without_embed_model(self):
+    def test_pick_first_without_embed_model(self):
+        # v0.9: no auto-pick at all, so the old "picks first" rule
+        # is gone. Both models are listed; picking one activates it.
         FakeLocalHandler.models = ["zzz:1b", "aaa:1b"]
         self._switch_local()
+        self.assertEqual(self.window.model_combo.count(), 2)
+        self._pick_model("aaa:1b")
         self.assertEqual(self.window.local_model, "aaa:1b")
 
     def test_switch_to_local_no_models(self):
@@ -484,7 +529,11 @@ class EncoderSwitchTests(WindowCase):
     def test_switch_resets_w_and_clears(self):
         self._step_theme(3)
         self.assertEqual(self.window.trace_table.rowCount(), 3)
+        # Peeking at the models does NOT reset W_t; picking one does.
         self._switch_local()
+        self.assertEqual(self.window.step_label.text(), "Step: 3")
+        self.assertEqual(self.window.trace_table.rowCount(), 3)
+        self._pick_model("nomic-embed-text:latest")
         self.assertEqual(self.window.step_label.text(), "Step: 0")
         self.assertEqual(self.window.trace_table.rowCount(), 0)
         self.assertEqual(self.window.buffer_list.count(), 0)
@@ -499,16 +548,16 @@ class EncoderSwitchTests(WindowCase):
         self.assertEqual(self.window.trace_table.rowCount(), 0)
 
     def test_model_change_resets_w(self):
-        self._switch_local()
+        self._go_local()
         self._step_theme(2)
         self.assertEqual(self.window.step_label.text(), "Step: 2")
-        self.window.model_combo.setCurrentText("other:1b")
+        self._pick_model("other:1b")
         self.assertEqual(self.window.local_model, "other:1b")
         self.assertEqual(self.window.step_label.text(), "Step: 0")
         self.assertEqual(self.window.trace_table.rowCount(), 0)
 
     def test_step_with_local(self):
-        self._switch_local()
+        self._go_local()
         self._step_theme(3)
         self.assertEqual(self.window.step_label.text(), "Step: 3")
         self.assertEqual(self.window.trace_table.rowCount(), 3)
@@ -516,7 +565,7 @@ class EncoderSwitchTests(WindowCase):
         self.assertEqual(len(self.window.norm_chart.values), 3)
 
     def test_mid_session_failure_falls_back(self):
-        self._switch_local()
+        self._go_local()
         self._step_text("local step one")
         self.assertEqual(self.window.step_label.text(), "Step: 1")
         self.server.shutdown()
@@ -636,7 +685,7 @@ class SessionVersionTests(WindowCase):
         self.assertEqual(self.window.trace_table.rowCount(), 3)
 
     def test_v2_local_round_trip(self):
-        self._switch_local()
+        self._go_local()
         self._step_theme(3)
         before = (self.window.step_label.text(),
                   self.window.norm_label.text(),
@@ -664,7 +713,7 @@ class SessionVersionTests(WindowCase):
         self.assertEqual(len(self.window.heatmap.values), self.DIM)
 
     def test_v2_local_refuses_when_service_down(self):
-        self._switch_local()
+        self._go_local()
         self._step_theme(2)
         path = self._path("local.json")
         self.window.save_session_to(path)
@@ -682,7 +731,7 @@ class SessionVersionTests(WindowCase):
         self.assertEqual(self.window.encoder_kind, "builtin")
 
     def test_v2_local_refuses_when_model_missing(self):
-        self._switch_local()
+        self._go_local()
         self._step_theme(2)
         path = self._path("local.json")
         self.window.save_session_to(path)
@@ -716,7 +765,7 @@ class SessionVersionTests(WindowCase):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
         self.assertIn("Encoder: built-in (dim 64)", text)
-        self._switch_local()
+        self._go_local()
         self._step_theme(2)
         self.window.export_session_to(path)
         with open(path, encoding="utf-8") as fh:
