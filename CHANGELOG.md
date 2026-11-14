@@ -2,6 +2,63 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.10 (2026-11-13) - Audit redesign
+
+- Every local-model call runs in a worker thread now, not just
+  embeddings and completions: the model list, the activation
+  probe, and starting the service. The window stays responsive
+  through all three, with the busy light lit, a status line
+  saying what is happening, and Cancel offered. Starting the
+  service can be abandoned mid-wait.
+- Keyboard navigation: a focused control shows a gold ring, Tab
+  moves in visual order, the input has the focus at launch, and
+  every menu action has a shortcut (Ctrl+S save, Ctrl+O load,
+  Ctrl+Q quit, Ctrl+1 to Ctrl+4 for the windows, F1 for How to
+  Use; the full list is in the How to Use guide).
+- Entry text is readable everywhere: hover over a finding in the
+  Analyze tiles to see the whole entry, double-click one to read
+  it in full, and click a trace row to see its full input below
+  the table.
+- Try an example: the empty main window offers four sentences on
+  one theme, stepped as real steps, so a first run teaches by
+  playing. It goes away once you step anything.
+- Analyze runs stream live: the chart and the headline tile
+  update as steps land, not only at the end.
+- The chart scrubs: hover to see a step's values, click or drag
+  to jump the heatmap and the trace selection to that step.
+- When a layer is flagged, a gold dot stays next to the resonance
+  readout until the next flag or a reset, naming the flagged step
+  on hover.
+- The Controls window shows the live alpha next to the slider.
+- Accessibility in the View menu: a Reduced motion toggle and a
+  Big text preset, one tap each, saved between runs. The chart
+  legend's red is lightened so its contrast passes the bar.
+- In built-in mode the main window collapses to the encoder
+  picker, the Start service button, and one line ("Built-in
+  encoder, dim 64."). Picking Local model brings the model
+  picker, notes, and completion row back.
+- Pack export previews before writing: names, row counts per
+  kind, and the first rows, then Write these packs saves them.
+  The revert confirm shows the W norm the revert will land on.
+- The trace table follows the newest row only when you are
+  already at the bottom; scrolled up, your place stays put.
+- Long runs are cheaper: batch progress updates the bar at most
+  every 100 ms, and the heat history is bounded (the oldest half
+  is sampled, and a step whose data was sampled out says so).
+  Windows open with an opacity fade instead of a geometry
+  animation.
+- The View menu shows which windows are open, and opens or
+  closes them.
+- Copy and empty-state polish: the Analyze chart's empty message
+  fits Analyze, the hero and progress labels say which steps
+  they count, a loaded session's source shows in the Analyze
+  window, the empty Trace window guides instead of showing blank
+  boxes, Revert is disabled with no steps, How to Use opens with
+  no heading highlighted, and the W norm reads "-" at step 0
+  like Resonance does.
+- No change to the update rule: the 16-theme numbers are still
+  exact.
+
 ## v0.9 (2026-11-13) - UI rebuild and Analyze a file
 
 - Analyze a file: point the loop at a text file or a folder and see

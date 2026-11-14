@@ -1,6 +1,6 @@
 # ACR: How to Use and What to Use It For
 
-ACR v0.9. Plain words, everything the app does.
+ACR v0.10. Plain words, everything the app does.
 
 ## What ACR is for
 
@@ -37,8 +37,18 @@ Open it from the desktop icon, or type `acr` in a terminal.
 3. Type something on a different topic and watch Resonance fall. That drop is
    the forgetting problem.
 
+New here? Try an example, on the empty main window, steps four sentences
+about quantum entanglement through the loop for you, as real steps. It goes
+away once you step anything yourself.
+
 The menu bar at the top holds everything: File for sessions and exports,
-View for the windows, Help for this guide.
+View for the windows, Help for this guide. Keyboard: Tab moves in visual
+order, the input has the focus at launch, and the shortcuts are: Ctrl+S
+save session, Ctrl+O load session, Ctrl+J export trace JSON, Ctrl+Shift+J
+export trace CSV, Ctrl+E export session, Ctrl+D generate debug report,
+Ctrl+R reset, Ctrl+Q quit, Ctrl+1 Controls, Ctrl+2 Trace log, Ctrl+3
+Resonance views, Ctrl+4 Analyze a file, Ctrl+M reduced motion, Ctrl+T big
+text, F1 How to Use.
 
 ## Reading the numbers
 
@@ -58,18 +68,26 @@ Everything lives in its own window, opened from the View menu:
 
 - **Controls:** the learning rate slider, Freeze, Schedule, and the stability
   cap with the top singular value. Each control explains itself underneath.
-- **Trace log:** every step, every weight change, 10 columns. Click a row and
-  you can revert the weights back to that step.
+  The live alpha sits next to the slider.
+- **Trace log:** every step, every weight change, 10 columns. Click a row to
+  see its full input below the table, and to revert the weights back to that
+  step. The table follows the newest row only while you are already at the
+  bottom; scrolled up, your place stays put.
 - **Resonance views:** the chart over time (red dots mark new-layer
   candidates, first one usually lands at step 15 on a theme run), the heatmap
   showing what changed each step, and layer discovery, where you click a
-  candidate to see the trace entries around it. When a new layer is flagged,
-  the chart dot lands with a spring settle, the resonance readout glows gold,
-  and the trace row highlights, so you see the moment it happened.
+  candidate to see the trace entries around it. Hover over the chart to see a
+  step's values; click a point, or drag across it, to jump the heatmap and
+  the trace selection to that step. When a new layer is flagged, the chart
+  dot lands with a spring settle, the resonance readout glows gold, and the
+  trace row highlights, so you see the moment it happened, and a gold dot
+  stays next to the resonance readout until the next flag or a reset.
 - **Analyze a file:** see below.
 - **How to Use:** this guide.
 
-Every window remembers its size and position between runs.
+Every window remembers its size and position between runs. The View menu
+shows which windows are open, and opens or closes them. Reduced motion and
+Big text live in the View menu too: one tap each, saved between runs.
 
 ## Analyze a file
 
@@ -81,7 +99,9 @@ text file in it, in name order. Plain text, .md, and .jsonl all work; a
 
 While it runs, the progress bar shows how far along it is, the busy light
 is lit, and Cancel stops it. The steps it finished stay: they are real
-steps, in the trace log like typed ones.
+steps, in the trace log like typed ones. The chart and the headline tile
+update as steps land, so a long run shows its findings while it is still
+going.
 
 When it finishes, the results land as tiles. The big tile is the headline:
 how many themes were found, and the strongest one. Then:
@@ -94,7 +114,9 @@ how many themes were found, and the strongest one. Then:
 - **Shifts:** the steps where resonance drops sharply and stays low. Topic
   boundaries.
 
-A checkmark draws itself next to the status line when the run finishes.
+Hover over a finding to see the whole entry; double-click one to read it in
+full. A checkmark draws itself next to the status line when the run
+finishes.
 
 Export curated file saves the core entries as plain text, one per line.
 Export curated .jsonl saves them as one {"text": ...} object per line, ready
@@ -106,7 +128,9 @@ outliers, shifts) as a readable text file.
 Export STELLA data pack turns the analysis into training data packs for
 STELLA. The packs do not teach a model the raw text. They teach it what ACR
 found: the themes, the relationships, the analogies, and the resonance
-judgments, all measured from this run.
+judgments, all measured from this run. Export first shows a preview of the
+packs it is about to write: names, row counts per kind, and the first rows.
+Write these packs saves them.
 
 Each pack is a folder with a .jsonl file of training rows, a README, and a
 manifest, the same pack shape Data Pack Builder writes. There is one pack per
@@ -144,7 +168,8 @@ model as context and shows what it says.
 
 - Save session and Load session keep the whole thing in one file, from the
   File menu. Export trace CSV and Export session give you readable files.
-  Reset asks first.
+  Reset asks first. Revert asks first too, and shows the W norm the revert
+  will land on.
 - **Freeze:** Off, Whole W_t, or Rank directions (freeze individual
   directions 1 to 8 while the rest keep learning).
 - **Schedule:** Steady, Fast-adapt (learns fast early, settles down), or

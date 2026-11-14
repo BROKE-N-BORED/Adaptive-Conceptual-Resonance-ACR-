@@ -615,13 +615,40 @@ class LocalWindowCase(FakeServerCase):
     def _switch_local(self):
         # v0.9: picking "Local model" only OFFERS the models. The
         # encoder stays built-in until a model is picked (U39+U6).
+        # v0.10: the offer runs on a worker thread. Wait for it
+        # to land: either the list is filled or the picker
+        # bounced back to Built-in. Either way, wait for the
+        # thread to clear too: the thread reference outlives
+        # the fill by a pump cycle, and picking a model in that
+        # gap is refused.
         self.window.encoder_combo.setCurrentIndex(1)
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if self.window._local_thread is None and (
+                    self.window.model_combo.count() > 0
+                    or self.window.encoder_combo.currentIndex()
+                    == 0):
+                return
+            QTest.qWait(50)
+        raise AssertionError("model offer did not land")
 
     def _pick_model(self, name):
         combo = self.window.model_combo
         index = combo.findData(name)
         self.assertNotEqual(index, -1, "model %r not listed" % name)
         combo.setCurrentIndex(index)
+        # v0.10: activation runs on a worker thread. Wait for
+        # the model to become the encoder, and for the thread
+        # to clear: the encoder flips in the finished handler,
+        # before the thread reference clears, and a step or a
+        # switch in that gap is refused.
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if (self.window.local_model == name
+                    and self.window._local_thread is None):
+                return
+            QTest.qWait(50)
+        raise AssertionError("model %r did not activate" % name)
 
     def _pick_completion(self, name):
         combo = self.window.completion_combo

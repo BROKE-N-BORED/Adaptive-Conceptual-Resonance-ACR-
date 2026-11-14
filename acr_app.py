@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.9.
+"""ACR - Adaptive Contextual Resonance, v0.10.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -49,6 +49,19 @@ model picker that starts unselected, plain-words explanations
 under every field, a restrained identity pass, and a snapshot
 limit that adapts to the machine's RAM. The engine is untouched:
 the 16-theme numbers are still exact.
+
+v0.10 is the audit redesign: the remaining local-model calls move
+off the UI thread, keyboard navigation lands (visible focus,
+visual tab order, shortcuts), entry text is readable everywhere,
+a first run teaches by playing, results stream live during a
+run, the chart scrubs, the flag marker persists, the Controls
+window shows the live alpha, the menu carries accessibility
+toggles, the main window discloses progressively, pack export
+previews before writing, the trace follows only at the bottom,
+batch progress is throttled and the heat history bounded, the
+View menu shows which windows are open, and the empty states
+and copy are polished. The engine is untouched: the 16-theme
+numbers are still exact.
 """
 
 import csv
@@ -68,8 +81,9 @@ from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon,
                            QPainter, QPen, QTextCursor)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QGraphicsEffect, QGridLayout, QHBoxLayout, QHeaderView,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QFileDialog, QFrame, QGraphicsEffect, QGraphicsOpacityEffect,
+    QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
     QTableWidget, QTableWidgetItem, QTextBrowser, QTextEdit,
@@ -80,7 +94,8 @@ from acr_engine import (BUFFER_SIZE, DIM, RANK, SCHEDULES,
                         SCHEDULE_STEADY, Engine,
                         SESSION_FORMAT_VERSION, SessionError,
                         mem_total_bytes, schedule_alpha)
-from acr_packs import default_packs_dir, export_stella_packs
+from acr_packs import (build_pack_rows, default_packs_dir,
+                       export_stella_packs)
 from debug_log import DebugLogger, check_ollama
 from local_encoder import (
     MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
@@ -88,7 +103,7 @@ from local_encoder import (
     model_display_text)
 
 APP_NAME = "acr"
-VERSION = "0.9"
+VERSION = "0.10"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 # v0.9 identity (U15): ACR's own dark look, drawn from the icon
@@ -122,6 +137,16 @@ QPushButton:hover { background: #3d3d49; }
 QPushButton:pressed { background: #2a2a32; }
 QPushButton:disabled { color: #77777f; background: #26262e;
     border-color: #33333e; }
+/* v0.10 keyboard navigation (R2): a focused control must LOOK
+   focused. The gold ring is the same gold as the resonance
+   accent, so focus reads as part of the identity. */
+QPushButton:focus { border: 2px solid #ffd75e; }
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus,
+QListWidget:focus, QTableWidget:focus, QTextBrowser:focus {
+    border: 2px solid #ffd75e; }
+QCheckBox:focus { border: 1px solid #ffd75e; border-radius: 4px; }
+QSlider:focus::groove:horizontal { background: #4a4a56; }
 QPushButton#primaryButton { background: #c9a227; color: #1d1d23;
     font-weight: bold; border: 1px solid #c9a227; }
 QPushButton#primaryButton:hover { background: #d8b73a; }
@@ -194,6 +219,46 @@ def reduced_motion():
     return QSettings("BrokeNBored", "ACR").value(
         "reduced_motion", False, type=bool)
 
+
+BIG_TEXT_STEP = 2  # points the big-text preset adds (v0.10, R9)
+
+
+def big_text_enabled():
+    """True when the user saved the big-text preset in settings."""
+    return QSettings("BrokeNBored", "ACR").value(
+        "big_text", False, type=bool)
+
+
+def apply_big_text(app, enabled):
+    """Apply the big-text preset (v0.10, R9): raise the app font
+    two points when enabled, restore it when not. The font is
+    separate from the stylesheet, so the identity test still
+    holds: the stylesheet string never changes. Idempotent for
+    one call per state change: main() calls it once at launch,
+    the menu toggle calls it once per flip."""
+    font = QFont(app.font())
+    size = font.pointSize()
+    if size <= 0:
+        size = 10
+    if enabled:
+        size += BIG_TEXT_STEP
+    font.setPointSize(size)
+    app.setFont(font)
+
+
+def adjust_big_text(app, enabled):
+    """Flip the big-text preset from its current state: add the
+    two points when turning on, take them back when turning
+    off. The menu toggle uses this; main() uses apply_big_text
+    (the font is still the system default at launch)."""
+    font = QFont(app.font())
+    size = font.pointSize()
+    if size <= 0:
+        size = 10
+    font.setPointSize(size + (BIG_TEXT_STEP if enabled
+                              else -BIG_TEXT_STEP))
+    app.setFont(font)
+
 # Single-instance names (U27). ACR_INSTANCE_NAME lets tests run a
 # private instance without touching a real one.
 INSTANCE_ENV = "ACR_INSTANCE_NAME"
@@ -205,7 +270,10 @@ TRACE_COLUMNS = ["Step", "Input", "Delta norm", "W old", "W new",
 
 CHART_BG = QColor(0x26, 0x26, 0x2e)
 CHART_LINE = QColor(110, 168, 216)
-CHART_SPIKE = QColor(224, 92, 80)
+# v0.10 (R9): the spike red is lightened from (224, 92, 80) so
+# the legend text passes WCAG AA on the chart background: 5.44:1,
+# up from 4.16:1. Still clearly red, against the blue line.
+CHART_SPIKE = QColor(240, 120, 110)
 LEGEND_TEXT = "red dot = new-layer candidate"
 CHART_GRID = QColor(58, 58, 68)
 CHART_AXIS = QColor(169, 169, 179)
@@ -215,6 +283,26 @@ HEAT_HIGH = QColor(201, 162, 39)
 # chart's red-dot meaning, as a row); the fade starts brighter.
 FLAG_TINT = QColor(0x4a, 0x23, 0x20)
 FLAG_TINT_BRIGHT = QColor(0x7a, 0x32, 0x2b)
+
+# v0.10 (R13): the heat history is bounded -- one entry per step,
+# each holding dim floats, so a 10,000-line run at dim 768 would
+# otherwise hold ~240 MB of heatmap data. 1000 entries is ~24 MB
+# at dim 768, ~2 MB at dim 64. Past the bound the oldest half is
+# thinned (every other entry), so the step picker still spans
+# the whole run and a thinned-out step says so (U32).
+HEAT_HISTORY_LIMIT = 1000
+# v0.10 (R13): batch progress updates the bar and label at most
+# this often. The final update always lands.
+PROGRESS_UI_INTERVAL = 0.1
+
+# v0.10 (R4): the example run. The four theme sentences, the
+# same ones the tests drive: four real steps on one theme.
+EXAMPLE_SENTENCES = [
+    "quantum entanglement links particles",
+    "entangled particles share a state",
+    "quantum particles stay connected",
+    "entanglement links distant particles",
+]
 
 
 def _row_change_norms(old_u, old_v, new_u, new_v):
@@ -276,8 +364,12 @@ class LocalServiceManager:
     after ACR closes and ACR never stops it: a service the user
     started another way is never touched either. start() returns
     (ok, message) with a plain-language message, and never raises.
-    It blocks while waiting, pumping the event loop so the window
-    stays alive.
+    v0.10 (R1): start() runs on a worker thread, so it no longer
+    pumps the event loop from the wait -- pumping from a worker
+    thread is not safe, and the window stays responsive on its
+    own thread. The wait can be abandoned: stop, when given, is
+    a zero-arg callable checked every poll, and a stop returns
+    at once with a cancelled message.
     """
 
     START_TIMEOUT = 15.0
@@ -286,7 +378,7 @@ class LocalServiceManager:
     def __init__(self, client):
         self.client = client
 
-    def start(self, timeout=None):
+    def start(self, timeout=None, stop=None):
         """Start the service if it is not already answering."""
         if timeout is None:
             timeout = self.START_TIMEOUT
@@ -306,9 +398,8 @@ class LocalServiceManager:
             return False, MSG_START_FAILED
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            app = QApplication.instance()
-            if app is not None:
-                app.processEvents()
+            if stop is not None and stop():
+                return False, "Cancelled."
             try:
                 if self.client.probe(timeout=2):
                     return True, "The local model service is running."
@@ -324,21 +415,72 @@ class NormChart(QWidget):
     Steps flagged as new-layer candidates are drawn as red dots so
     resonance spikes stand out. Plain QPainter painting, no extra
     dependencies. `values` and `flags` mirror the trace log.
+
+    v0.10 (R6): the chart scrubs. Hover shows the step's values
+    as a tooltip; click (or drag) jumps the heatmap and the trace
+    selection to that step, through stepClicked, which carries
+    the 0-based index into the values list. The window maps the
+    index to a step id through the trace.
     """
 
-    def __init__(self, parent=None):
+    stepClicked = Signal(int)
+
+    def __init__(self, parent=None, empty_text=None):
         super().__init__(parent)
         self.setMinimumHeight(130)
+        # v0.10 (R15): the empty message fits where the chart
+        # lives. The Views chart says "Step some text"; the
+        # Analyze chart says "Analyze a file" -- nobody steps
+        # text in Analyze.
+        self.empty_text = (empty_text
+                           or "Step some text to see the chart.")
         self.values = []
         self.flags = []
         self._pulse_index = None
         self._pulse_scale = 1.0
         self._pulse_anim = None
+        self.setMouseTracking(True)
 
     def set_data(self, values, flags):
         self.values = list(values)
         self.flags = list(flags)
         self.update()
+
+    def _index_at(self, x):
+        """The step index nearest a mouse x position, or None
+        when the chart is empty. The plot area is the same
+        geometry paintEvent uses: left margin 48, right 10."""
+        n = len(self.values)
+        if n == 0:
+            return None
+        if n == 1:
+            return 0
+        left, right = 48, 10
+        width = max(1, self.width() - left - right)
+        frac = (x - left) / float(width)
+        index = int(round(frac * (n - 1)))
+        return max(0, min(n - 1, index))
+
+    def mouseMoveEvent(self, event):
+        index = self._index_at(event.position().x())
+        if index is not None:
+            text = ("Step %d: W norm %.4f"
+                    % (index + 1, self.values[index]))
+            if index < len(self.flags) and self.flags[index]:
+                text += " (new-layer candidate)"
+            self.setToolTip(text)
+            # Drag scrubs: a held left button jumps as the mouse
+            # moves, the same as a click.
+            if event.buttons() & Qt.LeftButton:
+                self.stepClicked.emit(index)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            index = self._index_at(event.position().x())
+            if index is not None:
+                self.stepClicked.emit(index)
+        super().mousePressEvent(event)
 
     def _get_pulse_scale(self):
         return self._pulse_scale
@@ -398,7 +540,7 @@ class NormChart(QWidget):
         if not self.values:
             painter.setPen(CHART_AXIS)
             painter.drawText(self.rect(), Qt.AlignCenter,
-                             "Step some text to see the chart.")
+                             self.empty_text)
             return
         left, right = 48, 10
         top, bottom = 10, 22
@@ -743,6 +885,60 @@ class LocalCallWorker(QObject):
         self.finished.emit(result)
 
 
+class LocalTaskWorker(QObject):
+    """One setup call for the local model service, off the UI
+    thread (v0.10, R1 -- the same pattern as LocalCallWorker).
+
+    kind is "offer", "activate", or "start". "offer" probes the
+    service and lists the installed models (the picker fill);
+    "activate" runs a probe embedding to learn one model's dim;
+    "start" starts the service. finished carries the result --
+    the model info list, the probe vector, or the service
+    start's (ok, message) pair -- or a LocalModelError whose
+    message is the plain status text to show. The worker never
+    touches a widget itself, so the window stays responsive
+    while the call runs. A start can be abandoned mid-wait: the
+    stop callable is checked every poll, and a stop returns at
+    once.
+    """
+
+    finished = Signal(object)
+    progress = Signal(str)
+
+    def __init__(self, client, service, kind, model=None,
+                 stop=None):
+        super().__init__()
+        self.client = client
+        self.service = service
+        self.kind = kind
+        self.model = model
+        self.stop = stop
+
+    def run(self):
+        try:
+            if self.kind == "offer":
+                if not self.client.probe():
+                    self.finished.emit(LocalModelError(
+                        MSG_SERVICE_DOWN + " Press Start service, "
+                        "or stay on Built-in."))
+                    return
+                infos = self.client.list_model_info()
+                self.finished.emit(infos)
+            elif self.kind == "activate":
+                probe = self.client.embed(self.model, "hello")
+                self.finished.emit(probe)
+            elif self.kind == "start":
+                self.finished.emit(
+                    self.service.start(stop=self.stop))
+            else:
+                self.finished.emit(LocalModelError(
+                    "unknown local task: %s" % self.kind))
+        except LocalModelError as exc:
+            self.finished.emit(exc)
+        except Exception as exc:  # never strand the window
+            self.finished.emit(LocalModelError(str(exc)))
+
+
 # v0.9 Analyze: file types a folder run picks up, and how many
 # entries the core and outlier lists hold.
 BATCH_EXTENSIONS = (".txt", ".md", ".jsonl")
@@ -1036,6 +1232,10 @@ class SubWindow(QWidget):
     destroying it, so the View menu can open it again, and each
     remembers its own geometry between runs (U5)."""
 
+    # v0.10 (R14): the View menu's checkable actions follow this,
+    # so the menu shows which windows are open.
+    visibilityChanged = Signal(bool)
+
     def __init__(self, title, settings_key, parent=None,
                  default_width=900, default_height=600):
         super().__init__(parent, Qt.Window)
@@ -1050,34 +1250,35 @@ class SubWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Opening a window springs it in (v0.9, technique 2):
-        # 97% size, centered, settling on the restored geometry
-        # over 200 ms. The geometry memory still rules: the
-        # animation ends exactly where the window belongs.
-        # Reduced motion skips it. The main window does not
-        # spring: it opens once, at launch, at its saved size.
+        self.visibilityChanged.emit(True)
+        # Opening a window fades it in (v0.10, R13): the v0.9
+        # open animated the window GEOMETRY, a layout property,
+        # which the library says never to animate (entries
+        # 001/002: animate transform and opacity, never layout).
+        # The fade is 150 ms, OutCubic, and the effect is
+        # removed when it lands so the window paints normally
+        # afterwards. Reduced motion skips it. The main window
+        # does not fade: it opens once, at launch, at its saved
+        # size.
         if reduced_motion():
             return
         if self._open_anim is not None:
             self._open_anim.stop()
             self._open_anim = None
-        end = self.geometry()
-        width = max(1, int(end.width() * 0.97))
-        height = max(1, int(end.height() * 0.97))
-        center = end.center()
-        start = QRect(center.x() - width // 2,
-                      center.y() - height // 2, width, height)
-        anim = QPropertyAnimation(self, b"geometry", self)
-        anim.setDuration(200)
-        anim.setEasingCurve(QEasingCurve.OutBack)
-        anim.setStartValue(start)
-        anim.setEndValue(end)
+        effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(150)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
         anim.finished.connect(self._open_done)
         self._open_anim = anim
         anim.start()
 
     def _open_done(self):
         self._open_anim = None
+        self.setGraphicsEffect(None)
 
     def closeEvent(self, event):
         self._settings.setValue(self._settings_key,
@@ -1086,6 +1287,7 @@ class SubWindow(QWidget):
         # Hide, do not destroy: the window reopens from the menu.
         event.ignore()
         self.hide()
+        self.visibilityChanged.emit(False)
 
 
 class HowToUseWindow(SubWindow):
@@ -1112,7 +1314,50 @@ class HowToUseWindow(SubWindow):
         layout.addWidget(self.browser, 1)
 
         self.sections = []
+        self._first_show = True
+        self._shown_at = None
         self._load_guide()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # v0.10 (R15): on first show the index takes focus and Qt
+        # auto-selects row 0, which fires the section jump and
+        # leaves the first heading blue-highlighted in the guide.
+        # The guide is the reading pane, so it takes the focus
+        # instead: the index keeps no current row until the user
+        # picks one. Later shows keep the user's pick: the window
+        # hides, it is never destroyed.
+        if self._first_show:
+            self._first_show = False
+            self._shown_at = time.monotonic()
+            self.browser.setFocus()
+
+    def _on_section_picked(self, current, _previous):
+        if current is None:
+            return
+        # v0.10 (R15) backstop: if the index still auto-selects
+        # row 0 right after the first show (the focus landed on
+        # the index despite the browser taking it), that pick is
+        # not the user's: drop it and clear the row, so a later
+        # click on row 0 still fires. Only row 0 within half a
+        # second of the first show is dropped: the auto-select
+        # always picks the first item, and a real pick of any
+        # other row -- or of row 0 after half a second -- is
+        # never dropped.
+        if (self._shown_at is not None
+                and self.index_list.row(current) == 0
+                and time.monotonic() - self._shown_at < 0.5):
+            self._shown_at = None
+            self.index_list.blockSignals(True)
+            self.index_list.setCurrentRow(-1)
+            self.index_list.clearSelection()
+            self.index_list.blockSignals(False)
+            return
+        # Jump to the section heading in the guide.
+        cursor = self.browser.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        self.browser.setTextCursor(cursor)
+        self.browser.find(current.text())
 
     def _load_guide(self):
         try:
@@ -1130,15 +1375,6 @@ class HowToUseWindow(SubWindow):
         self.index_list.clear()
         for section in self.sections:
             self.index_list.addItem(section)
-
-    def _on_section_picked(self, current, _previous):
-        if current is None:
-            return
-        # Jump to the section heading in the guide.
-        cursor = self.browser.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-        self.browser.setTextCursor(cursor)
-        self.browser.find(current.text())
 
 
 class AnalyzeWindow(SubWindow):
@@ -1160,6 +1396,11 @@ class AnalyzeWindow(SubWindow):
         self._source_note = ""
         self._summary = None
         self._trace = []
+        # v0.10 (R3): the full-entry dialog, when one is open.
+        self._entry_dialog = None
+        # v0.10 (R11): the step count the pack preview was built
+        # from, so the write can say when the session moved on.
+        self._preview_step_count = None
         layout = QVBoxLayout(self)
 
         layout.addWidget(_header_label("What to analyze"))
@@ -1233,7 +1474,15 @@ class AnalyzeWindow(SubWindow):
         chart_layout.addWidget(_note_label(
             "W_t norm over the whole run. Spikes are resonance "
             "spikes."))
-        self.chart = NormChart()
+        # v0.10 (R15): the empty message fits Analyze -- nobody
+        # steps text here.
+        self.chart = NormChart(
+            empty_text="Analyze a file to see the chart.")
+        # v0.10 (R6): click a point to jump the heatmap and the
+        # trace selection to that step, the same as the Views
+        # chart.
+        self.chart.stepClicked.connect(
+            main._on_chart_step_clicked)
         chart_layout.addWidget(self.chart, 1)
         results_grid.addWidget(chart_tile, 1, 0, 1, 2)
 
@@ -1248,6 +1497,11 @@ class AnalyzeWindow(SubWindow):
         self.themes_list.setUniformItemSizes(True)
         self.themes_list.currentItemChanged.connect(
             self._on_theme_picked)
+        # v0.10 (R3): double-click shows the whole entry: the
+        # list clips long lines, and the tooltip alone is not
+        # enough to read one.
+        self.themes_list.itemDoubleClicked.connect(
+            self._on_finding_double_clicked)
         themes_layout.addWidget(self.themes_list, 1)
         self.theme_detail = QTextEdit()
         self.theme_detail.setReadOnly(True)
@@ -1257,6 +1511,8 @@ class AnalyzeWindow(SubWindow):
         # always shows the trigger entry and its neighbours.
         self.theme_detail.setMinimumHeight(55)
         self.theme_detail.setMaximumHeight(80)
+        # v0.10 (R2): a read-only display surface: no Tab stop.
+        self.theme_detail.setFocusPolicy(Qt.NoFocus)
         themes_layout.addWidget(self.theme_detail, 1)
         results_grid.addWidget(themes_tile, 1, 2, 1, 1)
 
@@ -1269,6 +1525,8 @@ class AnalyzeWindow(SubWindow):
             "The heart of the file."))
         self.core_list = QListWidget()
         self.core_list.setUniformItemSizes(True)
+        self.core_list.itemDoubleClicked.connect(
+            self._on_finding_double_clicked)
         core_layout.addWidget(self.core_list, 1)
         results_grid.addWidget(core_tile, 2, 0, 1, 1)
 
@@ -1281,6 +1539,8 @@ class AnalyzeWindow(SubWindow):
             "and off-topic lines."))
         self.outlier_list = QListWidget()
         self.outlier_list.setUniformItemSizes(True)
+        self.outlier_list.itemDoubleClicked.connect(
+            self._on_finding_double_clicked)
         outlier_layout.addWidget(self.outlier_list, 1)
         results_grid.addWidget(outlier_tile, 2, 1, 1, 1)
 
@@ -1293,6 +1553,8 @@ class AnalyzeWindow(SubWindow):
             "sharply and stays low. Topic boundaries."))
         self.shift_list = QListWidget()
         self.shift_list.setUniformItemSizes(True)
+        self.shift_list.itemDoubleClicked.connect(
+            self._on_finding_double_clicked)
         shift_layout.addWidget(self.shift_list, 1)
         results_grid.addWidget(shift_tile, 2, 2, 1, 1)
 
@@ -1333,6 +1595,49 @@ class AnalyzeWindow(SubWindow):
             "A STELLA data pack teaches a model what ACR found: "
             "themes, matches, analogies, judgments. One folder "
             "per theme."))
+
+        # v0.10 (R11): the pack preview. Export fills this pane
+        # with the packs it is about to write -- names, row
+        # counts, first rows -- and the Write button appears.
+        # Nothing is written until Write is pressed. A pane, not
+        # a dialog: export is a routine event, and routine
+        # events never pop a dialog (calm technology).
+        self.pack_preview_label = _header_label("Pack preview")
+        self.pack_preview_label.hide()
+        layout.addWidget(self.pack_preview_label)
+        self.pack_preview = QTextEdit()
+        self.pack_preview.setReadOnly(True)
+        self.pack_preview.setFocusPolicy(Qt.NoFocus)
+        self.pack_preview.setMaximumHeight(160)
+        self.pack_preview.hide()
+        layout.addWidget(self.pack_preview)
+        self.write_packs_button = QPushButton("Write these packs")
+        self.write_packs_button.setObjectName("primaryButton")
+        self.write_packs_button.clicked.connect(
+            self.on_write_stella_packs)
+        self.write_packs_button.hide()
+        layout.addWidget(self.write_packs_button)
+
+        # v0.10 (R2): Tab order is the visual order.
+        QWidget.setTabOrder(self.pick_file_button,
+                            self.pick_folder_button)
+        QWidget.setTabOrder(self.pick_folder_button,
+                            self.go_button)
+        QWidget.setTabOrder(self.go_button, self.cancel_button)
+        QWidget.setTabOrder(self.cancel_button, self.themes_list)
+        QWidget.setTabOrder(self.themes_list, self.core_list)
+        QWidget.setTabOrder(self.core_list, self.outlier_list)
+        QWidget.setTabOrder(self.outlier_list, self.shift_list)
+        QWidget.setTabOrder(self.shift_list,
+                            self.export_text_button)
+        QWidget.setTabOrder(self.export_text_button,
+                            self.export_jsonl_button)
+        QWidget.setTabOrder(self.export_jsonl_button,
+                            self.export_report_button)
+        QWidget.setTabOrder(self.export_report_button,
+                            self.export_packs_button)
+        QWidget.setTabOrder(self.export_packs_button,
+                            self.write_packs_button)
 
     # -- picking ------------------------------------------------------
     def on_pick_file(self):
@@ -1391,8 +1696,12 @@ class AnalyzeWindow(SubWindow):
                 "Pick a file, press Go, and the findings land "
                 "here.")
         else:
+            # v0.10 (R15): the hero counts session steps, while
+            # the progress label counts the run's steps. Say
+            # which, so the two numbers never look like a
+            # contradiction.
             self.hero_title.setText(
-                "%d theme%s found in %d steps"
+                "%d theme%s found in %d steps in this session"
                 % (len(themes),
                    "" if len(themes) == 1 else "s", steps))
             if themes:
@@ -1422,6 +1731,9 @@ class AnalyzeWindow(SubWindow):
             item = self.themes_list.item(
                 self.themes_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
+            # v0.10 (R3): the full text, on hover and on
+            # double-click: the list clips long lines.
+            item.setToolTip(self.main._entry_text(entry))
             if entry["id"] == selected:
                 restore_row = self.themes_list.count() - 1
         self.themes_list.blockSignals(False)
@@ -1438,11 +1750,18 @@ class AnalyzeWindow(SubWindow):
             self.core_list.addItem(
                 "%.3f  %s" % (entry["resonance"],
                               self.main._entry_text(entry)))
+            item = self.core_list.item(self.core_list.count() - 1)
+            item.setData(Qt.UserRole, entry["id"])
+            item.setToolTip(self.main._entry_text(entry))
         self.outlier_list.clear()
         for entry in summary["outliers"]:
             self.outlier_list.addItem(
                 "%.3f  %s" % (entry["resonance"],
                               self.main._entry_text(entry)))
+            item = self.outlier_list.item(
+                self.outlier_list.count() - 1)
+            item.setData(Qt.UserRole, entry["id"])
+            item.setToolTip(self.main._entry_text(entry))
         self.shift_list.clear()
         by_id = {entry["id"]: entry for entry in trace}
         for entry in summary["shifts"]:
@@ -1456,11 +1775,75 @@ class AnalyzeWindow(SubWindow):
                 self.shift_list.addItem(
                     "Step %d: resonance %.3f"
                     % (entry["id"], entry["resonance"]))
+            item = self.shift_list.item(self.shift_list.count() - 1)
+            item.setData(Qt.UserRole, entry["id"])
+            item.setToolTip(self.main._entry_text(entry))
         has_steps = summary["steps"] > 0
         self.export_text_button.setEnabled(has_steps)
         self.export_jsonl_button.setEnabled(has_steps)
         self.export_report_button.setEnabled(has_steps)
         self.export_packs_button.setEnabled(has_steps)
+
+    def show_live(self, trace, done, total):
+        """Mid-run refresh (v0.10, R5): the chart and the hero
+        tile update as steps land, so a long run shows its
+        findings while it is still going. Only the chart and
+        the hero: the finding lists need the finished summary,
+        and rebuilding them every progress tick would cost more
+        than it shows. Called from the throttled progress
+        handler, on the UI thread, with a snapshot of the trace.
+        """
+        self.chart.set_data(
+            [entry["new_norm"] for entry in trace],
+            [entry["new_layer"] for entry in trace])
+        themes = sum(1 for entry in trace if entry["new_layer"])
+        steps = len(trace)
+        self.hero_title.setText(
+            "Analyzing... %d theme%s so far in %d steps in this "
+            "session"
+            % (themes, "" if themes == 1 else "s", steps))
+        self.hero_theme.setText(
+            "Run in progress: line %d of %d in this run."
+            % (done, total))
+
+    def _on_finding_double_clicked(self, item):
+        """Double-click on a finding shows the whole entry
+        (v0.10, R3): the lists clip long lines, and a tooltip
+        is not enough to read one."""
+        if item is None:
+            return
+        step_id = item.data(Qt.UserRole)
+        for entry in self._trace:
+            if entry["id"] == step_id:
+                self._show_full_entry(
+                    self.main._entry_text(entry),
+                    "Step %d" % step_id)
+                return
+
+    def _show_full_entry(self, text, title):
+        """One entry's full text in a small read-only dialog.
+        Modeless: it never blocks the window behind it, and a
+        second double-click replaces it."""
+        if self._entry_dialog is not None:
+            self._entry_dialog.close()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        layout = QVBoxLayout(dialog)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        view.setMinimumSize(500, 200)
+        layout.addWidget(view)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.close)
+        layout.addWidget(close)
+        dialog.destroyed.connect(self._clear_entry_dialog)
+        self._entry_dialog = dialog
+        dialog.show()
+
+    def _clear_entry_dialog(self, _obj=None):
+        self._entry_dialog = None
 
     def _on_theme_picked(self, current, _previous):
         if current is None:
@@ -1596,6 +1979,84 @@ class AnalyzeWindow(SubWindow):
         return result
 
     def on_export_stella_packs(self):
+        """Preview the packs before writing (v0.10, R11): the
+        preview pane shows the pack names, the row counts per
+        kind, and the first rows, and the Write button appears.
+        Nothing is written until Write is pressed. The plan is
+        built from the same summary the write uses, so the
+        preview is what the write writes -- unless the session
+        changes in between, in which case the write uses the
+        newer state and says so in the status line."""
+        if self._summary is None or self._summary["steps"] == 0:
+            self.main.status_label.setText(
+                "Nothing analyzed yet: run an analysis first.")
+            return
+        packs = build_pack_rows(
+            self._summary, self.main._pack_item,
+            self.main._pack_context(),
+            self.main._batch_source_note)
+        if not packs:
+            self.main.status_label.setText(
+                "No packs to write from this run.")
+            return
+        self._preview_step_count = self._summary["steps"]
+        self.pack_preview.setPlainText(
+            self._render_pack_preview(packs))
+        self.pack_preview_label.show()
+        self.pack_preview.show()
+        self.write_packs_button.show()
+        total_rows = sum(len(pack["rows"]) for pack in packs)
+        self.main.status_label.setText(
+            "Preview ready: %d pack%s, %d rows. Press Write "
+            "these packs to save them."
+            % (len(packs), "s" if len(packs) != 1 else "",
+               total_rows))
+
+    def _render_pack_preview(self, packs):
+        """The preview text for a pack plan: one block per pack
+        -- name, row count, counts per kind, first three rows.
+        Rows are shown prompt then completion, trimmed to fit
+        the pane."""
+        lines = []
+        for pack in packs:
+            counts = {}
+            for _row, entry in pack["rows"]:
+                kind = entry["kind"]
+                counts[kind] = counts.get(kind, 0) + 1
+            lines.append("Pack: %s" % pack["name"])
+            lines.append("  %d rows: %s"
+                         % (len(pack["rows"]),
+                            ", ".join("%d %s" % (counts[kind], kind)
+                                      for kind in
+                                      ("Theme membership",
+                                       "Closest match", "Analogy",
+                                       "Resonance judgment")
+                                      if counts.get(kind))))
+            for row, _entry in pack["rows"][:3]:
+                lines.append("  Q: %s"
+                             % self._preview_trim(
+                                 row["prompt"], 100))
+                lines.append("  A: %s"
+                             % self._preview_trim(
+                                 row["completion"], 100))
+            if len(pack["rows"]) > 3:
+                lines.append("  ... and %d more rows"
+                             % (len(pack["rows"]) - 3))
+            lines.append("")
+        return "\n".join(lines).rstrip("\n")
+
+    @staticmethod
+    def _preview_trim(text, limit):
+        if len(text) <= limit:
+            return text
+        return text[:limit - 3] + "..."
+
+    def on_write_stella_packs(self):
+        """Write the previewed packs, after the folder pick.
+        The write rebuilds from the current summary: if the
+        session changed since the preview, the packs follow the
+        newer state, and the status line names the step count
+        the preview was built from."""
         folder = QFileDialog.getExistingDirectory(
             self, "Where to save the STELLA data packs",
             default_packs_dir())
@@ -1611,11 +2072,22 @@ class AnalyzeWindow(SubWindow):
         if result["error"] is not None:
             self.main.status_label.setText(result["error"])
             return
+        self.write_packs_button.hide()
         count = len(result["packs"])
         under = sum(1 for _f, _n, flag in result["packs"]
                     if flag)
         message = ("Wrote %d STELLA data pack%s to %s."
                    % (count, "s" if count != 1 else "", folder))
+        if (self._preview_step_count is not None
+                and self._summary is not None
+                and self._summary["steps"]
+                != self._preview_step_count):
+            message += (" The session changed since the preview "
+                        "(preview was %d steps, now %d): these "
+                        "packs are from the current state."
+                        % (self._preview_step_count,
+                           self._summary["steps"]))
+        self._preview_step_count = None
         if under == 1:
             message += (" 1 pack has fewer than 2 rows: STELLA "
                         "needs 2 or more, add more source "
@@ -1719,6 +2191,13 @@ class MainWindow(QMainWindow):
         self._glow_anim = None
         self._flag_anim = None
         self._flag_anim_step = None
+        # v0.10 (R4): the example run's remaining sentences, when
+        # one is in flight on the local encoder (built-in runs
+        # at once, so the queue stays empty there).
+        self._example_queue = []
+        # v0.10 (R13): when the batch progress UI last updated,
+        # for the throttle.
+        self._last_progress_ui = 0.0
 
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(
@@ -1734,6 +2213,9 @@ class MainWindow(QMainWindow):
         self.logger.info("ACR %s started", VERSION)
 
         self._build_ui()
+        # v0.10 (R10): apply the built-in collapsed state at
+        # launch: the local-model chrome starts hidden.
+        self._set_encoder_ui()
         self._refresh_all()
 
     def closeEvent(self, event):
@@ -1811,19 +2293,28 @@ class MainWindow(QMainWindow):
         root.addLayout(encoder_row)
         self.encoder_label = QLabel("Built-in encoder, dim 64.")
         root.addWidget(self.encoder_label)
-        root.addWidget(_note_label(
+        # v0.10 (R10): the local-model notes are named, so the
+        # progressive disclosure can hide them in built-in mode.
+        self.model_note = _note_label(
             "The model list shows what each model does and whether "
-            "it fits this PC. Nothing is picked for you."))
-        switch_note = QLabel(
+            "it fits this PC. Nothing is picked for you.")
+        root.addWidget(self.model_note)
+        self.switch_note = QLabel(
             "Switching encoders starts a fresh W_t (the embedding "
             "sizes differ).")
-        switch_note.setWordWrap(True)
-        root.addWidget(switch_note)
+        self.switch_note.setWordWrap(True)
+        root.addWidget(self.switch_note)
 
         root.addWidget(_header_label("Input text"))
         self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText(
             "Type a sentence, then press Enter or Step...")
+        # v0.10 (R2): Tab moves the focus on, like every other
+        # control. The input is one sentence; nobody needs a
+        # literal tab in it, and the default QPlainTextEdit
+        # behaviour swallows Tab for text editing, which broke
+        # the visual-order Tab chain at its first hop.
+        self.input_edit.setTabChangesFocus(True)
         # v0.6: fixed at two lines. The input is one sentence; the
         # freed height goes to the synthesis panel below, which
         # holds four sections plus the completion.
@@ -1844,16 +2335,39 @@ class MainWindow(QMainWindow):
         self.analyze_button = QPushButton("Analyze a file")
         self.analyze_button.clicked.connect(self.show_analyze_window)
         step_row.addWidget(self.analyze_button)
+        # v0.10 (R4): teach by playing. Offered, not defaulted:
+        # visible only while the session is empty, gone once
+        # the user steps anything.
+        self.example_button = QPushButton("Try an example")
+        self.example_button.clicked.connect(self.on_try_example)
+        step_row.addWidget(self.example_button)
         root.addLayout(step_row)
+        self.example_label = _note_label(
+            "New here? Try an example steps four sentences about "
+            "quantum entanglement through the loop, so you can "
+            "see W_t adapt.")
+        root.addWidget(self.example_label)
 
         readout_row = QHBoxLayout()
         self.step_label = QLabel("Step: 0")
         self.norm_label = QLabel("W norm: -")
         self.resonance_label = QLabel("Resonance: -")
+        # v0.10 (R7): the persistent flag marker. The 300 ms
+        # moment passes; this gold dot stays, naming the latest
+        # flagged step on hover, until the next flag or a reset.
+        # A separate label, never the readout's stylesheet: the
+        # readout still rests at its normal style after the
+        # moment.
+        self.flag_marker = QLabel("\u25cf")
+        self.flag_marker.setStyleSheet(
+            "color: %s;" % ACCENT_GOLD)
+        self.flag_marker.hide()
         self.alpha_label = QLabel("Alpha: 0.30")
-        for label in (self.step_label, self.norm_label,
-                      self.resonance_label, self.alpha_label):
-            readout_row.addWidget(label)
+        readout_row.addWidget(self.step_label)
+        readout_row.addWidget(self.norm_label)
+        readout_row.addWidget(self.resonance_label)
+        readout_row.addWidget(self.flag_marker)
+        readout_row.addWidget(self.alpha_label)
         readout_row.addStretch(1)
         root.addLayout(readout_row)
 
@@ -1867,6 +2381,9 @@ class MainWindow(QMainWindow):
         # the cap it takes all the spare height and the completion
         # scroll-to-bottom has nothing to scroll.
         self.synthesis_text.setMaximumHeight(170)
+        # v0.10 (R2): a read-only display surface, not a control:
+        # it takes no Tab stop.
+        self.synthesis_text.setFocusPolicy(Qt.NoFocus)
         root.addWidget(self.synthesis_text, 1)
 
         # Optional local-model completion: on-demand only, and
@@ -1916,6 +2433,39 @@ class MainWindow(QMainWindow):
         self.howto_window = HowToUseWindow(self)
         self.analyze_window = AnalyzeWindow(self)
 
+        # v0.10 (R14): the View menu's checkable actions follow
+        # the windows' visibility, so the menu shows which
+        # windows are open.
+        self.controls_window.visibilityChanged.connect(
+            self.action_show_controls.setChecked)
+        self.trace_window.visibilityChanged.connect(
+            self.action_show_trace.setChecked)
+        self.views_window.visibilityChanged.connect(
+            self.action_show_views.setChecked)
+        self.analyze_window.visibilityChanged.connect(
+            self.action_show_analyze.setChecked)
+
+        # v0.10 (R2): Tab order is the visual order, top to
+        # bottom. Hidden widgets are skipped by Qt, so the
+        # collapsed local-model chrome (R10) never takes a stop
+        # in built-in mode.
+        QWidget.setTabOrder(self.encoder_combo, self.model_combo)
+        QWidget.setTabOrder(self.model_combo, self.start_button)
+        QWidget.setTabOrder(self.start_button, self.input_edit)
+        QWidget.setTabOrder(self.input_edit, self.step_button)
+        QWidget.setTabOrder(self.step_button, self.analyze_button)
+        QWidget.setTabOrder(self.analyze_button,
+                            self.example_button)
+        QWidget.setTabOrder(self.example_button,
+                            self.complete_button)
+        QWidget.setTabOrder(self.complete_button,
+                            self.completion_combo)
+        QWidget.setTabOrder(self.completion_combo,
+                            self.cancel_button)
+        # v0.10 (R2): the input has the focus at launch, so the
+        # first thing the user types goes where it belongs.
+        self.input_edit.setFocus()
+
     def _set_busy(self, busy):
         """The busy light (v0.9, U16): gold while the app is
         working, grey at rest."""
@@ -1926,67 +2476,152 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         """A real menu bar (v0.9, U38): every function reachable
         from the menu, not only from buttons."""
+        # v0.10 (R2): every menu action carries a shortcut, and
+        # the shortcuts are listed in HOW-TO-USE.md. About is
+        # the one exception: no standard shortcut exists for it.
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
         self.action_save_session = QAction("Save session", self)
+        self.action_save_session.setShortcut("Ctrl+S")
         self.action_save_session.triggered.connect(
             self.on_save_session)
         file_menu.addAction(self.action_save_session)
         self.action_load_session = QAction("Load session", self)
+        self.action_load_session.setShortcut("Ctrl+O")
         self.action_load_session.triggered.connect(
             self.on_load_session)
         file_menu.addAction(self.action_load_session)
         file_menu.addSeparator()
         self.action_export_json = QAction("Export trace JSON", self)
+        self.action_export_json.setShortcut("Ctrl+J")
         self.action_export_json.triggered.connect(self.on_export)
         file_menu.addAction(self.action_export_json)
         self.action_export_csv = QAction("Export trace CSV", self)
+        self.action_export_csv.setShortcut("Ctrl+Shift+J")
         self.action_export_csv.triggered.connect(self.on_export_csv)
         file_menu.addAction(self.action_export_csv)
         self.action_export_session = QAction("Export session", self)
+        self.action_export_session.setShortcut("Ctrl+E")
         self.action_export_session.triggered.connect(
             self.on_export_session)
         file_menu.addAction(self.action_export_session)
         file_menu.addSeparator()
         self.action_debug_report = QAction(
             "Generate debug report", self)
+        self.action_debug_report.setShortcut("Ctrl+D")
         self.action_debug_report.triggered.connect(
             self.on_debug_report)
         file_menu.addAction(self.action_debug_report)
         self.action_reset = QAction("Reset", self)
+        self.action_reset.setShortcut("Ctrl+R")
         self.action_reset.triggered.connect(self.on_reset)
         file_menu.addAction(self.action_reset)
         file_menu.addSeparator()
         self.action_quit = QAction("Quit", self)
+        self.action_quit.setShortcut("Ctrl+Q")
         self.action_quit.triggered.connect(self.close)
         file_menu.addAction(self.action_quit)
 
         view_menu = menu_bar.addMenu("View")
+        # v0.10 (R14): the window actions are checkable toggles:
+        # checked while their window is open, following the
+        # windows' visibilityChanged signal (wired in _build_ui,
+        # after the windows exist). The show_* methods stay
+        # open-only: the Analyze button on Main opens, it never
+        # toggles.
         self.action_show_controls = QAction("Controls", self)
+        self.action_show_controls.setCheckable(True)
+        self.action_show_controls.setShortcut("Ctrl+1")
         self.action_show_controls.triggered.connect(
-            self.show_controls_window)
+            self.toggle_controls_window)
         view_menu.addAction(self.action_show_controls)
         self.action_show_trace = QAction("Trace log", self)
+        self.action_show_trace.setCheckable(True)
+        self.action_show_trace.setShortcut("Ctrl+2")
         self.action_show_trace.triggered.connect(
-            self.show_trace_window)
+            self.toggle_trace_window)
         view_menu.addAction(self.action_show_trace)
         self.action_show_views = QAction("Resonance views", self)
+        self.action_show_views.setCheckable(True)
+        self.action_show_views.setShortcut("Ctrl+3")
         self.action_show_views.triggered.connect(
-            self.show_views_window)
+            self.toggle_views_window)
         view_menu.addAction(self.action_show_views)
         self.action_show_analyze = QAction("Analyze a file", self)
+        self.action_show_analyze.setCheckable(True)
+        self.action_show_analyze.setShortcut("Ctrl+4")
         self.action_show_analyze.triggered.connect(
-            self.show_analyze_window)
+            self.toggle_analyze_window)
         view_menu.addAction(self.action_show_analyze)
+        view_menu.addSeparator()
+        # v0.10 (R9): accessibility in the menu, one tap each.
+        # Both persist in settings; the reduced-motion toggle
+        # wires to the existing fallback, the big-text preset
+        # raises the app font two points.
+        self.action_reduced_motion = QAction("Reduced motion",
+                                             self)
+        self.action_reduced_motion.setCheckable(True)
+        self.action_reduced_motion.setChecked(reduced_motion())
+        self.action_reduced_motion.setShortcut("Ctrl+M")
+        self.action_reduced_motion.toggled.connect(
+            self._on_reduced_motion_toggled)
+        view_menu.addAction(self.action_reduced_motion)
+        self.action_big_text = QAction("Big text", self)
+        self.action_big_text.setCheckable(True)
+        self.action_big_text.setChecked(big_text_enabled())
+        self.action_big_text.setShortcut("Ctrl+T")
+        self.action_big_text.toggled.connect(
+            self._on_big_text_toggled)
+        view_menu.addAction(self.action_big_text)
 
         help_menu = menu_bar.addMenu("Help")
         self.action_how_to_use = QAction("How to Use", self)
+        self.action_how_to_use.setShortcut("F1")
         self.action_how_to_use.triggered.connect(
             self.show_howto_window)
         help_menu.addAction(self.action_how_to_use)
         self.action_about = QAction("About", self)
         self.action_about.triggered.connect(self.on_about)
         help_menu.addAction(self.action_about)
+
+    def toggle_controls_window(self, checked):
+        if checked:
+            self.show_controls_window()
+        else:
+            self.controls_window.close()
+
+    def toggle_trace_window(self, checked):
+        if checked:
+            self.show_trace_window()
+        else:
+            self.trace_window.close()
+
+    def toggle_views_window(self, checked):
+        if checked:
+            self.show_views_window()
+        else:
+            self.views_window.close()
+
+    def toggle_analyze_window(self, checked):
+        if checked:
+            self.show_analyze_window()
+        else:
+            self.analyze_window.close()
+
+    def _on_reduced_motion_toggled(self, checked):
+        """The reduced-motion menu toggle (v0.10, R9): writes
+        the setting the fallback already reads. State changes
+        still land; only the motion is skipped."""
+        QSettings("BrokeNBored", "ACR").setValue(
+            "reduced_motion", checked)
+
+    def _on_big_text_toggled(self, checked):
+        """The big-text menu toggle (v0.10, R9): persists the
+        preset and adjusts the app font two points, up or back.
+        The stylesheet is untouched."""
+        QSettings("BrokeNBored", "ACR").setValue(
+            "big_text", checked)
+        adjust_big_text(QApplication.instance(), checked)
 
     def show_controls_window(self):
         self.controls_window.show()
@@ -2033,13 +2668,23 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(window)
 
         layout.addWidget(_header_label("Learning rate (alpha)"))
+        # v0.10 (R8): the live value next to the slider. It shows
+        # the effective alpha for the next step, the same number
+        # as the main window's readout: under Fast-adapt and
+        # Gentle the slider value and the effective rate differ,
+        # and two different "Alpha" numbers on screen would lie
+        # to one of them.
+        alpha_row = QHBoxLayout()
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(1, 50)
         self.alpha_slider.setValue(30)
         self.alpha_slider.setTickPosition(QSlider.TicksBelow)
         self.alpha_slider.setTickInterval(10)
         self.alpha_slider.valueChanged.connect(self._on_alpha_changed)
-        layout.addWidget(self.alpha_slider)
+        alpha_row.addWidget(self.alpha_slider, 1)
+        self.alpha_value_label = QLabel("Alpha: 0.30")
+        alpha_row.addWidget(self.alpha_value_label)
+        layout.addLayout(alpha_row)
         layout.addWidget(_note_label(
             "How fast W_t adapts. Higher learns faster but can "
             "overshoot. 0.30 is the setting the resonance climb "
@@ -2111,6 +2756,14 @@ class MainWindow(QMainWindow):
             "singular value is the size of W_t's strongest "
             "direction."))
         layout.addStretch(1)
+        # v0.10 (R2): Tab order is the visual order.
+        QWidget.setTabOrder(self.alpha_slider, self.freeze_combo)
+        QWidget.setTabOrder(self.freeze_combo, self.schedule_combo)
+        previous = self.schedule_combo
+        for check in self.rank_checks:
+            QWidget.setTabOrder(previous, check)
+            previous = check
+        QWidget.setTabOrder(previous, self.cap_spin)
         self.controls_window = window
 
     def _build_trace_window(self):
@@ -2138,13 +2791,30 @@ class MainWindow(QMainWindow):
             else:
                 header.setSectionResizeMode(
                     col, QHeaderView.ResizeToContents)
+        # v0.10 (R3): clicking a row shows the full input below
+        # the table -- the Input column holds an 80-character
+        # preview, and long lines are unreadable in it.
+        self.trace_table.currentItemChanged.connect(
+            self._on_trace_row_picked)
         layout.addWidget(self.trace_table, 3)
+        self.trace_detail = QLabel("")
+        self.trace_detail.setWordWrap(True)
+        layout.addWidget(self.trace_detail)
+        # v0.10 (R15): the empty window teaches instead of
+        # showing two blank boxes.
+        self.trace_empty_label = _note_label(
+            "No steps yet. Step some text on the main window and "
+            "every weight change lands here, one row per step.")
+        layout.addWidget(self.trace_empty_label)
 
         # v0.7: roll W_t back to the state after a selected step.
         revert_row = QHBoxLayout()
         self.revert_button = QPushButton(
             "Revert W_t to selected step")
         self.revert_button.clicked.connect(self.on_revert)
+        # v0.10 (R15): Revert is disabled with no steps. It
+        # enables in _refresh_trace_table once a step lands.
+        self.revert_button.setEnabled(False)
         revert_row.addWidget(self.revert_button)
         revert_row.addStretch(1)
         layout.addLayout(revert_row)
@@ -2157,6 +2827,9 @@ class MainWindow(QMainWindow):
             % BUFFER_SIZE))
         self.buffer_list = QListWidget()
         layout.addWidget(self.buffer_list, 1)
+        # v0.10 (R2): Tab order is the visual order.
+        QWidget.setTabOrder(self.trace_table, self.revert_button)
+        QWidget.setTabOrder(self.revert_button, self.buffer_list)
         self.trace_window = window
 
     def _build_views_window(self):
@@ -2169,6 +2842,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(_header_label(
             "W_t norm over time - spikes are resonance spikes"))
         self.norm_chart = NormChart()
+        # v0.10 (R6): click a point to jump the heatmap and the
+        # trace selection to that step.
+        self.norm_chart.stepClicked.connect(
+            self._on_chart_step_clicked)
         layout.addWidget(self.norm_chart, 2)
 
         layout.addWidget(_header_label(
@@ -2199,7 +2876,12 @@ class MainWindow(QMainWindow):
         self.layer_detail = QTextEdit()
         self.layer_detail.setReadOnly(True)
         self.layer_detail.setMaximumHeight(110)
+        # v0.10 (R2): a read-only display surface: no Tab stop.
+        self.layer_detail.setFocusPolicy(Qt.NoFocus)
         layout.addWidget(self.layer_detail)
+        # v0.10 (R2): Tab order is the visual order. The chart
+        # takes no focus; the detail pane is display only.
+        QWidget.setTabOrder(self.heat_spin, self.layer_list)
         self.views_window = window
 
     # -- actions ------------------------------------------------------
@@ -2234,8 +2916,11 @@ class MainWindow(QMainWindow):
         # The label shows the effective alpha for the next step,
         # not the slider value: under Fast-adapt and Gentle the
         # two differ, and the trace records the effective one.
-        self.alpha_label.setText(
-            "Alpha: %.2f" % self._effective_alpha())
+        # v0.10 (R8): the Controls window's label shows the same
+        # number, next to the slider.
+        text = "Alpha: %.2f" % self._effective_alpha()
+        self.alpha_label.setText(text)
+        self.alpha_value_label.setText(text)
 
     def _on_alpha_changed(self, _value):
         self._refresh_alpha_label()
@@ -2273,12 +2958,30 @@ class MainWindow(QMainWindow):
         self.model_combo.blockSignals(False)
 
     def _set_encoder_ui(self):
-        """Picker, model list, and label to match the encoder state."""
+        """Picker, model list, and label to match the encoder state.
+
+        v0.10 (R10): progressive disclosure. In built-in mode
+        the local-model chrome collapses: the model combo, the
+        two note lines, and the completion row hide, leaving
+        the encoder picker, the Start service button, and the
+        one line "Built-in encoder, dim 64." Nothing is removed:
+        it all returns the moment Local model is picked. The
+        Start service button stays visible in both modes: it is
+        how the service gets running, which is the step before
+        Local model can work at all."""
         self.encoder_combo.blockSignals(True)
         self.encoder_combo.setCurrentIndex(
             1 if (self.encoder_kind == "local"
                   or self._local_pending) else 0)
         self.encoder_combo.blockSignals(False)
+        local_visible = (self.encoder_kind == "local"
+                         or self._local_pending)
+        self.model_combo.setVisible(local_visible)
+        self.model_note.setVisible(local_visible)
+        self.switch_note.setVisible(local_visible)
+        self.complete_button.setVisible(local_visible)
+        self.completion_combo.setVisible(local_visible)
+        self.completion_note.setVisible(local_visible)
         if self.encoder_kind == "local":
             self.model_combo.setEnabled(True)
             self.encoder_label.setText(
@@ -2369,6 +3072,14 @@ class MainWindow(QMainWindow):
             # while the worker owns the engine.
             self._set_encoder_ui()
             return
+        if self._local_thread is not None:
+            # v0.10 (R1): the encoder cannot change while a
+            # local call is in flight: the offer or activation
+            # would land on the wrong state.
+            self.status_label.setText(
+                "Wait for the local model call to finish.")
+            self._set_encoder_ui()
+            return
         if index == 0:
             if self.encoder_kind == "local":
                 self._switch_to_builtin(
@@ -2399,25 +3110,31 @@ class MainWindow(QMainWindow):
         model picker with guided lines. Nothing is activated yet:
         the user picks a model, and that pick activates the local
         encoder. Any failure leaves the built-in encoder in place
-        with a plain message."""
-        if not self.client.probe():
+        with a plain message. v0.10 (R1): the probe and the list
+        run on a worker thread -- with a slow service they took
+        4.21 s on the UI thread. The picker area opens at once
+        (pending), so the mode switch feels immediate; the list
+        fills when the worker lands."""
+        self._local_pending = True
+        self._set_encoder_ui()
+        if not self._start_local_task("offer"):
+            self._local_pending = False
             self._set_encoder_ui()
-            self.status_label.setText(
-                MSG_SERVICE_DOWN + " Press Start service, or stay "
-                "on Built-in.")
-            return
-        try:
-            infos = self.client.list_model_info()
-        except LocalModelError as exc:
+
+    def _on_offer_finished(self, result):
+        """The model-list worker landed, on the UI thread."""
+        if isinstance(result, LocalModelError):
+            self._local_pending = False
             self._set_encoder_ui()
-            self.status_label.setText(str(exc))
+            self.status_label.setText(str(result))
             return
-        if not infos:
+        if not result:
+            self._local_pending = False
             self._set_encoder_ui()
             self.status_label.setText(MSG_NO_MODELS)
             return
         self._local_pending = True
-        self._fill_model_combo(infos)
+        self._fill_model_combo(result)
         self._set_encoder_ui()
         self.status_label.setText(
             "Pick a model to use the local encoder.")
@@ -2428,10 +3145,15 @@ class MainWindow(QMainWindow):
         A probe embedding learns the model's dim first: the engine
         is built at the dim the model actually returns. On failure
         the built-in encoder stays in place with a plain message.
-        """
-        try:
-            probe = self.client.embed(model, "hello")
-        except LocalModelError as exc:
+        v0.10 (R1): the probe embedding runs on a worker thread --
+        with a slow model it took 3.12 s on the UI thread, and a
+        60 s timeout times three retries is ~3 min."""
+        self._start_local_task("activate", model)
+
+    def _on_activate_finished(self, result):
+        """The activation probe landed, on the UI thread."""
+        model = self._local_model_name
+        if isinstance(result, LocalModelError):
             self._set_encoder_ui()
             # A failed model switch leaves the old model active:
             # put its name back in the list so the list never shows
@@ -2447,8 +3169,9 @@ class MainWindow(QMainWindow):
                 self.model_combo.blockSignals(True)
                 self.model_combo.setCurrentIndex(-1)
                 self.model_combo.blockSignals(False)
-            self.status_label.setText(str(exc))
+            self.status_label.setText(str(result))
             return
+        probe = result
         self.encoder_kind = "local"
         self.local_model = model
         self._local_pending = False
@@ -2480,33 +3203,52 @@ class MainWindow(QMainWindow):
             return
         if self.encoder_kind == "local" and name == self.local_model:
             return
+        if self._local_thread is not None:
+            # v0.10 (R1): a local call is already running: put
+            # the picker back on the running model (or
+            # unselected, when only peeking) and wait.
+            self.status_label.setText(
+                "Wait for the local model call to finish.")
+            self.model_combo.blockSignals(True)
+            if self.encoder_kind == "local" and self.local_model:
+                self.model_combo.setCurrentIndex(
+                    self.model_combo.findData(self.local_model))
+            else:
+                self.model_combo.setCurrentIndex(-1)
+            self.model_combo.blockSignals(False)
+            return
         if self._local_pending or self.encoder_kind == "local":
             self._activate_local_model(name)
 
     def on_start_service(self):
-        self.start_button.setEnabled(False)
-        self._set_busy(True)
-        try:
-            ok, message = self.service.start()
-        finally:
-            self.start_button.setEnabled(True)
-            self._set_busy(False)
+        """Start the local model service, off the UI thread
+        (v0.10, R1): with a service that never answers, the
+        15 s wait used to block the window with no cancel. Now
+        the wait runs on a worker thread, the busy light is on,
+        and Cancel abandons the wait."""
+        self._start_local_task("start")
+
+    def _on_start_finished(self, result):
+        """The service start landed, on the UI thread."""
+        ok, message = result
         if ok:
             message += " Pick Local model to use it."
         self.status_label.setText(message)
 
     # -- local calls in a worker thread (v0.9, U30) -------------------
-    def _start_local_call(self, kind, model, text):
-        """Run one local-model call off the UI thread. The busy
-        light goes on, the Step and completion buttons go off (one
-        local call at a time), and Cancel appears. Returns False
-        when a call is already running."""
+    def _launch_local_worker(self, worker, op, model, status_text):
+        """Run one local worker off the UI thread: the shared
+        launch for embedding/completion calls (v0.9) and setup
+        tasks (v0.10, R1). The busy light goes on, the Step and
+        completion buttons go off (one local call at a time),
+        and Cancel appears. Returns False when a call is already
+        running."""
         if self._local_thread is not None:
             self.status_label.setText(
                 "A local model call is already running.")
             return False
         self._local_cancelled = False
-        self._local_op = "step" if kind == "embed" else "complete"
+        self._local_op = op
         # The model name, kept on the window: the worker object is
         # deleted when its thread winds down, possibly before the
         # queued finished handler runs, so the handler must never
@@ -2516,15 +3258,12 @@ class MainWindow(QMainWindow):
         self.step_button.setEnabled(False)
         self.complete_button.setEnabled(False)
         self.cancel_button.show()
-        self.status_label.setText(
-            "Asking the local model..." if kind == "generate"
-            else "Getting the embedding from the local model...")
+        self.status_label.setText(status_text)
         # The thread is unparented on purpose: if the window
         # closes mid-call, the call finishes in the background
         # and its answer is ignored, instead of Qt destroying a
         # running thread with the window.
         thread = QThread()
-        worker = LocalCallWorker(self.client, kind, model, text)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_local_progress)
@@ -2540,6 +3279,36 @@ class MainWindow(QMainWindow):
         self._local_worker = worker
         thread.start()
         return True
+
+    def _start_local_call(self, kind, model, text):
+        """Run one local-model call off the UI thread. Returns
+        False when a call is already running."""
+        worker = LocalCallWorker(self.client, kind, model, text)
+        op = "step" if kind == "embed" else "complete"
+        status = ("Asking the local model..." if kind == "generate"
+                  else "Getting the embedding from the local "
+                  "model...")
+        return self._launch_local_worker(worker, op, model, status)
+
+    def _start_local_task(self, kind, model=None):
+        """Run one setup task off the UI thread (v0.10, R1):
+        "offer" (list the models), "activate" (probe one
+        model's dim), or "start" (start the service). Returns
+        False when a call is already running."""
+        worker = LocalTaskWorker(
+            self.client, self.service, kind, model,
+            stop=lambda: self._local_cancelled)
+        if kind == "offer":
+            status = "Checking the local model service..."
+        elif kind == "activate":
+            status = "Checking the model %s..." % model
+        else:
+            status = "Starting the local model service..."
+        launched = self._launch_local_worker(
+            worker, kind, model, status)
+        if launched and kind == "start":
+            self.start_button.setEnabled(False)
+        return launched
 
     def _clear_local_thread(self):
         """Drop the local-call thread once it has stopped."""
@@ -2566,6 +3335,10 @@ class MainWindow(QMainWindow):
         _clear_local_thread)."""
         self._set_busy(False)
         self.step_button.setEnabled(True)
+        # v0.10 (R1): the start button is disabled only while a
+        # start task runs; re-enabling it here is safe for every
+        # op, since it is enabled whenever no start is running.
+        self.start_button.setEnabled(True)
         self.cancel_button.hide()
         self._local_op = None
         # The completion button's state depends on the picker.
@@ -2574,7 +3347,8 @@ class MainWindow(QMainWindow):
     def _on_local_finished(self, result):
         """A worker call landed, on the UI thread. Cancelled calls
         are thrown away. Errors on a step fall back to the
-        built-in encoder; errors on a completion just say so."""
+        built-in encoder; errors on a completion just say so.
+        Setup tasks (v0.10, R1) land in their own handlers."""
         op = self._local_op
         cancelled = self._local_cancelled
         text = self._pending_step_text
@@ -2582,7 +3356,37 @@ class MainWindow(QMainWindow):
         self._pending_step_text = None
         self._finish_local_call()
         if cancelled:
+            # v0.10 (R1/R4): a cancelled offer drops the pending
+            # peek; a cancelled activation puts the picker back
+            # on the running model (or unselected, when only
+            # peeking); a cancelled example run stops where it
+            # is. The answer is thrown away in all three cases.
+            self._example_queue = []
+            if op == "offer":
+                self._local_pending = False
+                self._set_encoder_ui()
+            elif op == "activate":
+                if self.encoder_kind == "local" and self.local_model:
+                    index = self.model_combo.findData(
+                        self.local_model)
+                    self.model_combo.blockSignals(True)
+                    self.model_combo.setCurrentIndex(index)
+                    self.model_combo.blockSignals(False)
+                else:
+                    self.model_combo.blockSignals(True)
+                    self.model_combo.setCurrentIndex(-1)
+                    self.model_combo.blockSignals(False)
+                self._set_encoder_ui()
             self.status_label.setText("Cancelled.")
+            return
+        if op == "offer":
+            self._on_offer_finished(result)
+            return
+        if op == "activate":
+            self._on_activate_finished(result)
+            return
+        if op == "start":
+            self._on_start_finished(result)
             return
         if isinstance(result, LocalModelError):
             if op == "step":
@@ -2594,6 +3398,10 @@ class MainWindow(QMainWindow):
                     "built-in encoder with a fresh W_t.")
                 self._switch_to_builtin(message)
                 self._run_step(text, None, message)
+                # v0.10 (R4): an example run in flight keeps
+                # going after a fallback: the encoder is
+                # built-in now, so the rest run at once.
+                self._continue_example()
             else:
                 self.logger.action("completion failed: %s" % result)
                 self.status_label.setText(str(result))
@@ -2609,8 +3417,10 @@ class MainWindow(QMainWindow):
                     "W_t.")
                 self._switch_to_builtin(message)
                 self._run_step(text, None, message)
+                self._continue_example()
             else:
                 self._run_step(text, result, None)
+                self._continue_example()
         else:
             self._completion_model = model
             self._completion_text = result.strip()
@@ -2645,6 +3455,7 @@ class MainWindow(QMainWindow):
         self._heat_history.append(
             (entry["id"], _row_change_norms(
                 old_u, old_v, self.engine.u, self.engine.v)))
+        self._trim_heat_history()
         self._full_texts[entry["id"]] = text
         self.logger.action(
             "step %d: resonance %.3f, W norm %.3f -> %.3f"
@@ -2679,6 +3490,71 @@ class MainWindow(QMainWindow):
             self._start_local_call("embed", self.local_model, text)
             return
         self._run_step(text, None, None)
+
+    def on_try_example(self):
+        """Teach by playing (v0.10, R4): step the four theme
+        sentences as real Engine.step calls, through the same
+        path as the Step button. Built-in runs at once; local
+        steps one sentence per worker call, in order. The
+        button only shows while the session is empty, so an
+        example run always starts from step 0."""
+        if self._refuse_if_batch_running():
+            return
+        if self._local_thread is not None:
+            self.status_label.setText(
+                "Wait for the local model call to finish.")
+            return
+        self._clear_completion_mark()
+        if self.encoder_kind == "local":
+            self._example_queue = list(EXAMPLE_SENTENCES)
+            self._step_next_example()
+            return
+        for sentence in EXAMPLE_SENTENCES:
+            self._run_step(sentence, None, None)
+        self.status_label.setText(
+            "Example done: 4 steps on one theme. W_t adapted. "
+            "See the trace log and the resonance views.")
+
+    def _step_next_example(self):
+        """Step the next example sentence on the local encoder,
+        or finish the run when the queue is empty."""
+        if not self._example_queue:
+            self.status_label.setText(
+                "Example done: 4 steps on one theme. W_t "
+                "adapted. See the trace log and the resonance "
+                "views.")
+            return
+        text = self._example_queue.pop(0)
+        self._pending_step_text = text
+        self._start_local_call("embed", self.local_model, text)
+
+    def _continue_example(self):
+        """Keep an example run going after one step landed: the
+        next sentence goes through the worker while the encoder
+        is local, and the rest run at once after a fallback to
+        built-in. A no-op when no example is in flight."""
+        if not self._example_queue:
+            return
+        if self.encoder_kind == "local":
+            self._step_next_example()
+        else:
+            remaining = self._example_queue
+            self._example_queue = []
+            for sentence in remaining:
+                self._run_step(sentence, None, None)
+            self.status_label.setText(
+                "Example done: 4 steps on one theme. W_t "
+                "adapted. See the trace log and the resonance "
+                "views.")
+
+    def _refresh_example(self):
+        """The Try an example button and its label show only
+        while the session is empty (step count 0) and no batch
+        is running: offered, not defaulted (U6)."""
+        show = (self.engine.step_count == 0
+                and not self._batch_running())
+        self.example_button.setVisible(show)
+        self.example_label.setVisible(show)
 
     def on_complete(self):
         """Complete the session's theme with the local model.
@@ -2839,6 +3715,17 @@ class MainWindow(QMainWindow):
 
     def _on_batch_progress(self, done, total, resonance, w_norm,
                            skipped):
+        # v0.10 (R13): the bar and label update at most every
+        # ~100 ms, not per line: per-line updates dominated a
+        # long run (128 ms/step of UI overhead at 280 lines).
+        # The final update always lands, so the bar still
+        # reaches 100%.
+        now = time.monotonic()
+        if (done < total
+                and now - self._last_progress_ui
+                < PROGRESS_UI_INTERVAL):
+            return
+        self._last_progress_ui = now
         bar = self.analyze_window.progress_bar
         bar.setMaximum(max(1, total))
         bar.setValue(done)
@@ -2847,6 +3734,11 @@ class MainWindow(QMainWindow):
             "Line %d of %d (%d steps, %d skipped). Resonance "
             "%.3f, W norm %.3f."
             % (done, total, steps, skipped, resonance, w_norm))
+        # v0.10 (R5): the chart and hero update as steps land,
+        # not only at the end. A snapshot of the trace: the
+        # worker owns the engine until the run lands.
+        self.analyze_window.show_live(
+            list(self.engine.trace), done, total)
 
     def _clear_batch_thread(self):
         """Drop the batch thread once it has stopped."""
@@ -2860,6 +3752,7 @@ class MainWindow(QMainWindow):
         cancelled or failed run keeps the steps it completed:
         they are real steps."""
         self._heat_history.extend(result["heat"])
+        self._trim_heat_history()
         self._full_texts.update(result["texts"])
         self._locators.update(result["locators"])
         self._set_busy(False)
@@ -2871,15 +3764,21 @@ class MainWindow(QMainWindow):
         steps = result["steps"]
         skipped = result["skipped"]
         unreadable = result["unreadable"]
+        # v0.10 (R15): the progress label counts the run's
+        # steps, while the hero counts the session's. Say
+        # which, so the two numbers never look like a
+        # contradiction.
         if result["cancelled"]:
-            note = ("Analysis stopped at %d steps." % steps)
+            note = ("Analysis stopped at %d steps in this run."
+                    % steps)
             self._clear_completion_mark()
         elif result["error"] is not None:
             note = ("The local model service stopped. The "
-                    "analysis stopped at %d steps." % steps)
+                    "analysis stopped at %d steps in this run."
+                    % steps)
             self._clear_completion_mark()
         else:
-            note = ("Analysis done: %d steps." % steps)
+            note = ("Analysis done: %d steps in this run." % steps)
             if skipped:
                 note += " %d lines skipped." % skipped
             self._show_completion_mark()
@@ -3182,6 +4081,7 @@ class MainWindow(QMainWindow):
         self.schedule_combo.setCurrentIndex(
             SCHEDULES.index(preset))
         self._heat_history = heat
+        self._trim_heat_history()
         self._heat_follow = True
         # A loaded session is a different session: the old
         # completion does not carry over.
@@ -3192,6 +4092,19 @@ class MainWindow(QMainWindow):
         self._known_flag_steps = {
             entry["id"] for entry in self.engine.trace
             if entry["new_layer"]}
+        # v0.10 (R15): the restored source note shows in the
+        # Analyze window. The picker is cleared: the loaded
+        # session's source is a record, not a picked file, so
+        # Go says "Pick a file or a folder first" until the user
+        # picks one.
+        self.analyze_window._paths = []
+        self.analyze_window._source_note = source_note
+        if source_note:
+            self.analyze_window.source_label.setText(
+                "Source: %s" % source_note)
+        else:
+            self.analyze_window.source_label.setText(
+                "No file picked yet.")
         self._set_encoder_ui()
         self.logger.action("session loaded from %s" % path)
         self._refresh_all()
@@ -3455,10 +4368,16 @@ class MainWindow(QMainWindow):
                 "Pick a step in the trace log first.")
             return
         step_id = self.engine.trace[row]["id"]
+        # v0.10 (R11): show the effect before committing: the W
+        # norm the revert will land on is the trace entry's
+        # new_norm -- the snapshot holds the same state.
+        target_norm = self.engine.trace[row]["new_norm"]
         answer = QMessageBox.question(
             self, "Revert W_t",
-            "Revert W_t to the state after step %d? The current "
-            "W_t will be replaced." % step_id,
+            "Revert W_t to the state after step %d? W norm will "
+            "go from %.4f to %.4f. The current W_t will be "
+            "replaced."
+            % (step_id, self.engine.w_norm(), target_norm),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer == QMessageBox.Yes:
             self.do_revert(step_id)
@@ -3482,6 +4401,7 @@ class MainWindow(QMainWindow):
         self._heat_history.append(
             (entry["id"], _row_change_norms(
                 old_u, old_v, self.engine.u, self.engine.v)))
+        self._trim_heat_history()
         self._full_texts[entry["id"]] = entry["input"]
         self.logger.action(
             "reverted W_t to step %d: W norm %.3f -> %.3f"
@@ -3493,18 +4413,25 @@ class MainWindow(QMainWindow):
     # -- refresh ------------------------------------------------------
     def _refresh_all(self):
         self.step_label.setText("Step: %d" % self.engine.step_count)
-        self.norm_label.setText(
-            "W norm: %.4f" % self.engine.w_norm())
+        # v0.10 (R15): at step 0 the W norm and the top singular
+        # value are the random starting W_t, not a measurement
+        # of anything the user did. They read "-" until the
+        # first step lands, like Resonance already did: showing
+        # a number would imply a reading that has not happened.
         if self.engine.trace:
+            self.norm_label.setText(
+                "W norm: %.4f" % self.engine.w_norm())
             last = self.engine.trace[-1]
             self.resonance_label.setText(
                 "Resonance: %.4f" % last["resonance"])
+            self.spectral_label.setText(
+                "Top singular value: %.4f"
+                % self.engine.spectral_norm())
         else:
+            self.norm_label.setText("W norm: -")
             self.resonance_label.setText("Resonance: -")
+            self.spectral_label.setText("Top singular value: -")
         self._refresh_alpha_label()
-        self.spectral_label.setText(
-            "Top singular value: %.4f"
-            % self.engine.spectral_norm())
         self._refresh_trace_table()
         self._refresh_buffer_list()
         self._refresh_synthesis()
@@ -3513,6 +4440,25 @@ class MainWindow(QMainWindow):
         self._refresh_layers()
         self._refresh_analysis()
         self._celebrate_new_flags()
+        self._refresh_flag_marker()
+        self._refresh_example()
+
+    def _refresh_flag_marker(self):
+        """The persistent flag marker (v0.10, R7): a gold dot
+        next to the resonance readout, naming the latest
+        flagged step on hover. It stays until the next flag or
+        a reset. Computed from the trace, so a loaded session
+        shows its latest flag too."""
+        flagged = [entry["id"] for entry in self.engine.trace
+                   if entry["new_layer"]]
+        if not flagged:
+            self.flag_marker.hide()
+            return
+        latest = max(flagged)
+        self.flag_marker.setToolTip(
+            "New layer candidate flagged at step %d. See "
+            "Resonance views." % latest)
+        self.flag_marker.show()
 
     def _celebrate_new_flags(self):
         """The resonance moment (v0.9, technique 8): when a step
@@ -3622,6 +4568,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_trace_table(self):
         trace = self.engine.trace
+        # v0.10 (R12): follow only when the user is already at
+        # the bottom. Read the scroll position BEFORE the
+        # rebuild: after it, the scrollbar's range has changed
+        # and the old position is gone.
+        bar = self.trace_table.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum()
         self.trace_table.setRowCount(len(trace))
         for row, entry in enumerate(trace):
             values = [
@@ -3642,14 +4594,48 @@ class MainWindow(QMainWindow):
                     # The flagged row rests at the calm tint
                     # (the chart's red-dot meaning, as a row).
                     item.setBackground(FLAG_TINT)
+                if col == 1:
+                    # v0.10 (R3): the full input, on hover: the
+                    # column holds an 80-character preview.
+                    item.setToolTip(self._entry_text(entry))
                 self.trace_table.setItem(row, col, item)
-        if trace:
+        if trace and at_bottom:
             self.trace_table.scrollToBottom()
+        # v0.10 (R15): Revert is disabled with no steps, and the
+        # empty window shows guidance instead of blank boxes.
+        self.revert_button.setEnabled(bool(trace))
+        self.trace_empty_label.setVisible(not trace)
+        self._refresh_trace_detail()
+
+    def _on_trace_row_picked(self, current, _previous):
+        """A trace row was clicked: show its full input below
+        the table (v0.10, R3)."""
+        self._refresh_trace_detail()
+
+    def _refresh_trace_detail(self):
+        """The full input of the selected trace row, below the
+        table. Blank with no selection. Called from the
+        selection handler and after every table rebuild: the
+        rebuild replaces the items, so the signal alone is not
+        enough."""
+        row = self.trace_table.currentRow()
+        if row < 0 or row >= len(self.engine.trace):
+            self.trace_detail.setText("")
+            return
+        entry = self.engine.trace[row]
+        self.trace_detail.setText(
+            "Step %d: %s" % (entry["id"],
+                             self._entry_text(entry)))
 
     def _refresh_buffer_list(self):
         self.buffer_list.clear()
         for item in reversed(self.engine.buffer):
             self.buffer_list.addItem(item["text"])
+            # v0.10 (R3): the full text, on hover: the list
+            # clips long lines.
+            row = self.buffer_list.item(
+                self.buffer_list.count() - 1)
+            row.setToolTip(item["text"])
 
     def _refresh_synthesis(self):
         # Order: the analogy and counter-examples first, so the
@@ -3702,6 +4688,20 @@ class MainWindow(QMainWindow):
             [entry["new_norm"] for entry in trace],
             [entry["new_layer"] for entry in trace])
 
+    def _trim_heat_history(self):
+        """Bound the heat history (v0.10, R13): keep at most
+        HEAT_HISTORY_LIMIT entries, thinning the oldest half
+        (every other entry) when over. The newest steps stay
+        dense; older steps are sampled, never silently dropped:
+        the step picker still reaches every step, and a step
+        whose data was thinned out says so in the heatmap (see
+        _refresh_heatmap). UI-side state only: the engine's
+        trace keeps every step."""
+        while len(self._heat_history) > HEAT_HISTORY_LIMIT:
+            half = len(self._heat_history) // 2
+            self._heat_history = (self._heat_history[:half:2]
+                                  + self._heat_history[half:])
+
     def _heat_rows_for(self, step_id):
         """Per-row change norms recorded for one step id."""
         for entry_id, rows in self._heat_history:
@@ -3728,7 +4728,17 @@ class MainWindow(QMainWindow):
         self.heat_spin.blockSignals(False)
         step_id = self.heat_spin.value()
         rows = self._heat_rows_for(step_id)
-        if not rows or max(rows) <= 0.0:
+        if not rows:
+            # v0.10 (R13): no change data kept for this step --
+            # a very long run samples the heat history, or the
+            # loaded session did not carry it. Say so, do not
+            # claim W_t stood still.
+            note = ("Step %d: change data was not kept for this "
+                    "step." % step_id)
+            self.heatmap.set_data(rows, step_id, note)
+            self.heat_summary.setText(note)
+            return
+        if max(rows) <= 0.0:
             # v0.3: step 1 never moves W_t (no previous state to
             # predict from), so it is not a frozen step. v0.7: a
             # revert that changed nothing is not a frozen step
@@ -3764,6 +4774,24 @@ class MainWindow(QMainWindow):
         self._heat_follow = (value >= self.heat_spin.maximum())
         self._refresh_heatmap()
 
+    def _on_chart_step_clicked(self, index):
+        """A chart point was clicked or dragged to (v0.10, R6):
+        jump the heatmap and the trace selection to that step.
+        The index is into the trace; the step id comes from the
+        trace itself. The trace scrolls to the row: this is a
+        user-initiated jump, not a refresh yanking the place
+        (R12)."""
+        if index < 0 or index >= len(self.engine.trace):
+            return
+        step_id = self.engine.trace[index]["id"]
+        self.heat_spin.setValue(step_id)
+        row = self._trace_row_for_step(step_id)
+        if row is not None:
+            self.trace_table.setCurrentCell(row, 0)
+            item = self.trace_table.item(row, 0)
+            if item is not None:
+                self.trace_table.scrollToItem(item)
+
     def _refresh_layers(self):
         selected = None
         current = self.layer_list.currentItem()
@@ -3782,6 +4810,8 @@ class MainWindow(QMainWindow):
             item = self.layer_list.item(
                 self.layer_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
+            # v0.10 (R3): the full text, on hover.
+            item.setToolTip(self._entry_text(entry))
             if entry["id"] == selected:
                 restore_row = self.layer_list.count() - 1
         self.layer_list.blockSignals(False)
@@ -3796,6 +4826,9 @@ class MainWindow(QMainWindow):
                 "Click a candidate to see its trace entries.")
 
     def _format_trace_entry(self, entry, label):
+        # v0.10 (R3): the full input, not the 80-character
+        # preview: the detail panes exist to show the whole
+        # entry.
         return (
             "%s\n"
             "  Input: %s\n"
@@ -3803,7 +4836,8 @@ class MainWindow(QMainWindow):
             "  W norm: %.4f -> %.4f\n"
             "  Resonance: %.4f  Alpha: %.2f  Confidence: %.4f\n"
             "  Frozen: %s  Capped: %s"
-            % (label, entry["input"], entry["delta_norm"],
+            % (label, self._entry_text(entry),
+               entry["delta_norm"],
                entry["old_norm"], entry["new_norm"],
                entry["resonance"], entry["alpha"],
                entry["confidence"],
@@ -3843,6 +4877,8 @@ def main(argv=None):
     app = QApplication(sys.argv if argv is None else argv)
     # v0.9 identity (U15): the dark look, on the whole app.
     apply_theme(app)
+    # v0.10 (R9): the big-text preset, when the user saved it.
+    apply_big_text(app, big_text_enabled())
     # v0.9 single instance (U27): re-clicking the icon focuses the
     # running app, never starts a second copy. QLockFile plus a
     # QLocalServer: the second launch asks the first to raise,

@@ -361,10 +361,34 @@ class BatchCancelTests(BatchWindowCase):
         self.server.server_close()
 
     def _go_local(self):
+        # v0.10: the offer and the activation run on worker
+        # threads. Wait for the list AND the thread to clear
+        # before picking: the thread reference outlives the
+        # fill by a pump cycle, and a pick in that gap is
+        # refused (and start_batch refuses while a local call
+        # is running, so the batch would never start).
         self.window.encoder_combo.setCurrentIndex(1)
         combo = self.window.model_combo
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if (combo.count() > 0
+                    and self.window._local_thread is None):
+                break
+            time.sleep(0.05)
+            QApplication.processEvents()
+        self.assertGreater(combo.count(), 0,
+                           "model offer did not land")
         combo.setCurrentIndex(
             combo.findData("nomic-embed-text:latest"))
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if (self.window.encoder_kind == "local"
+                    and self.window._local_thread is None):
+                break
+            time.sleep(0.05)
+            QApplication.processEvents()
+        self.assertEqual(self.window.encoder_kind, "local",
+                         "model did not activate")
 
     def test_cancel_stops_mid_file(self):
         self._go_local()
@@ -813,11 +837,14 @@ class PackTests(BatchWindowCase):
         self.assertIn("fewer than 2 rows", readme)
         self.assertIn("STELLA needs 2 or more rows", readme)
         # And the window says so plainly too.
+        # v0.10 (R11): export previews first, then Write saves
+        # the packs. The warning lands on the write.
+        self.window.analyze_window.on_export_stella_packs()
         with mock.patch(
                 "acr_app.QFileDialog.getExistingDirectory",
                 return_value=os.path.join(self.tmp.name,
                                           "packs2")):
-            self.window.analyze_window.on_export_stella_packs()
+            self.window.analyze_window.on_write_stella_packs()
         self.assertIn("fewer than 2 rows",
                       self.window.status_label.text())
 

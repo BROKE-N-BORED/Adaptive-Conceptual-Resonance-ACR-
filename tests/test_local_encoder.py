@@ -407,10 +407,13 @@ class WindowCase(FakeServerCase):
     def _wait_idle(self, timeout=25.0):
         # v0.9: local steps run in a worker thread. Built-in steps
         # are synchronous, so this returns at once for them.
+        return self._wait_idle_for(self.window, timeout)
+
+    def _wait_idle_for(self, window, timeout=25.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if (self.window._local_thread is None
-                    and self.window._batch_thread is None):
+            if (window._local_thread is None
+                    and window._batch_thread is None):
                 return True
             QTest.qWait(50)
         return False
@@ -431,13 +434,40 @@ class WindowCase(FakeServerCase):
     def _switch_local(self):
         # v0.9: picking "Local model" only OFFERS the models. The
         # encoder stays built-in until a model is picked (U39+U6).
+        # v0.10: the offer runs on a worker thread. Wait for it
+        # to land: either the list is filled or the picker
+        # bounced back to Built-in (service down, no models).
+        # Either way, wait for the thread to clear too: the
+        # thread reference outlives the fill by a pump cycle,
+        # and picking a model in that gap is refused.
         self.window.encoder_combo.setCurrentIndex(1)
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if self.window._local_thread is None and (
+                    self.window.model_combo.count() > 0
+                    or self.window.encoder_combo.currentIndex()
+                    == 0):
+                return
+            QTest.qWait(50)
+        raise AssertionError("model offer did not land")
 
     def _pick_model(self, name):
         combo = self.window.model_combo
         index = combo.findData(name)
         self.assertNotEqual(index, -1, "model %r not listed" % name)
         combo.setCurrentIndex(index)
+        # v0.10: activation runs on a worker thread. Wait for
+        # the model to become the encoder, and for the thread
+        # to clear: the encoder flips in the finished handler,
+        # before the thread reference clears, and a step or a
+        # switch in that gap is refused.
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if (self.window.local_model == name
+                    and self.window._local_thread is None):
+                return
+            QTest.qWait(50)
+        raise AssertionError("model %r did not activate" % name)
 
     def _go_local(self, name="nomic-embed-text:latest"):
         self._switch_local()
@@ -518,6 +548,13 @@ class EncoderSwitchTests(WindowCase):
         window.show()
         try:
             window.encoder_combo.setCurrentIndex(1)
+            # v0.10: the offer runs on a worker thread. Wait for
+            # the picker to bounce back to Built-in.
+            deadline = time.time() + 25.0
+            while time.time() < deadline:
+                if window.encoder_combo.currentIndex() == 0:
+                    break
+                QTest.qWait(50)
             self.assertEqual(window.encoder_kind, "builtin")
             self.assertEqual(window.encoder_combo.currentIndex(), 0)
             self.assertIn("not running",
@@ -583,9 +620,12 @@ class EncoderSwitchTests(WindowCase):
 
 class StartServiceTests(WindowCase):
     def test_start_when_running_says_so(self):
+        # v0.10: the start runs on a worker thread, so the mock
+        # stays in place until the worker lands.
         with mock.patch(
                 "acr_app.QProcess.startDetached") as detached:
             QTest.mouseClick(self.window.start_button, Qt.LeftButton)
+            self.assertTrue(self._wait_idle())
             detached.assert_not_called()
         self.assertIn("is running", self.window.status_label.text())
 
@@ -601,6 +641,7 @@ class StartServiceTests(WindowCase):
                     mock.patch("acr_app.QProcess.startDetached",
                                return_value=(True, 123)) as detached:
                 QTest.mouseClick(window.start_button, Qt.LeftButton)
+                self.assertTrue(self._wait_idle_for(window))
             detached.assert_called_once_with("ollama", ["serve"])
             self.assertIn("is running", window.status_label.text())
         finally:
@@ -617,6 +658,7 @@ class StartServiceTests(WindowCase):
                     mock.patch(
                         "acr_app.QProcess.startDetached") as detached:
                 QTest.mouseClick(window.start_button, Qt.LeftButton)
+                self.assertTrue(self._wait_idle_for(window))
             detached.assert_not_called()
             self.assertIn("not installed",
                           window.status_label.text())
@@ -634,6 +676,7 @@ class StartServiceTests(WindowCase):
                     mock.patch("acr_app.QProcess.startDetached",
                                return_value=(False, 0)):
                 QTest.mouseClick(window.start_button, Qt.LeftButton)
+                self.assertTrue(self._wait_idle_for(window))
             self.assertIn("did not start", window.status_label.text())
         finally:
             window.close()

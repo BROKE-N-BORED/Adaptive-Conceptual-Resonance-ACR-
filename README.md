@@ -1,4 +1,4 @@
-# ACR v0.9 - Adaptive Contextual Resonance
+# ACR v0.10 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
@@ -77,7 +77,9 @@ synthesis head. The rest lives in its own window, opened from View.
 1. Type a sentence in the input box.
 2. Press Step, or Enter in the input box. The readouts update, a
    row appears in the trace log, and the synthesis head shows
-   related past inputs.
+   related past inputs. New here? Try an example (on the empty
+   main window) steps four sentences on one theme for you, so you
+   can see the loop work before typing anything.
 3. Step a few sentences on one theme and watch the resonance climb.
    Switch themes and watch it drop.
 4. The Controls window holds the learning controls. Alpha (the
@@ -103,6 +105,11 @@ synthesis head. The rest lives in its own window, opened from View.
    (pick a step to look back, or leave it on the latest), and the
    layer candidates: resonance spikes with the input that
    triggered them. Click a candidate to see its trace entries.
+   Hover over the chart to see a step's values; click a point
+   (or drag across the chart) to jump the heatmap and the trace
+   selection to that step. When a layer is flagged, a gold dot
+   stays next to the resonance readout on the main window until
+   the next flag or a reset.
 7. Save session writes the whole session (W_t, buffer, trace,
    settings) to one JSON file. Load session brings it back exactly
    where you left off. Export session writes the same session as
@@ -125,9 +132,11 @@ synthesis head. The rest lives in its own window, opened from View.
    encoder with a fresh W_t and says so plainly. Sessions remember
    which encoder they used: a session saved with the local encoder
    needs the service running (with that model installed) to load
-   back. Local-model calls run in a worker thread, so the window
-   stays responsive while the model works; the busy light is lit
-   and Cancel is offered.
+   back. Every local-model call runs in a worker thread, so the
+   window stays responsive while the model works: the model list,
+   the activation probe, and starting the service, as well as
+   embeddings and completions. The busy light is lit and Cancel
+   is offered; starting the service can be abandoned mid-wait.
 10. The synthesis head shows more than neighbours now: an Analogy
     (like one resonant input is to another, your input points at
     a third past input), and Counter-examples (the past inputs
@@ -141,8 +150,9 @@ synthesis head. The rest lives in its own window, opened from View.
     stepping never generates anything.
 11. Revert: click a step in the trace log, then Revert W_t to
     selected step, to roll W_t back to its state after that
-    step. It asks first, and the trace log keeps a revert entry
-    so the history shows what happened. The last 200 steps are
+    step. It asks first, and shows the W norm the revert will
+    land on, and the trace log keeps a revert entry so the
+    history shows what happened. The last 200 steps are
     kept for reverting on an 8 GB machine; the limit adapts to
     the machine's RAM (fewer on smaller machines, more on bigger
     ones), because snapshots are real memory. Older steps age out.
@@ -153,17 +163,21 @@ synthesis head. The rest lives in its own window, opened from View.
     file or a folder of them, in file order. Plain text, .md, and
     .jsonl all work; a .jsonl record uses its text field. The
     progress bar shows how far along it is, Cancel stops it, and
-    the steps it finished stay in the trace like typed ones. When
-    it finishes, the results land as tiles: one big tile for the
-    headline (themes found and the strongest theme), then tiles
+    the steps it finished stay in the trace like typed ones. While
+    it runs, the chart and the headline tile update as steps land.
+    When it finishes, the results land as tiles: one big tile for
+    the headline (themes found and the strongest theme), then tiles
     for the resonance chart over the run, the themes found, the
     core entries (the most resonant: the heart of the file), the
     outliers (the noise and off-topic lines), and the theme shifts
-    (where the topic changes). Export curated file saves the core
-    entries as plain
+    (where the topic changes). Hover over a finding to see the
+    whole entry; double-click one to read it in full. Export
+    curated file saves the core entries as plain
     text, one per line; Export curated .jsonl saves them as one
     {"text": ...} object per line; Export report saves the whole
-    analysis as readable text. Export STELLA data pack writes one
+    analysis as readable text. Export STELLA data pack first shows
+    a preview of the packs it is about to write (names, row counts,
+    first rows); Write these packs saves them. Each pack is one
     training-data pack per theme found (a folder with a .jsonl
     file of training rows, a README, and a manifest), plus one
     off-topic pack for the entries that belong to no theme. The
@@ -175,7 +189,13 @@ synthesis head. The rest lives in its own window, opened from View.
 
 Every window remembers its size and position between runs.
 Re-clicking the icon focuses the running app; it never starts a
-second copy.
+second copy. The View menu shows which windows are open, and
+opens or closes them. Keyboard: Tab moves in visual order, the
+input has the focus at launch, and every menu action has a
+shortcut (Ctrl+S save, Ctrl+O load, Ctrl+Q quit, Ctrl+1 to Ctrl+4
+for the windows, F1 for How to Use; the full list is in the How
+to Use guide). The View menu also carries Reduced motion and Big
+text: one tap each, saved between runs.
 
 The app has a dark look drawn from its icon: deep dark surfaces,
 gold for resonance, blue as the secondary. When the loop flags a

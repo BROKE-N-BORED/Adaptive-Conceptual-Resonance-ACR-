@@ -360,11 +360,28 @@ class LocalWindowCase(unittest.TestCase):
             timeout=timeout)
 
     def _go_local(self):
+        # v0.10: the offer and the activation run on worker
+        # threads. Wait for the list to fill, then for the
+        # activation to land.
         self.window.encoder_combo.setCurrentIndex(1)
         combo = self.window.model_combo
+        # Wait for the list AND the thread to clear: the thread
+        # reference outlives the fill by a pump cycle, and a
+        # pick in that gap is refused.
+        self.assertTrue(_pump_until(
+            lambda: (combo.count() > 0
+                     and self.window._local_thread is None),
+            timeout=25.0),
+            "model offer did not land")
         combo.setCurrentIndex(
             combo.findData("nomic-embed-text:latest"))
-        self.assertEqual(self.window.encoder_kind, "local")
+        # The encoder flips in the finished handler, before
+        # the thread reference clears: wait for both, or the
+        # next step is refused.
+        self.assertTrue(_pump_until(
+            lambda: (self.window.encoder_kind == "local"
+                     and self.window._local_thread is None),
+            timeout=25.0), "model did not activate")
 
 
 class BusyLightTests(LocalWindowCase):
@@ -464,6 +481,10 @@ class ModelPickerTests(unittest.TestCase):
     def test_picker_starts_unselected_with_fit_info(self):
         self.window.encoder_combo.setCurrentIndex(1)
         combo = self.window.model_combo
+        # v0.10: the offer runs on a worker thread.
+        self.assertTrue(_pump_until(
+            lambda: combo.count() == 2, timeout=25.0),
+            "model offer did not land")
         self.assertEqual(combo.count(), 2)
         self.assertEqual(combo.currentIndex(), -1)
         self.assertEqual(combo.placeholderText(), "Pick a model")
@@ -737,7 +758,8 @@ class BentoTests(WindowCase):
         self.assertTrue(self._run_batch([path]))
         analyze = self.window.analyze_window
         self.assertEqual(analyze.hero_title.text(),
-                         "1 theme found in 24 steps")
+                         "1 theme found in 24 steps in this "
+                         "session")
         self.assertIn("Strongest theme",
                       analyze.hero_theme.text())
         self.assertIn("quantum particles stay connected",
@@ -773,7 +795,8 @@ class BentoTests(WindowCase):
         self.assertTrue(self._run_batch([path], "mixed.txt"))
         analyze = self.window.analyze_window
         self.assertEqual(analyze.hero_title.text(),
-                         "0 themes found in 2 steps")
+                         "0 themes found in 2 steps in this "
+                         "session")
         self.assertIn("No resonance spikes",
                       analyze.hero_theme.text())
 
@@ -861,10 +884,15 @@ class CompletionMomentTests(WindowCase):
         self.assertTrue(self._run_batch([path]))
         self.window.completion_mark.clear()
         dest = os.path.join(self.tmp.name, "packs")
+        # v0.10 (R11): export previews first, then Write saves
+        # the packs. The mark lands on the write, not the
+        # preview.
+        self.window.analyze_window.on_export_stella_packs()
+        self.assertFalse(self.window.completion_mark.isVisible())
         with mock.patch(
                 "acr_app.QFileDialog.getExistingDirectory",
                 return_value=dest):
-            self.window.analyze_window.on_export_stella_packs()
+            self.window.analyze_window.on_write_stella_packs()
         self.assertTrue(self.window.completion_mark.isVisible())
 
     def test_completion_mark_clears_on_next_step(self):
