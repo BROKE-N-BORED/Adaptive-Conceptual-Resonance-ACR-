@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 import local_encoder  # noqa: E402
 from acr_app import MainWindow, _row_change_norms  # noqa: E402
@@ -532,7 +532,12 @@ class EncoderSwitchTests(WindowCase):
         FakeLocalHandler.models = ["zzz:1b", "aaa:1b"]
         self._switch_local()
         self.assertEqual(self.window.model_combo.count(), 2)
-        self._pick_model("aaa:1b")
+        # v0.11 (A14): "aaa:1b" is a text model, so the pick
+        # warns first. Yes: the test is about the pick, not the
+        # warning.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Yes):
+            self._pick_model("aaa:1b")
         self.assertEqual(self.window.local_model, "aaa:1b")
 
     def test_switch_to_local_no_models(self):
@@ -570,7 +575,12 @@ class EncoderSwitchTests(WindowCase):
         self._switch_local()
         self.assertEqual(self.window.step_label.text(), "Step: 3")
         self.assertEqual(self.window.trace_table.rowCount(), 3)
-        self._pick_model("nomic-embed-text:latest")
+        # v0.11 (B1): both switches wipe a dirty session, so the
+        # confirm fires. Discard, both times: the test is about
+        # the wipe, not the save.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Discard):
+            self._pick_model("nomic-embed-text:latest")
         self.assertEqual(self.window.step_label.text(), "Step: 0")
         self.assertEqual(self.window.trace_table.rowCount(), 0)
         self.assertEqual(self.window.buffer_list.count(), 0)
@@ -578,7 +588,9 @@ class EncoderSwitchTests(WindowCase):
         # And back again: fresh again, dim 64.
         self._step_text("local step one")
         self.assertEqual(self.window.step_label.text(), "Step: 1")
-        self.window.encoder_combo.setCurrentIndex(0)
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Discard):
+            self.window.encoder_combo.setCurrentIndex(0)
         self.assertEqual(self.window.encoder_kind, "builtin")
         self.assertEqual(self.window.engine.dim, DIM)
         self.assertEqual(self.window.step_label.text(), "Step: 0")
@@ -588,7 +600,15 @@ class EncoderSwitchTests(WindowCase):
         self._go_local()
         self._step_theme(2)
         self.assertEqual(self.window.step_label.text(), "Step: 2")
-        self._pick_model("other:1b")
+        # v0.11 (B1/A14): the switch wipes a dirty session AND
+        # the new model is a text model, so two dialogs fire in
+        # order: the save confirm (Discard), then the text-model
+        # warning (Yes, use it anyway).
+        with mock.patch(
+                "acr_app.QMessageBox.question",
+                side_effect=[QMessageBox.Discard,
+                             QMessageBox.Yes]):
+            self._pick_model("other:1b")
         self.assertEqual(self.window.local_model, "other:1b")
         self.assertEqual(self.window.step_label.text(), "Step: 0")
         self.assertEqual(self.window.trace_table.rowCount(), 0)
@@ -763,7 +783,13 @@ class SessionVersionTests(WindowCase):
         self.server.shutdown()
         self.server.server_close()
         # Live session: two builtin steps to prove it stays put.
-        self.window.encoder_combo.setCurrentIndex(0)
+        # v0.11 (B1): the saved session is still dirty here --
+        # save_session_to is the plain writer, only the
+        # interactive save marks it clean -- so the switch
+        # confirms. Discard: the file already has the session.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Discard):
+            self.window.encoder_combo.setCurrentIndex(0)
         self._step_theme(2)
         with self.assertRaises(SessionError) as ctx:
             self.window.load_session_from(path)
@@ -808,7 +834,12 @@ class SessionVersionTests(WindowCase):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
         self.assertIn("Encoder: built-in (dim 64)", text)
-        self._go_local()
+        # v0.11 (B1): the two builtin steps are unsaved, so the
+        # switch confirms. Discard: the test is about the export
+        # text, not the save.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Discard):
+            self._go_local()
         self._step_theme(2)
         self.window.export_session_to(path)
         with open(path, encoding="utf-8") as fh:

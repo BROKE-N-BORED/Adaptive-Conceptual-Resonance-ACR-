@@ -57,6 +57,14 @@ OFF = ["the toaster needs a new heating element",
        "my phone screen cracked last night",
        "the plumber fixed the leaking tap",
        "we watched a film about sailing"]
+# v0.11: the audit's second theme (mixed.txt). Twelve fiscal
+# steps peak at 0.235 -- a weak theme, but below the 0.4
+# resonant floor, so no entry is resonant enough for an
+# analogy row.
+FISCAL = ["the quarterly budget needs approval",
+          "fiscal policy shapes interest rates",
+          "the treasury issued new bonds today",
+          "inflation rose faster than expected"]
 
 
 def setUpModule():
@@ -140,17 +148,25 @@ class SummarizeTests(unittest.TestCase):
         summary = summarize_run(engine.trace)
         self.assertEqual(summary["steps"], 24)
         self.assertEqual(len(summary["themes"]), 1)
-        self.assertEqual(summary["themes"][0]["id"], 15)
+        # v0.11 (B2): the theme trigger is the first step that
+        # crossed the calibrated 0.4 threshold, step 12 -- not
+        # the old jump-rule flag at step 15.
+        self.assertEqual(summary["themes"][0]["id"], 12)
         self.assertEqual(summary["themes"][0]["input"],
-                         "quantum particles stay connected")
+                         "entanglement links distant particles")
         self.assertEqual([e["id"] for e in summary["shifts"]],
                          [17])
         core_texts = [e["input"] for e in summary["core"]]
         self.assertIn("quantum entanglement links particles",
                       core_texts)
         outlier_texts = [e["input"] for e in summary["outliers"]]
-        self.assertIn("the toaster needs a new heating element",
+        # v0.11 (A2): core and outliers are exclusive -- the
+        # toaster line is in core here (8th of 12 distinct
+        # texts), so it cannot also be an outlier. The two
+        # lowest texts are the outliers.
+        self.assertIn("I need to buy milk and bread",
                       outlier_texts)
+        self.assertFalse(set(core_texts) & set(outlier_texts))
 
     def test_pure_theme_run_has_no_shifts(self):
         lines = [THEME[i % 4] for i in range(16)]
@@ -606,7 +622,8 @@ class PackTests(BatchWindowCase):
         self.assertEqual(len(folders), 2)
         theme_folder = [f for f in folders
                         if f.startswith(
-                            "quantum-particles-stay-connected-")]
+                            "entanglement-links-distant-"
+                            "particles-")]
         off_folder = [f for f in folders
                       if f.startswith("fixture-off-topic-")]
         self.assertEqual(len(theme_folder), 1)
@@ -625,8 +642,12 @@ class PackTests(BatchWindowCase):
                 os.path.join(folder, "manifest.json")))
         theme_rows, _m, _r = self._read_pack(theme_folder)
         off_rows, _m, _r = self._read_pack(off_folder)
-        self.assertEqual(len(theme_rows), 12)
-        self.assertEqual(len(off_rows), 9)
+        # v0.11 (B2/B3): span membership puts all four theme
+        # sentences in the theme pack (4 entries x 4 row kinds),
+        # and the off-topic pack holds the 6 core entries with
+        # no theme plus the 2 outliers-only entries.
+        self.assertEqual(len(theme_rows), 16)
+        self.assertEqual(len(off_rows), 8)
 
     def test_rows_are_prompt_completion_shaped(self):
         theme_folder, off_folder = self._theme_and_off_topic()
@@ -648,12 +669,14 @@ class PackTests(BatchWindowCase):
         membership = [row for row in rows
                       if row["prompt"].startswith(
                           "What theme does this belong to?")]
-        self.assertEqual(len(membership), 3)
+        # v0.11 (B2): all four theme sentences are members now
+        # (span membership, not the resonance floor), and the
+        # theme label is the step-12 trigger text, verbatim.
+        self.assertEqual(len(membership), 4)
         for row in membership:
-            # The theme label is the trigger text, verbatim.
             self.assertEqual(
                 row["completion"],
-                "quantum particles stay connected")
+                "entanglement links distant particles")
             subject = row["prompt"].split("? ", 1)[1]
             self.assertIn(subject, THEME)
 
@@ -663,7 +686,8 @@ class PackTests(BatchWindowCase):
         matches = [row for row in rows
                    if row["prompt"].startswith(
                        "What is most related to this?")]
-        self.assertEqual(len(matches), 3)
+        # v0.11 (B2): four theme members, four match rows.
+        self.assertEqual(len(matches), 4)
         # The expected neighbour, computed independently from
         # the engine's own buffer and cosine: the distinct text
         # with the highest positive score to the subject, never
@@ -700,13 +724,16 @@ class PackTests(BatchWindowCase):
             export_stella_packs_to(packs_dir)
         self.assertIsNone(result["error"])
         folders = os.listdir(packs_dir)
-        # Two packs: the theme pack, plus the off-topic pack for
-        # the step-14 dip entry (below the floor, so it belongs
-        # to no theme). The analogy row lives in the theme pack.
-        self.assertEqual(len(folders), 2)
+        # v0.11 (B2): one pack only. The step-14 dip entry
+        # ("entangled particles share a state", resonance 0.219)
+        # used to fall below the floor and land in an off-topic
+        # pack; span membership puts it in the theme it belongs
+        # to. The analogy row lives in the theme pack.
+        self.assertEqual(len(folders), 1)
         theme_folder = [f for f in folders
                         if f.startswith(
-                            "quantum-particles-stay-connected-")]
+                            "entanglement-links-distant-"
+                            "particles-")]
         self.assertEqual(len(theme_folder), 1)
         rows, _m, _r = self._read_pack(
             os.path.join(packs_dir, theme_folder[0]))
@@ -723,10 +750,15 @@ class PackTests(BatchWindowCase):
                          head["result"][0])
 
     def test_no_analogy_rows_when_floor_not_met(self):
-        packs_dir, _result = self._export([
-            "quantum entanglement links particles",
-            "the toaster needs a new heating element",
-        ], "mixed.txt")
+        # v0.11 (B2/B3): the old two-line fixture finds no theme
+        # now, so it writes no packs at all -- the floor case
+        # needs a run that DOES find a theme but has no resonant
+        # entries. Twelve fiscal steps are a weak theme (peak
+        # 0.235, below the 0.4 floor): packs exist, but no
+        # analogy row can be built from fewer than two resonant
+        # entries.
+        packs_dir, _result = self._export(
+            [FISCAL[i % 4] for i in range(12)], "fiscal.txt")
         self.assertLess(
             max(e["resonance"]
                 for e in self.window.engine.trace),
@@ -752,16 +784,20 @@ class PackTests(BatchWindowCase):
         theme_judgments = [
             row for row in theme_rows
             if row["prompt"].startswith("Is this central")]
-        self.assertEqual(len(theme_judgments), 3)
+        # v0.11 (B2): four theme members, four central
+        # judgments, naming the step-12 trigger.
+        self.assertEqual(len(theme_judgments), 4)
         for row in theme_judgments:
             self.assertEqual(
                 row["completion"],
-                "Central to quantum particles stay connected")
+                "Central to entanglement links distant particles")
         off_rows, _m, _r = self._read_pack(off_folder)
         off_judgments = [
             row for row in off_rows
             if row["prompt"].startswith("Is this central")]
-        self.assertEqual(len(off_judgments), 9)
+        # v0.11 (A2/B2): 6 core entries with no theme plus the
+        # 2 outliers-only entries.
+        self.assertEqual(len(off_judgments), 8)
         subjects = set()
         for row in off_judgments:
             self.assertEqual(row["completion"], "Off-topic")
@@ -809,30 +845,41 @@ class PackTests(BatchWindowCase):
         theme_folder, off_folder = self._theme_and_off_topic()
         _rows, _m, readme = self._read_pack(theme_folder)
         self.assertIn("fixture.txt", readme)
-        self.assertIn("quantum particles stay connected", readme)
+        self.assertIn("entanglement links distant particles",
+                      readme)
         self.assertIn("Extractor used: ACR resonance analysis",
                       readme)
         self.assertIn("Every entry is quoted verbatim", readme)
         self.assertIn("Nothing was invented", readme)
-        self.assertIn("Theme membership: 3", readme)
-        self.assertIn("Resonance judgment: 3", readme)
+        self.assertIn("Theme membership: 4", readme)
+        self.assertIn("Resonance judgment: 4", readme)
         _rows, _m, off_readme = self._read_pack(off_folder)
         self.assertIn("fixture.txt", off_readme)
         self.assertIn("## Excluded", off_readme)
         self.assertIn("No theme membership row", off_readme)
 
     def test_under_minimum_pack_written_with_warning(self):
-        path = self._fixture("one.txt",
-                             ["quantum entanglement links "
-                              "particles"])
+        # v0.11 (B3): the old one-line fixture finds no theme
+        # now, so it writes no packs at all -- the under-minimum
+        # case needs a run with a theme AND exactly one entry
+        # outside it. Sixteen theme steps plus one off-topic
+        # line: the theme pack has 16 rows, the off-topic pack
+        # has 1 judgment row, under the minimum.
+        path = self._fixture(
+            "one.txt",
+            [THEME[i % 4] for i in range(16)]
+            + ["the toaster needs a new heating element"])
         self.assertTrue(self._run_batch([path], "one.txt"))
         packs_dir = os.path.join(self.tmp.name, "packs")
         result = self.window.analyze_window.\
             export_stella_packs_to(packs_dir)
-        self.assertEqual(len(result["packs"]), 1)
-        folder, rows, under = result["packs"][0]
+        self.assertEqual(len(result["packs"]), 2)
+        under_packs = [(folder, rows)
+                       for folder, rows, under in result["packs"]
+                       if under]
+        self.assertEqual(len(under_packs), 1)
+        folder, rows = under_packs[0]
         self.assertEqual(rows, 1)
-        self.assertTrue(under)
         _rows, _m, readme = self._read_pack(folder)
         self.assertIn("fewer than 2 rows", readme)
         self.assertIn("STELLA needs 2 or more rows", readme)

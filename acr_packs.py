@@ -37,13 +37,18 @@ all prompt/completion:
   off-topic? <entry>" -> "Central to <theme>" or "Off-topic".
   One per entry judged (the core entries and the outliers).
 
-An entry belongs to a theme when its resonance is at or above
-the resonant floor (0.4, the same floor the synthesis head uses)
-and the theme is the nearest layer candidate by step. A row goes
-in the pack of the theme its subject entry belongs to. Entries
-in no theme get judgment rows only, in a single off-topic pack;
-their other row kinds are listed as excluded in that pack's
-README, never silently skipped (U32).
+An entry belongs to a theme when its step falls inside one of
+the theme's spans (v0.11: themes are sustained stretches of a
+run, found by segmentation, not single resonance spikes -- see
+find_themes in acr_app.py). A row goes in the pack of the theme
+its subject entry belongs to. Entries in no theme get judgment
+rows only, in a single off-topic pack; their other row kinds are
+listed as excluded in that pack's README, never silently skipped
+(U32). When a run finds no themes at all, no judgment rows are
+written: with no theme to be central to, calling the run's most
+resonant entries "Off-topic" would teach STELLA backwards (user
+audit 2026-11-16, B3), so a no-theme run writes no packs and
+says so plainly.
 
 This module is pure: no Qt, no engine import beyond the shared
 vector helpers and the resonant floor. The window gathers the
@@ -110,12 +115,31 @@ def source_slug(source_note):
 
 
 def assign_theme(entry, themes):
-    """The theme an entry belongs to, or None: the nearest layer
-    candidate by step, when the entry's resonance is at or above
-    the resonant floor. Below the floor, or with no themes at
-    all, the entry belongs to no theme. Ties go to the earlier
-    theme."""
-    if not themes or entry["resonance"] < RESONANT_FLOOR:
+    """The theme an entry belongs to, or None.
+
+    v0.11: a theme is a sustained stretch of the run, and it
+    carries its spans (start and end step ids). An entry belongs
+    to the theme whose span contains its step -- no resonance
+    floor: a quiet sentence inside a theme block is still part
+    of the theme (a fiscal sentence that never scores above 0.14
+    belongs to the fiscal theme, and the theme's lowest scorer
+    belongs to its own theme). An entry in no span belongs to no
+    theme, however close the nearest trigger step is.
+
+    Theme dicts without spans (older callers, and the unit tests'
+    synthetic themes) keep the old rule: the nearest theme by
+    step, when the entry's resonance is at or above the resonant
+    floor. Below the floor, or with no themes at all, the entry
+    belongs to no theme. Ties go to the earlier theme."""
+    if not themes:
+        return None
+    if any("spans" in theme for theme in themes):
+        for theme in themes:
+            for start, end in theme.get("spans", []):
+                if start <= entry["id"] <= end:
+                    return theme
+        return None
+    if entry["resonance"] < RESONANT_FLOOR:
         return None
     return min(themes,
                key=lambda t: (abs(t["id"] - entry["id"]),
@@ -194,7 +218,11 @@ def build_pack_rows(summary, item_of, context, source_note):
     pack), rows (each a (row dict, manifest entry dict) pair),
     excluded (plain-words reasons), sources (distinct item
     sources). One pack per theme that has rows, plus one
-    off-topic pack when any entry belongs to no theme.
+    off-topic pack when any entry belongs to no theme -- except
+    when the run found no themes at all, in which case no packs
+    are planned: with no theme to be central to, no entry can be
+    judged off-topic (B3), so the run honestly has nothing to
+    teach. Packs with no rows are never returned.
 
     item_of maps a trace entry to {"source", "locator", "text"}.
     context holds "vectors" (step id to embedding, from the
@@ -328,11 +356,22 @@ def build_pack_rows(summary, item_of, context, source_note):
                     "Is this central to the theme or off-topic? "
                     "%s" % text,
                     "Central to %s" % theme_text, entry)
-        else:
+        elif themes:
+            # Themes exist and this entry is in none of them:
+            # genuinely off-topic.
             add_row(off_topic, KIND_JUDGMENT,
                     "Is this central to the theme or off-topic? "
                     "%s" % text,
                     "Off-topic", entry)
+        else:
+            # v0.11 (B3): no themes were found in this run, so
+            # centrality cannot be judged at all. Calling the
+            # run's most resonant entries "Off-topic" taught
+            # STELLA backwards: no judgment row, and the reason
+            # is recorded, not silent.
+            exclude(off_topic, KIND_JUDGMENT, entry,
+                    "no theme was found in this run, so "
+                    "centrality cannot be judged")
         judged.add(text)
 
     for entry in outliers:
@@ -348,14 +387,22 @@ def build_pack_rows(summary, item_of, context, source_note):
                     "%s" % text,
                     "Central to %s" % item_of(theme)["text"],
                     entry)
-        else:
+        elif themes:
             pack = pack_for(None)
             add_row(pack, KIND_JUDGMENT,
                     "Is this central to the theme or off-topic? "
                     "%s" % text,
                     "Off-topic", entry)
+        else:
+            # v0.11 (B3): no themes, no judgment -- see above.
+            exclude(pack_for(None), KIND_JUDGMENT, entry,
+                    "no theme was found in this run, so "
+                    "centrality cannot be judged")
 
-    return [packs[key] for key in order]
+    # Packs with no rows are not returned: a no-theme run's
+    # off-topic pack only ever holds exclusions, and an empty
+    # pack would be a folder with nothing to teach.
+    return [packs[key] for key in order if packs[key]["rows"]]
 
 
 def _readme_text(pack_name, purpose, sources, rows, excluded,
@@ -490,7 +537,15 @@ def export_stella_packs(summary, item_of, context, dest_dir,
     packs = build_pack_rows(summary, item_of, context,
                             source_note)
     if not packs:
-        return {"packs": [], "error": "Nothing analyzed yet."}
+        if summary["steps"] == 0:
+            error = "Nothing analyzed yet."
+        else:
+            # v0.11 (B3): steps ran, but no themes were found, so
+            # there is nothing to teach. Say which, so the
+            # message never reads as "you did nothing".
+            error = ("No themes were found in this run, so no "
+                     "packs can be written.")
+        return {"packs": [], "error": error}
     written = []
     for pack in packs:
         folder, info = export_pack(pack, dest_dir)

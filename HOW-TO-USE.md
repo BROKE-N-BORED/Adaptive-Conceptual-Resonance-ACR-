@@ -1,6 +1,6 @@
 # ACR: How to Use and What to Use It For
 
-ACR v0.10. Plain words, everything the app does.
+ACR v0.11. Plain words, everything the app does.
 
 ## What ACR is for
 
@@ -73,15 +73,16 @@ Everything lives in its own window, opened from the View menu:
   see its full input below the table, and to revert the weights back to that
   step. The table follows the newest row only while you are already at the
   bottom; scrolled up, your place stays put.
-- **Resonance views:** the chart over time (red dots mark new-layer
-  candidates, first one usually lands at step 15 on a theme run), the heatmap
-  showing what changed each step, and layer discovery, where you click a
-  candidate to see the trace entries around it. Hover over the chart to see a
-  step's values; click a point, or drag across it, to jump the heatmap and
-  the trace selection to that step. When a new layer is flagged, the chart
-  dot lands with a spring settle, the resonance readout glows gold, and the
-  trace row highlights, so you see the moment it happened, and a gold dot
-  stays next to the resonance readout until the next flag or a reset.
+- **Resonance views:** the chart over time, from 0 (the line is the W_t norm;
+  red dots mark new-layer candidates, the first one usually lands at step 12
+  on a theme run), the heatmap showing what changed each step, and layer
+  discovery, where you click a candidate to see the trace entries around it.
+  Hover over the chart to see a step's values; click a point, or drag across
+  it, to jump the heatmap and the trace selection to that step. When a new
+  layer is flagged, the chart dot lands with a spring settle, the resonance
+  readout glows gold, and the trace row highlights, so you see the moment it
+  happened, and a gold dot stays next to the resonance readout, with a label
+  naming the flagged step, until the next flag or a reset.
 - **Analyze a file:** see below.
 - **How to Use:** this guide.
 
@@ -95,22 +96,30 @@ The main window's "Analyze a file" button (or View, then Analyze a file)
 opens the Analyze window. Pick a file, press Go, and the loop steps through
 every line, in file order, the same way typing would. A folder runs every
 text file in it, in name order. Plain text, .md, and .jsonl all work; a
-.jsonl record uses its text field.
+.jsonl record uses its text field. In a .md file, headers, code fences, and
+horizontal rules are skipped, and list markers are stripped: markup is not
+content.
 
 While it runs, the progress bar shows how far along it is, the busy light
-is lit, and Cancel stops it. The steps it finished stay: they are real
-steps, in the trace log like typed ones. The chart and the headline tile
-update as steps land, so a long run shows its findings while it is still
-going.
+is lit, and Cancel stops it (and the bar goes back to 0). The steps it
+finished stay: they are real steps, in the trace log like typed ones. The
+chart and the headline tile update as steps land, so a long run shows its
+findings while it is still going.
 
 When it finishes, the results land as tiles. The big tile is the headline:
-how many themes were found, and the strongest one. Then:
+how many themes were found, and the strongest one. The results cover the
+latest run only: analyzing a second file shows that file's results, and
+the headline says which run it counts. Then:
 
-- **Chart:** the W_t norm over the whole run.
-- **Themes:** the resonance spikes and the entry that triggered each one.
-  Click one to see the entries around it.
+- **Chart:** the W_t norm over the run, from 0.
+- **Themes:** sustained stretches that held together as a topic, with the
+  entry that triggered each one. Click one to see the entries around it. A
+  theme needs about 12 steps of repetition to lock on: shorter or more
+  scattered runs find no themes, and that is the engine honestly reporting
+  what it measured.
 - **Core:** the most resonant entries overall. The heart of the file.
 - **Outliers:** the lowest-resonance entries. The noise and off-topic lines.
+  An entry is core or outlier, never both.
 - **Shifts:** the steps where resonance drops sharply and stays low. Topic
   boundaries.
 
@@ -130,7 +139,10 @@ STELLA. The packs do not teach a model the raw text. They teach it what ACR
 found: the themes, the relationships, the analogies, and the resonance
 judgments, all measured from this run. Export first shows a preview of the
 packs it is about to write: names, row counts per kind, and the first rows.
-Write these packs saves them.
+Write these packs saves them. If the session changes after the preview, the
+preview says it is out of date: export again for a fresh one. A run that
+finds no themes writes no packs at all, because with no theme to be central
+to, no entry can be judged off-topic.
 
 Each pack is a folder with a .jsonl file of training rows, a README, and a
 manifest, the same pack shape Data Pack Builder writes. There is one pack per
@@ -160,23 +172,37 @@ says so in its README, so add more source material before importing it.
 
 Below the input box, it shows an analogy ("like A is to B, your input points
 at X"), counter-examples (what this session is not), closest past inputs, and
-midpoint neighbours. All from your own session. With the Local model encoder
-on, "Complete with local model" sends your most resonant entries to a local
-model as context and shows what it says.
+midpoint neighbours. All from your own session. Counter-examples only list
+inputs that are actually far from the current one; when nothing is far, it
+says so. The closest inputs never list the current input itself. The input
+box clears after each step. With the Local model encoder on, "Complete with
+local model" sends your most resonant entries to a local model as context
+and shows what it says; the button stays greyed out until there are resonant
+inputs to complete from.
 
 ## Sessions and controls
 
 - Save session and Load session keep the whole thing in one file, from the
-  File menu. Export trace CSV and Export session give you readable files.
-  Reset asks first. Revert asks first too, and shows the W norm the revert
-  will land on.
+  File menu. Ctrl+S saves to the same file again without asking where.
+  Export trace CSV and Export session give you readable files. Reset asks
+  first. Revert asks first too, and shows the W norm the revert will land
+  on. ACR also saves a recovery copy in the background as steps land: if
+  the app closes with unsaved steps, the next launch offers the session
+  back. The status line shows when the session was last saved, and a gold
+  dot marks unsaved steps. Loading a session, or switching encoders, over
+  unsaved steps asks first, offering to save.
 - **Freeze:** Off, Whole W_t, or Rank directions (freeze individual
-  directions 1 to 8 while the rest keep learning).
+  directions 1 to 8 while the rest keep learning). A frozen step never
+  flags a new layer: W_t did not move, so no new layer was found.
 - **Schedule:** Steady, Fast-adapt (learns fast early, settles down), or
   Gentle (a third of the base rate).
 - **Stability cap:** limits how big any single update can be.
-- **Generate debug report** if something breaks.
+- **Generate debug report** if something breaks. The dialog offers to open
+  the folder the report is in, or save a copy somewhere easy to reach.
 - The encoder picker offers Built-in or Local model. Local model lists every
   installed model with what it does and whether it fits this PC. Nothing is
-  picked for you: pick a model to use the local encoder. Built-in stays the
-  default, because the app cannot run with no encoder at all.
+  picked for you: pick a model to use the local encoder. Picking a text
+  model (not an embedding model) as the encoder warns first. Built-in stays
+  the default, because the app cannot run with no encoder at all. Start
+  service starts the local model service on this PC, so ACR can use your
+  installed models; it keeps running after ACR closes.

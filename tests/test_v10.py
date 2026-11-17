@@ -200,8 +200,9 @@ class LocalWindowCase(WindowCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_version_is_0_10(self):
-        self.assertEqual(acr_app.VERSION, "0.10")
+    def test_version_is_0_11(self):
+        # v0.11: the version moved; the pin moves with it.
+        self.assertEqual(acr_app.VERSION, "0.11")
 
 
 # --------------------------------------------------------------------- R1
@@ -461,7 +462,8 @@ class ReadableEntriesTests(WindowCase):
         self.assertTrue(self._run_batch([path]))
         analyze = self.window.analyze_window
         item = analyze.themes_list.item(0)
-        self.assertIn("quantum particles stay connected",
+        # v0.11 (B2): the theme trigger is the step-12 entry now.
+        self.assertIn("entanglement links distant particles",
                       item.toolTip())
         for listing in (analyze.core_list, analyze.outlier_list,
                         analyze.shift_list):
@@ -483,7 +485,8 @@ class ReadableEntriesTests(WindowCase):
         self.assertTrue(dialog.isVisible())
         view = dialog.findChild(QTextEdit)
         self.assertIsNotNone(view)
-        self.assertIn("quantum particles stay connected",
+        # v0.11 (B2): the theme trigger is the step-12 entry now.
+        self.assertIn("entanglement links distant particles",
                       view.toPlainText())
         dialog.close()
 
@@ -1019,7 +1022,9 @@ class PolishTests(WindowCase):
         path = self._theme_fixture()
         self.assertTrue(self._run_batch([path]))
         analyze = self.window.analyze_window
-        self.assertIn("in this session", analyze.hero_title.text())
+        # v0.11 (A3): the hero counts the run now, not the
+        # session -- both lines name the run, and they agree.
+        self.assertIn("in this run", analyze.hero_title.text())
         self.assertIn("in this run", analyze.progress_label.text())
 
     def test_session_load_restores_the_analyze_source(self):

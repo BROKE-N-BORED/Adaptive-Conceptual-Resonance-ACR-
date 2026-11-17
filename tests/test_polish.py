@@ -70,11 +70,15 @@ class DedupeTests(unittest.TestCase):
         self.assertEqual(len(texts), len(set(texts)))
         self.assertLessEqual(len(texts), 2)
 
-    def test_top_neighbour_still_the_latest_input(self):
+    def test_top_neighbour_is_the_closest_past_input(self):
+        # v0.11 (N5): the current input is no longer its own
+        # closest match, so the top neighbour is the closest
+        # PAST input: Q0 at 0.721, not the latest input at 1.000.
         result = self._theme_engine().synthesize()
         top_text, top_score = result["neighbours"][0]
-        self.assertEqual(top_text, THEME[15 % 4])
-        self.assertAlmostEqual(top_score, 1.0, places=3)
+        self.assertEqual(top_text, THEME[0])
+        self.assertAlmostEqual(top_score, 0.721, places=3)
+        self.assertNotEqual(top_text, THEME[15 % 4])
 
     def test_midpoint_between_two_distinct_neighbours(self):
         # With only two distinct inputs there is nothing left for
@@ -209,7 +213,7 @@ class WindowIconTests(WindowCase):
         self.assertEqual(QApplication.applicationName(), "ACR")
 
     def test_window_title_carries_version(self):
-        self.assertIn("0.10", self.window.windowTitle())
+        self.assertIn("0.11", self.window.windowTitle())
 
 
 # ------------------------------------------------------------- geometry
@@ -289,7 +293,7 @@ class ShippedFilesTests(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"),
                   encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn("v0.10", text)
+        self.assertIn("v0.11", text)
         self.assertIn("10 columns", text)
 
 
@@ -319,7 +323,7 @@ class BuildFromCloneTests(unittest.TestCase):
                 path = os.path.join(clone, name)
                 self.assertTrue(os.path.exists(path))
                 self.assertGreater(os.path.getsize(path), 100)
-            zip_path = os.path.join(clone, "acr-v0.10.zip")
+            zip_path = os.path.join(clone, "acr-v0.11.zip")
             self.assertTrue(os.path.exists(zip_path))
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.10.
+"""ACR - Adaptive Contextual Resonance, v0.11.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -68,6 +68,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -75,10 +76,11 @@ import time
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QLockFile, QObject,
                             QProcess, QPropertyAnimation, QRect,
-                            QSettings, Qt, QThread, Signal,
-                            QVariantAnimation, Property)
-from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon,
-                           QPainter, QPen, QTextCursor)
+                            QSettings, Qt, QThread, QTimer, QUrl,
+                            Signal, QVariantAnimation, Property)
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont,
+                           QFontMetrics, QIcon, QPainter, QPen,
+                           QPixmap, QTextCursor)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
@@ -86,8 +88,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
-    QTableWidget, QTableWidgetItem, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget,
+    QSplashScreen, QTableWidget, QTableWidgetItem, QTextBrowser,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from acr_engine import (BUFFER_SIZE, DIM, RANK, SCHEDULES,
@@ -100,10 +102,10 @@ from debug_log import DebugLogger, check_ollama
 from local_encoder import (
     MSG_NO_MODELS, MSG_SERVICE_DOWN, MSG_SERVICE_NOT_INSTALLED,
     MSG_START_FAILED, LocalModelClient, LocalModelError,
-    model_display_text)
+    is_embedding_model, model_display_text)
 
 APP_NAME = "acr"
-VERSION = "0.10"
+VERSION = "0.11"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 # v0.9 identity (U15): ACR's own dark look, drawn from the icon
@@ -427,7 +429,9 @@ class NormChart(QWidget):
 
     def __init__(self, parent=None, empty_text=None):
         super().__init__(parent)
-        self.setMinimumHeight(130)
+        # v0.11 (A11): 90 tall, down from 130 -- the old floor
+        # held the Analyze window above 750 px tall.
+        self.setMinimumHeight(90)
         # v0.10 (R15): the empty message fits where the chart
         # lives. The Views chart says "Step some text"; the
         # Analyze chart says "Analyze a file" -- nobody steps
@@ -546,14 +550,15 @@ class NormChart(QWidget):
         top, bottom = 10, 22
         width = max(1, self.width() - left - right)
         height = max(1, self.height() - top - bottom)
-        low = min(self.values)
-        high = max(self.values)
-        if high - low < 1e-9:
-            low -= 0.1
-            high += 0.1
-        pad = (high - low) * 0.1
-        low -= pad
-        high += pad
+        # v0.11 (N2): the Y axis starts at 0. The old auto-scale
+        # (min to max) stretched small moves into big ones: a
+        # W norm drifting between 1.50 and 1.59 filled the whole
+        # chart and read as a steep climb. The top is the max
+        # value plus a little headroom.
+        low = 0.0
+        high = max(self.values) * 1.05
+        if high <= 0.1:
+            high = 0.1
         n = len(self.values)
 
         def point(i, value):
@@ -953,16 +958,96 @@ SHIFT_LOW = 0.25
 SHIFT_DROP = 0.25
 SHIFT_STAYS_LOW = 0.35
 
+# v0.11 theme detection (user audit 2026-11-16, B2/B4): a theme is
+# a sustained stretch of the run, found by segmentation, not a
+# single resonance spike. The old rule counted spikes: a file
+# with two clear 12-line themes came back "0 themes found"
+# (nothing crossed the 0.75 threshold), and a 2-theme file
+# reported 27 themes (every jump counted). Three probes drove
+# this design, and all three are recorded in the tests:
+#
+# - No absolute resonance floor separates a quiet theme from
+#   off-topic noise: a fiscal block peaks at 0.23 while
+#   off-topic lines reach 0.19, so the bar must combine
+#   resonance with repetition.
+# - No embedding-cosine threshold separates themes either: the
+#   built-in encoder's flat mean lets shared function words
+#   dominate (fiscal-vs-fiscal cosine runs 0.02-0.15, below
+#   quantum-vs-fiscal at 0.21), so clustering on vectors is a
+#   dead end at this scale.
+# - Within-block resonance swings as much as between-block
+#   changes (a fiscal sentence scores 0.44 in one block and 0.03
+#   in the next as W_t rotates), so any purely resonance-based
+#   boundary detector false-fires inside blocks. Text change is
+#   the reliable boundary signal.
+#
+# The bars: THEME_STRONG (0.4) is the resonant floor -- a
+# settled theme holds 0.45-0.55. THEME_WEAK (0.18) catches a
+# sustained-but-quiet theme (the fiscal block peaks at 0.23)
+# only when the segment repeats its lines (steps per distinct
+# text at least 2.0): off-topic tails peak at 0.15 and never
+# repeat, so they stay out. A run of distinct sentences with no
+# repetition finds no themes: the engine genuinely does not lock
+# on without repetition, and the result says so honestly.
+THEME_STRONG = 0.4
+THEME_WEAK = 0.18
+THEME_WEAK_REPEAT = 2.0
+SEG_WINDOW = 4
+SEG_JACCARD = 0.1
+SEG_MIN_LEN = 3
+MERGE_SHARED_WORDS = 3
+# Content words for segmentation: lowercase letter-runs minus
+# these function words. Small and hardcoded: the list only has
+# to strip the words that carry no topic, not to know English.
+SEG_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "to", "of", "in", "on", "and", "or", "for", "with",
+    "by", "at", "from", "as", "it", "its", "this", "that",
+    "these", "those", "i", "you", "he", "she", "we", "they",
+    "my", "your", "his", "her", "our", "their", "am", "do",
+    "does", "did", "have", "has", "had", "not", "no", "but",
+    "so", "if", "then", "than", "too", "very",
+}
+# v0.11 (A6): finding items trim their entry text to this many
+# characters, with "..." when cut, so a clipped line always says
+# it is clipped. The full text stays on the tooltip and the
+# double-click dialog (R3).
+FINDING_TEXT_LIMIT = 40
 
-def extract_batch_text(line, is_jsonl):
+
+def extract_batch_text(line, is_jsonl, is_markdown=False):
     """The step text for one line of a batch file, or None when
     the line carries no usable text. Plain text lines are used as
     they are. A .jsonl record uses its "text" field, else
     "prompt", else "completion"; a record with none of those, or
-    a line that is not JSON at all, is skipped, never guessed."""
+    a line that is not JSON at all, is skipped, never guessed.
+    v0.11 (A7): in a .md file, markdown markup is not content.
+    Headers, code fences, and horizontal rules are skipped
+    whole: a title is a label, not a sentence. List markers are
+    stripped and the item text is stepped: the item is real
+    content, only the marker is markup. Skipped lines count in
+    the run's skipped total, like any other skipped line (U32)."""
     stripped = line.strip()
     if not stripped:
         return None
+    if is_markdown and not is_jsonl:
+        if stripped.startswith("#"):
+            # A header line: "# Budget notes" is a title.
+            return None
+        if stripped.startswith("```"):
+            # A code fence.
+            return None
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            # A horizontal rule: ---, ***, ___.
+            return None
+        marker = re.match(r"^[-*+]\s+(.*)$", stripped)
+        if marker is not None:
+            text = marker.group(1).strip()
+            return text if text else None
+        ordered = re.match(r"^\d+[.)]\s+(.*)$", stripped)
+        if ordered is not None:
+            text = ordered.group(1).strip()
+            return text if text else None
     if not is_jsonl:
         return stripped
     try:
@@ -988,6 +1073,7 @@ def iter_batch_lines(paths, unreadable=None):
     `unreadable` when one is given (U32: never silently skip)."""
     for path in paths:
         is_jsonl = path.lower().endswith(".jsonl")
+        is_markdown = path.lower().endswith(".md")
         try:
             fh = open(path, "r", encoding="utf-8",
                       errors="replace")
@@ -997,7 +1083,8 @@ def iter_batch_lines(paths, unreadable=None):
             continue
         with fh:
             for line_no, line in enumerate(fh, start=1):
-                text = extract_batch_text(line, is_jsonl)
+                text = extract_batch_text(line, is_jsonl,
+                                          is_markdown)
                 yield text, text is None, path, line_no
 
 
@@ -1013,14 +1100,167 @@ def collect_batch_files(folder):
             and os.path.isfile(os.path.join(folder, name))]
 
 
+def _content_words(text):
+    """The topic words of a line: lowercase letter-runs minus
+    the function words. Used by segmentation and theme merging:
+    two stretches about the same topic share content words,
+    two stretches about different topics share almost none."""
+    return {word for word in re.findall(r"[a-z]+", text.lower())
+            if word not in SEG_STOPWORDS}
+
+
+def _segment_steps(steps):
+    """Split steps into stretches on text change (TextTiling
+    style): a boundary falls between steps i-1 and i when the
+    content-word Jaccard between the SEG_WINDOW texts before
+    and the SEG_WINDOW after is below SEG_JACCARD, and the
+    stretch so far is at least SEG_MIN_LEN steps long. Returns
+    [(start step id, end step id), ...]. Resonance plays no part:
+    within-block resonance swings as much as between-block
+    changes, so a resonance boundary would false-fire inside
+    blocks (see the THEME_STRONG note above). A short tail
+    stretch stays its own segment: merging it into the theme
+    before it would call an off-topic line a theme member (and
+    its pack row would teach STELLA it is central). Short
+    segments simply cannot be themes -- see find_themes."""
+    count = len(steps)
+    if count == 0:
+        return []
+    bounds = [0]
+    for i in range(1, count):
+        if i - bounds[-1] < SEG_MIN_LEN:
+            continue
+        before = set()
+        for entry in steps[max(0, i - SEG_WINDOW):i]:
+            before |= _content_words(entry["input"])
+        after = set()
+        for entry in steps[i:i + SEG_WINDOW]:
+            after |= _content_words(entry["input"])
+        union = before | after
+        jaccard = (len(before & after) / len(union)
+                   if union else 0.0)
+        if jaccard < SEG_JACCARD:
+            bounds.append(i)
+    bounds.append(count)
+    return [(steps[bounds[k]]["id"],
+             steps[bounds[k + 1] - 1]["id"])
+            for k in range(len(bounds) - 1)]
+
+
+def find_themes(trace):
+    """The themes in a trace: sustained stretches that held
+    together, not resonance spikes (v0.11, B2/B4). Pure: no
+    engine, no widgets. Revert entries are not steps, so they
+    never appear.
+
+    Each theme is a copy of its trigger trace entry, plus
+    "spans" (the (start, end) step ids of its stretches) and
+    "peak" (its highest resonance). The trigger is the first
+    step at or above THEME_STRONG in the earliest stretch, else
+    that stretch's peak step. Segments merge into one theme when
+    they share at least MERGE_SHARED_WORDS distinct content
+    words (transitive): the same topic returning later in the
+    file is the same theme, not a new one. A segment is a theme
+    candidate when it holds at least SEG_MIN_LEN steps and its
+    peak reaches THEME_STRONG, or when it repeats its lines
+    (steps per distinct text at least THEME_WEAK_REPEAT) and its
+    peak reaches THEME_WEAK: a lone high step is not a theme."""
+    steps = [entry for entry in trace if "reverted_to" not in entry]
+    if not steps:
+        return []
+    segments = _segment_steps(steps)
+    candidates = []
+    for start, end in segments:
+        seg = [entry for entry in steps
+               if start <= entry["id"] <= end]
+        peak = max(entry["resonance"] for entry in seg)
+        distinct = len({entry["input"] for entry in seg})
+        ratio = len(seg) / float(distinct) if distinct else 0.0
+        if (len(seg) >= SEG_MIN_LEN
+                and (peak >= THEME_STRONG
+                     or (ratio >= THEME_WEAK_REPEAT
+                         and peak >= THEME_WEAK))):
+            candidates.append((start, end, seg, peak))
+    # Merge by shared content words, transitive (union-find).
+    parent = list(range(len(candidates)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    words = []
+    for _start, _end, seg, _peak in candidates:
+        merged = set()
+        for entry in seg:
+            merged |= _content_words(entry["input"])
+        words.append(merged)
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            if len(words[i] & words[j]) >= MERGE_SHARED_WORDS:
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[root_j] = root_i
+    groups = {}
+    for i in range(len(candidates)):
+        groups.setdefault(find(i), []).append(i)
+    themes = []
+    for indexes in sorted(groups.values(), key=lambda g: min(g)):
+        spans = sorted((candidates[i][0], candidates[i][1])
+                       for i in indexes)
+        all_steps = [entry for i in indexes
+                     for entry in candidates[i][2]]
+        peak = max(entry["resonance"] for entry in all_steps)
+        first_seg = candidates[indexes[0]][2]
+        trigger = None
+        for entry in first_seg:
+            if entry["resonance"] >= THEME_STRONG:
+                trigger = entry
+                break
+        if trigger is None:
+            trigger = max(first_seg,
+                          key=lambda e: e["resonance"])
+        theme = dict(trigger)
+        theme["spans"] = spans
+        theme["peak"] = peak
+        themes.append(theme)
+    return themes
+
+
+def _span_text(spans):
+    """Spans as short text: "1-16" for one stretch, "1-20 + 7
+    more" when the theme returns later in the run."""
+    if not spans:
+        return ""
+    first = "%d-%d" % spans[0]
+    if len(spans) == 1:
+        return first
+    return "%s + %d more" % (first, len(spans) - 1)
+
+
+def _trim_display(text, limit=FINDING_TEXT_LIMIT):
+    """Entry text for a finding tile: cut to `limit` characters
+    with "..." when it was longer, so a clipped line always says
+    it is clipped (v0.11, A6). The full text stays on the
+    tooltip and the double-click dialog."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3] + "..."
+
+
 def summarize_run(trace, top_n=ANALYSIS_TOP_N):
     """Themes, core entries, outliers, and theme shifts from a
     trace log (v0.9, Analyze). Pure: no engine, no widgets.
     Revert entries (marked reverted_to) are not steps, so they
     never appear in any list. Core is the highest-resonance
-    entries, outliers the lowest, one line per distinct text."""
+    entries, outliers the lowest, one line per distinct text.
+    v0.11: themes come from find_themes (sustained stretches),
+    and core and outliers are exclusive -- an entry is core OR
+    outlier, never both (A2): the outlier pass skips every text
+    the core pass already took."""
     steps = [entry for entry in trace if "reverted_to" not in entry]
-    themes = [entry for entry in steps if entry.get("new_layer")]
+    themes = find_themes(steps)
     core = []
     seen = set()
     for entry in sorted(steps, key=lambda e: e["resonance"],
@@ -1033,8 +1273,11 @@ def summarize_run(trace, top_n=ANALYSIS_TOP_N):
             break
     outliers = []
     seen = set()
+    core_texts = {entry["input"] for entry in core}
     for entry in sorted(steps, key=lambda e: e["resonance"]):
         if entry["input"] in seen:
+            continue
+        if entry["input"] in core_texts:
             continue
         seen.add(entry["input"])
         outliers.append(entry)
@@ -1068,12 +1311,30 @@ def format_analysis_report(summary, version, text_of,
     lines.append("")
     lines.append("Themes found (%d)" % len(summary["themes"]))
     if not summary["themes"]:
-        lines.append("  None yet. Step a few sentences on one "
-                     "theme and spikes will show up here.")
+        # v0.11: the no-themes line fits where the report came
+        # from. In a file report, "step a few sentences" is
+        # off-context advice; the honest reason is that nothing
+        # in the file held together as a theme.
+        if source_note:
+            lines.append("  None found in this run: nothing in "
+                         "the file held together as a theme. A "
+                         "theme needs repeated sentences on one "
+                         "topic, about 12 lines or more.")
+        else:
+            lines.append("  None yet. Step a few sentences on "
+                         "one theme and they will show up here.")
     for entry in summary["themes"]:
-        lines.append("  Step %d: %s (resonance %.3f)"
-                     % (entry["id"], text_of(entry),
-                        entry["resonance"]))
+        # v0.11: a theme is a stretch, so the report names its
+        # trigger step, its peak resonance, and the steps it
+        # covers -- not just the spike that used to stand for it.
+        peak = entry.get("peak", entry["resonance"])
+        lines.append("  Step %d: %s (peak resonance %.3f)"
+                     % (entry["id"], text_of(entry), peak))
+        spans = entry.get("spans", [])
+        if spans:
+            lines.append("    Steps in this theme: %s"
+                         % ", ".join("%d-%d" % span
+                                     for span in spans))
     lines.append("")
     lines.append("Core entries (%d)" % len(summary["core"]))
     lines.append("  The most resonant entries: the heart of the "
@@ -1124,9 +1385,12 @@ class BatchWorker(QObject):
     (file names), heat (step id plus row norms, for the heatmap),
     texts (step id to full text), locators (step id to (file
     name, line number): where each step came from, for the
-    STELLA pack manifest), cancelled, error (a LocalModelError
-    or None). A local-embed failure stops the run with the
-    error: the steps completed so far stay, they are real steps.
+    STELLA pack manifest), first_step and last_step (the run's
+    step ids, or None when no step landed -- v0.11, A3: the
+    window scopes the analysis to the run), cancelled, error (a
+    LocalModelError or None). A local-embed failure stops the
+    run with the error: the steps completed so far stay, they
+    are real steps.
     """
 
     progress = Signal(int, int, float, float, int)
@@ -1162,6 +1426,9 @@ class BatchWorker(QObject):
         error = None
         resonance = 0.0
         w_norm = self.engine.w_norm()
+        # v0.11 (A3): the run's first step id, for the window's
+        # per-run scoping. Steps are sequential from here.
+        first_id = self.engine.step_count + 1
         for text, is_skipped, path, line_no in iter_batch_lines(
                 self.paths):
             if self.cancelled:
@@ -1204,6 +1471,8 @@ class BatchWorker(QObject):
             "heat": heat,
             "texts": texts,
             "locators": locators,
+            "first_step": first_id if texts else None,
+            "last_step": max(texts) if texts else None,
             "cancelled": self.cancelled,
             "error": error,
         })
@@ -1423,6 +1692,10 @@ class AnalyzeWindow(SubWindow):
         go_row = QHBoxLayout()
         self.go_button = QPushButton("Go")
         self.go_button.setObjectName("primaryButton")
+        # v0.11 (A5): Go cannot act with nothing picked, so it
+        # starts greyed out. It enables when a file or folder is
+        # picked, and disables again while a run is in flight.
+        self.go_button.setEnabled(False)
         self.go_button.pressed.connect(
             lambda: press_dip(self.go_button))
         self.go_button.clicked.connect(self.on_go)
@@ -1471,9 +1744,12 @@ class AnalyzeWindow(SubWindow):
         chart_layout = QVBoxLayout(chart_tile)
         chart_layout.setContentsMargins(10, 8, 10, 10)
         chart_layout.addWidget(_header_label("Chart"))
+        # v0.11 (N2): the note says what the line and the dots
+        # each are -- the old wording mixed them together.
         chart_layout.addWidget(_note_label(
-            "W_t norm over the whole run. Spikes are resonance "
-            "spikes."))
+            "The line is the W_t norm over the run, from 0. The "
+            "red dots are resonance events: steps that flagged "
+            "a new-layer candidate."))
         # v0.10 (R15): the empty message fits Analyze -- nobody
         # steps text here.
         self.chart = NormChart(
@@ -1490,11 +1766,22 @@ class AnalyzeWindow(SubWindow):
         themes_layout = QVBoxLayout(themes_tile)
         themes_layout.setContentsMargins(10, 8, 10, 10)
         themes_layout.addWidget(_header_label("Themes"))
+        # v0.11 (B4): themes are sustained stretches now, not
+        # spikes -- the note says so.
         themes_layout.addWidget(_note_label(
-            "Resonance spikes and the entry that triggered each "
-            "one."))
+            "Sustained themes: stretches of the run that held "
+            "together, and the entry that triggered each one."))
         self.themes_list = QListWidget()
+        # v0.11 (A11): the lists keep a small floor so the
+        # window can shrink: the default list height held the
+        # window above 750 px tall.
+        self.themes_list.setMinimumHeight(40)
         self.themes_list.setUniformItemSizes(True)
+        # v0.11 (A6): overlong items elide with "..." at the
+        # tile edge instead of growing a horizontal scrollbar.
+        self.themes_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        self.themes_list.setTextElideMode(Qt.ElideRight)
         self.themes_list.currentItemChanged.connect(
             self._on_theme_picked)
         # v0.10 (R3): double-click shows the whole entry: the
@@ -1509,7 +1796,7 @@ class AnalyzeWindow(SubWindow):
         # the note label above it until its text clips, and
         # starves the list. Floored at three lines: the detail
         # always shows the trigger entry and its neighbours.
-        self.theme_detail.setMinimumHeight(55)
+        self.theme_detail.setMinimumHeight(40)
         self.theme_detail.setMaximumHeight(80)
         # v0.10 (R2): a read-only display surface: no Tab stop.
         self.theme_detail.setFocusPolicy(Qt.NoFocus)
@@ -1524,7 +1811,13 @@ class AnalyzeWindow(SubWindow):
             "Core entries: the most resonant entries overall. "
             "The heart of the file."))
         self.core_list = QListWidget()
+        self.core_list.setMinimumHeight(40)
         self.core_list.setUniformItemSizes(True)
+        # v0.11 (A6): overlong items elide with "..." at the
+        # tile edge instead of growing a horizontal scrollbar.
+        self.core_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        self.core_list.setTextElideMode(Qt.ElideRight)
         self.core_list.itemDoubleClicked.connect(
             self._on_finding_double_clicked)
         core_layout.addWidget(self.core_list, 1)
@@ -1538,7 +1831,13 @@ class AnalyzeWindow(SubWindow):
             "Outliers: the lowest-resonance entries. The noise "
             "and off-topic lines."))
         self.outlier_list = QListWidget()
+        self.outlier_list.setMinimumHeight(40)
         self.outlier_list.setUniformItemSizes(True)
+        # v0.11 (A6): overlong items elide with "..." at the
+        # tile edge instead of growing a horizontal scrollbar.
+        self.outlier_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        self.outlier_list.setTextElideMode(Qt.ElideRight)
         self.outlier_list.itemDoubleClicked.connect(
             self._on_finding_double_clicked)
         outlier_layout.addWidget(self.outlier_list, 1)
@@ -1552,7 +1851,13 @@ class AnalyzeWindow(SubWindow):
             "Theme shifts: the steps where resonance drops "
             "sharply and stays low. Topic boundaries."))
         self.shift_list = QListWidget()
+        self.shift_list.setMinimumHeight(40)
         self.shift_list.setUniformItemSizes(True)
+        # v0.11 (A6): overlong items elide with "..." at the
+        # tile edge instead of growing a horizontal scrollbar.
+        self.shift_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        self.shift_list.setTextElideMode(Qt.ElideRight)
         self.shift_list.itemDoubleClicked.connect(
             self._on_finding_double_clicked)
         shift_layout.addWidget(self.shift_list, 1)
@@ -1605,6 +1910,17 @@ class AnalyzeWindow(SubWindow):
         self.pack_preview_label = _header_label("Pack preview")
         self.pack_preview_label.hide()
         layout.addWidget(self.pack_preview_label)
+        # v0.11 (A15): the stale warning, above the preview pane.
+        # It shows when the session has moved on since the
+        # preview was made, so a stale preview never reads as
+        # current. Refreshed in show_results, which runs on
+        # every refresh.
+        self.pack_stale_label = _note_label(
+            "This preview is out of date: the session has "
+            "changed since it was made. Press Export STELLA "
+            "data pack again for a fresh preview.")
+        self.pack_stale_label.hide()
+        layout.addWidget(self.pack_stale_label)
         self.pack_preview = QTextEdit()
         self.pack_preview.setReadOnly(True)
         self.pack_preview.setFocusPolicy(Qt.NoFocus)
@@ -1649,6 +1965,8 @@ class AnalyzeWindow(SubWindow):
         self._paths = [path]
         self._source_note = os.path.basename(path)
         self.source_label.setText("File: %s" % path)
+        # v0.11 (A5): a file is picked, so Go can act now.
+        self.go_button.setEnabled(True)
 
     def on_pick_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1666,6 +1984,9 @@ class AnalyzeWindow(SubWindow):
                                 len(paths)))
         self.source_label.setText(
             "Folder: %s (%d text files)" % (folder, len(paths)))
+        # v0.11 (A5): a folder with text files is picked, so Go
+        # can act now.
+        self.go_button.setEnabled(True)
 
     def on_go(self):
         if not self._paths:
@@ -1696,26 +2017,29 @@ class AnalyzeWindow(SubWindow):
                 "Pick a file, press Go, and the findings land "
                 "here.")
         else:
-            # v0.10 (R15): the hero counts session steps, while
-            # the progress label counts the run's steps. Say
-            # which, so the two numbers never look like a
-            # contradiction.
+            # v0.11 (A3): the results cover the latest run, not
+            # the whole session -- the hero says which, so the
+            # number never reads as the session's. Before any
+            # batch runs, the "run" is the typed session.
+            scope = self.main._run_scope_text()
             self.hero_title.setText(
-                "%d theme%s found in %d steps in this session"
+                "%d theme%s found in %d steps %s"
                 % (len(themes),
-                   "" if len(themes) == 1 else "s", steps))
+                   "" if len(themes) == 1 else "s", steps, scope))
             if themes:
                 best = max(themes,
-                           key=lambda entry: entry["resonance"])
+                           key=lambda e: e.get(
+                               "peak", e["resonance"]))
                 self.hero_theme.setText(
-                    "Strongest theme: \"%s\" (resonance %.3f, "
-                    "step %d)"
+                    "Strongest theme: \"%s\" (peak resonance "
+                    "%.3f, trigger step %d)"
                     % (self.main._entry_text(best),
-                       best["resonance"], best["id"]))
+                       best.get("peak", best["resonance"]),
+                       best["id"]))
             else:
                 self.hero_theme.setText(
-                    "No resonance spikes: nothing in this file "
-                    "hung together as a theme.")
+                    "No themes found: nothing in this run held "
+                    "together as a theme.")
         selected = None
         current = self.themes_list.currentItem()
         if current is not None:
@@ -1724,10 +2048,20 @@ class AnalyzeWindow(SubWindow):
         self.themes_list.clear()
         restore_row = -1
         for entry in summary["themes"]:
+            # v0.11: the theme's trigger step, peak, and spans
+            # first, then the trigger text trimmed with "..."
+            # when cut (A6) -- the text is the tail, so the
+            # trim never eats the numbers.
+            spans = entry.get("spans", [])
+            peak = entry.get("peak", entry["resonance"])
+            if spans:
+                head = ("Step %d (peak %.3f, steps %s)"
+                        % (entry["id"], peak, _span_text(spans)))
+            else:
+                head = "Step %d (peak %.3f)" % (entry["id"], peak)
             self.themes_list.addItem(
-                "Step %d: %s (resonance %.3f)"
-                % (entry["id"], self.main._entry_text(entry),
-                   entry["resonance"]))
+                "%s: %s" % (head, _trim_display(
+                    self.main._entry_text(entry))))
             item = self.themes_list.item(
                 self.themes_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
@@ -1741,15 +2075,16 @@ class AnalyzeWindow(SubWindow):
             self.themes_list.setCurrentRow(restore_row)
         elif self.themes_list.count() == 0:
             self.theme_detail.setPlainText(
-                "No resonance spikes yet.")
+                "No themes found yet.")
         elif current is None:
             self.theme_detail.setPlainText(
-                "Click a theme to see its trace entries.")
+                "Click a theme to see what it covers.")
         self.core_list.clear()
         for entry in summary["core"]:
             self.core_list.addItem(
                 "%.3f  %s" % (entry["resonance"],
-                              self.main._entry_text(entry)))
+                              _trim_display(
+                                  self.main._entry_text(entry))))
             item = self.core_list.item(self.core_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
             item.setToolTip(self.main._entry_text(entry))
@@ -1757,7 +2092,8 @@ class AnalyzeWindow(SubWindow):
         for entry in summary["outliers"]:
             self.outlier_list.addItem(
                 "%.3f  %s" % (entry["resonance"],
-                              self.main._entry_text(entry)))
+                              _trim_display(
+                                  self.main._entry_text(entry))))
             item = self.outlier_list.item(
                 self.outlier_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
@@ -1783,6 +2119,20 @@ class AnalyzeWindow(SubWindow):
         self.export_jsonl_button.setEnabled(has_steps)
         self.export_report_button.setEnabled(has_steps)
         self.export_packs_button.setEnabled(has_steps)
+        self._refresh_stale_label()
+
+    def _refresh_stale_label(self):
+        """v0.11 (A15): the pack preview is stale when the
+        session moved on since it was made. The warning shows
+        with the preview pane, never on its own: no preview,
+        nothing stale. Called from show_results (every refresh)
+        and from on_export_stella_packs (a fresh preview clears
+        the mark)."""
+        stale = (self._preview_step_count is not None
+                 and self.main.engine.step_count
+                 != self._preview_step_count)
+        self.pack_stale_label.setVisible(
+            stale and not self.pack_preview.isHidden())
 
     def show_live(self, trace, done, total):
         """Mid-run refresh (v0.10, R5): the chart and the hero
@@ -1791,17 +2141,19 @@ class AnalyzeWindow(SubWindow):
         the hero: the finding lists need the finished summary,
         and rebuilding them every progress tick would cost more
         than it shows. Called from the throttled progress
-        handler, on the UI thread, with a snapshot of the trace.
-        """
+        handler, on the UI thread, with a snapshot of the run's
+        trace. v0.11 (B4): no mid-run theme count -- themes are
+        found by segmentation over the finished run, and
+        counting flags mid-run would report spike events as
+        themes, the bug B4 fixes. The finished show_results
+        shows the real count."""
         self.chart.set_data(
             [entry["new_norm"] for entry in trace],
             [entry["new_layer"] for entry in trace])
-        themes = sum(1 for entry in trace if entry["new_layer"])
         steps = len(trace)
         self.hero_title.setText(
-            "Analyzing... %d theme%s so far in %d steps in this "
-            "session"
-            % (themes, "" if themes == 1 else "s", steps))
+            "Analyzing... %d step%s so far in this run"
+            % (steps, "" if steps == 1 else "s"))
         self.hero_theme.setText(
             "Run in progress: line %d of %d in this run."
             % (done, total))
@@ -1849,21 +2201,31 @@ class AnalyzeWindow(SubWindow):
         if current is None:
             return
         step_id = current.data(Qt.UserRole)
-        lines = []
-        for entry in self._trace:
-            if entry["id"] == step_id - 1:
-                lines.append(self.main._format_trace_entry(
-                    entry, "Step %d (before)" % entry["id"]))
-            elif entry["id"] == step_id:
-                lines.append(self.main._format_trace_entry(
-                    entry, "Step %d (spike)" % entry["id"]))
-            elif entry["id"] == step_id + 1:
-                lines.append(self.main._format_trace_entry(
-                    entry, "Step %d (after)" % entry["id"]))
-        if not lines:
+        # v0.11: the detail names the theme -- its spans,
+        # trigger step, and peak -- instead of three trace
+        # entries in a three-line pane. The theme is looked up
+        # by its trigger step id in the current summary.
+        theme = None
+        if self._summary is not None:
+            for entry in self._summary["themes"]:
+                if entry["id"] == step_id:
+                    theme = entry
+                    break
+        if theme is None:
             self.theme_detail.setPlainText(
-                "No trace entries for step %d." % step_id)
+                "No theme found for step %d." % step_id)
             return
+        spans = theme.get("spans", [])
+        peak = theme.get("peak", theme["resonance"])
+        lines = ["Theme: steps %s, trigger step %d (peak "
+                 "resonance %.3f)"
+                 % (_span_text(spans) or "?", step_id, peak)]
+        lines.append("Trigger entry: %s"
+                     % self.main._entry_text(theme))
+        if len(spans) > 1:
+            lines.append("Stretches: %s"
+                         % ", ".join("%d-%d" % span
+                                     for span in spans))
         self.theme_detail.setPlainText("\n".join(lines))
 
     # -- exports ------------------------------------------------------
@@ -1996,15 +2358,29 @@ class AnalyzeWindow(SubWindow):
             self.main._pack_context(),
             self.main._batch_source_note)
         if not packs:
-            self.main.status_label.setText(
-                "No packs to write from this run.")
+            # v0.11 (B3): say WHY there are no packs. A no-theme
+            # run is not an empty run.
+            if not self._summary["themes"]:
+                self.main.status_label.setText(
+                    "No themes were found in this run, so no "
+                    "packs can be written.")
+            else:
+                self.main.status_label.setText(
+                    "No packs to write from this run.")
             return
-        self._preview_step_count = self._summary["steps"]
+        # v0.11 (A15): the preview is stale when the SESSION
+        # step count moves, not just the run's: the preview's
+        # rows also depend on the session buffer (vectors,
+        # neighbours, resonant entries), which any step churns.
+        self._preview_step_count = self.main.engine.step_count
         self.pack_preview.setPlainText(
             self._render_pack_preview(packs))
         self.pack_preview_label.show()
         self.pack_preview.show()
         self.write_packs_button.show()
+        # The preview is fresh by construction: clear any stale
+        # mark left by the preview it replaces.
+        self._refresh_stale_label()
         total_rows = sum(len(pack["rows"]) for pack in packs)
         self.main.status_label.setText(
             "Preview ready: %d pack%s, %d rows. Press Write "
@@ -2079,14 +2455,13 @@ class AnalyzeWindow(SubWindow):
         message = ("Wrote %d STELLA data pack%s to %s."
                    % (count, "s" if count != 1 else "", folder))
         if (self._preview_step_count is not None
-                and self._summary is not None
-                and self._summary["steps"]
+                and self.main.engine.step_count
                 != self._preview_step_count):
             message += (" The session changed since the preview "
                         "(preview was %d steps, now %d): these "
                         "packs are from the current state."
                         % (self._preview_step_count,
-                           self._summary["steps"]))
+                           self.main.engine.step_count))
         self._preview_step_count = None
         if under == 1:
             message += (" 1 pack has fewer than 2 rows: STELLA "
@@ -2101,7 +2476,8 @@ class AnalyzeWindow(SubWindow):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, log_dir=None, local_base_url=None):
+    def __init__(self, log_dir=None, local_base_url=None,
+                 autosave_path=None):
         super().__init__()
         self.setWindowTitle("ACR v%s - Adaptive Contextual "
                             "Resonance" % VERSION)
@@ -2198,6 +2574,35 @@ class MainWindow(QMainWindow):
         # v0.10 (R13): when the batch progress UI last updated,
         # for the throttle.
         self._last_progress_ui = 0.0
+        # v0.11 (A3): the current run's step range. Manual steps
+        # are the run until the first batch; a batch replaces
+        # the run with its own steps, so analyzing a second file
+        # shows that file's results, not the whole session's.
+        # _batch_has_run says which: before any batch the run is
+        # the whole trace, after one it is the batch's steps.
+        # _pending_run_start holds the next batch's first step
+        # while it is still running.
+        self._run_start_id = 1
+        self._run_end_id = 0
+        self._batch_has_run = False
+        self._pending_run_start = 1
+        # v0.11 (B1): the remembered save path (Ctrl+S re-saves
+        # to it) and the dirty flag (steps since the last
+        # explicit save). The autosave path is the recovery
+        # copy's home: ~/.local/share/ACR/autosave.json on a
+        # real run, next to the logs when a log dir is given
+        # (tests), or the explicit path when one is passed.
+        self._session_path = None
+        self._dirty = False
+        if autosave_path is not None:
+            self._autosave_path = autosave_path
+        elif log_dir is not None:
+            self._autosave_path = os.path.join(
+                log_dir, "autosave.json")
+        else:
+            self._autosave_path = os.path.join(
+                os.path.expanduser("~"), ".local", "share",
+                "ACR", "autosave.json")
 
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(
@@ -2222,6 +2627,19 @@ class MainWindow(QMainWindow):
         # v0.8: remember the geometry for the next run.
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.sync()
+        # v0.11 (B1): quitting never loses work, and never asks:
+        # the autosave already holds the session, and the next
+        # launch offers to restore it. A dirty session keeps its
+        # autosave (the work is unsaved to a file); a clean one
+        # deletes it (the file has it, so no restore offer).
+        # The final autosave covers setting changes since the
+        # last step -- but not while a batch is running: the
+        # worker owns the engine, and reading it from here would
+        # race the run. The pre-batch autosave stands instead.
+        if self._dirty and not self._batch_running():
+            self._autosave()
+        elif not self._dirty:
+            self._delete_autosave()
         # v0.9: the dedicated windows close too (each saves its
         # own geometry as it hides). A local call in flight is
         # left to finish in the background; its answer is ignored
@@ -2288,11 +2706,27 @@ class MainWindow(QMainWindow):
             self._on_model_changed)
         encoder_row.addWidget(self.model_combo, 1)
         self.start_button = QPushButton("Start service")
+        # v0.11 (N1): the button says what the service is, on
+        # hover and in the line below: first launch never
+        # explained it.
+        self.start_button.setToolTip(
+            "Start the local model service on this PC, so ACR "
+            "can use your installed models.")
         self.start_button.clicked.connect(self.on_start_service)
         encoder_row.addWidget(self.start_button)
         root.addLayout(encoder_row)
         self.encoder_label = QLabel("Built-in encoder, dim 64.")
         root.addWidget(self.encoder_label)
+        # v0.11 (N1): visible in built-in mode too -- the audit
+        # complaint is about first launch, when the local-model
+        # chrome is collapsed. So this line is NOT part of the
+        # R10 collapse: _set_encoder_ui never hides it.
+        self.service_note = _note_label(
+            "Start service starts the local model service on "
+            "this PC, so ACR can use your installed models. It "
+            "keeps running after ACR closes. You only need it "
+            "for the Local model encoder.")
+        root.addWidget(self.service_note)
         # v0.10 (R10): the local-model notes are named, so the
         # progressive disclosure can hide them in built-in mode.
         self.model_note = _note_label(
@@ -2362,11 +2796,17 @@ class MainWindow(QMainWindow):
         self.flag_marker.setStyleSheet(
             "color: %s;" % ACCENT_GOLD)
         self.flag_marker.hide()
+        # v0.11 (A13): the flag dot never said which step it was
+        # for, except on hover. The label names it in plain
+        # text, and shows and hides with the dot.
+        self.flag_label = QLabel("")
+        self.flag_label.hide()
         self.alpha_label = QLabel("Alpha: 0.30")
         readout_row.addWidget(self.step_label)
         readout_row.addWidget(self.norm_label)
         readout_row.addWidget(self.resonance_label)
         readout_row.addWidget(self.flag_marker)
+        readout_row.addWidget(self.flag_label)
         readout_row.addWidget(self.alpha_label)
         readout_row.addStretch(1)
         root.addLayout(readout_row)
@@ -2379,8 +2819,10 @@ class MainWindow(QMainWindow):
         # A compact panel, not a window-filler: the synthesis head
         # is one readout among several on the main window. Without
         # the cap it takes all the spare height and the completion
-        # scroll-to-bottom has nothing to scroll.
-        self.synthesis_text.setMaximumHeight(170)
+        # scroll-to-bottom has nothing to scroll. v0.11 (N4): 230
+        # tall, up from 170 -- the midpoint neighbours sat below
+        # the fold, and the layout has the slack at 1100x700.
+        self.synthesis_text.setMaximumHeight(230)
         # v0.10 (R2): a read-only display surface, not a control:
         # it takes no Tab stop.
         self.synthesis_text.setFocusPolicy(Qt.NoFocus)
@@ -2419,6 +2861,22 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
         status_row.addWidget(self.status_label, 1)
+        # v0.11 (B1): the saved line and the dirty dot. The
+        # saved line shows the last save -- "Saved HH:MM" for an
+        # explicit save, "Autosaved HH:MM" for the background
+        # copy. The dot shows while the session has steps since
+        # the last explicit save: the saved file is out of date,
+        # even though the autosave has the work.
+        self.saved_label = QLabel("")
+        status_row.addWidget(self.saved_label)
+        self.dirty_marker = QLabel("\u25cf")
+        self.dirty_marker.setStyleSheet(
+            "color: %s;" % ACCENT_GOLD)
+        self.dirty_marker.setToolTip(
+            "Unsaved changes since the last save. Press Ctrl+S "
+            "to save.")
+        self.dirty_marker.hide()
+        status_row.addWidget(self.dirty_marker)
         self.completion_mark = CheckmarkWidget()
         status_row.addWidget(self.completion_mark)
         self.cancel_button = QPushButton("Cancel")
@@ -2839,8 +3297,13 @@ class MainWindow(QMainWindow):
                            "views_geometry", self)
         layout = QVBoxLayout(window)
 
-        layout.addWidget(_header_label(
-            "W_t norm over time - spikes are resonance spikes"))
+        layout.addWidget(_header_label("W_t norm over time"))
+        # v0.11 (N2): the note says what the line and the dots
+        # each are -- the old header mixed them together.
+        layout.addWidget(_note_label(
+            "The line is the W_t norm, from 0. The red dots are "
+            "resonance events: steps that flagged a new-layer "
+            "candidate."))
         self.norm_chart = NormChart()
         # v0.10 (R6): click a point to jump the heatmap and the
         # trace selection to that step.
@@ -3006,10 +3469,12 @@ class MainWindow(QMainWindow):
         """Completion button, picker, and note to match the encoder
         state. The picker lists every installed model with the
         same guided lines as the encoder picker, and starts
-        unselected (U6): the button enables once a model is
-        picked. The user's pick is kept when it is still a
-        choice. Runs from _set_encoder_ui, which covers every
-        encoder change, session load, and failed switch."""
+        unselected (U6). v0.11 (A5): the button enables once a
+        model is picked AND resonant inputs exist to complete
+        from (see _refresh_complete_button). The user's pick is
+        kept when it is still a choice. Runs from _set_encoder_ui,
+        which covers every encoder change, session load, and
+        failed switch."""
         if self.encoder_kind != "local":
             self.complete_button.setEnabled(False)
             self.completion_combo.blockSignals(True)
@@ -3041,17 +3506,38 @@ class MainWindow(QMainWindow):
                 "No model is installed for completion.")
         else:
             self.completion_combo.setEnabled(True)
-            self.complete_button.setEnabled(
-                self.completion_combo.currentIndex() >= 0)
             self.completion_note.setText(
                 "Pick a model to continue the theme from the most "
                 "resonant inputs.")
+            self._refresh_complete_button()
+
+    def _refresh_complete_button(self):
+        """The Complete button enables only when it can act
+        (v0.11, A5): the local encoder is active, a model is
+        picked for completion, the session has resonant inputs
+        to complete from, and no local call or batch is running.
+        It mirrors on_complete's gate exactly, so the button
+        never promises what the action refuses. Runs from
+        _refresh_all, so it tracks resonance after each step."""
+        if self.encoder_kind != "local":
+            self.complete_button.setEnabled(False)
+            return
+        if (self._local_thread is not None
+                or self._batch_running()):
+            self.complete_button.setEnabled(False)
+            return
+        model = self.completion_combo.currentData()
+        self.complete_button.setEnabled(
+            bool(model)
+            and bool(self.engine.resonant_entries(5)))
 
     def _on_completion_model_changed(self, index):
-        # The button enables only once a model is picked: nothing
-        # is selected by default (U6).
+        # The button enables only once a model is picked and the
+        # session has resonant inputs: nothing is selected by
+        # default (U6), and a pick with nothing to complete from
+        # leaves the button greyed out (v0.11, A5).
         if self.encoder_kind == "local":
-            self.complete_button.setEnabled(index >= 0)
+            self._refresh_complete_button()
 
     def _fresh_engine(self, dim):
         """A fresh engine at the given dim, with views cleared."""
@@ -3064,6 +3550,16 @@ class MainWindow(QMainWindow):
         self._completion_model = None
         self._completion_text = None
         self._known_flag_steps = set()
+        # v0.11: a fresh engine is a fresh session -- no run, no
+        # remembered file, nothing dirty. The caller confirms
+        # first (B1); this only clears the state.
+        self._run_start_id = 1
+        self._run_end_id = 0
+        self._batch_has_run = False
+        self._pending_run_start = 1
+        self._session_path = None
+        self._dirty = False
+        self.saved_label.setText("")
         self.logger.set_setting("dim", dim)
 
     def _on_encoder_changed(self, index):
@@ -3082,6 +3578,17 @@ class MainWindow(QMainWindow):
             return
         if index == 0:
             if self.encoder_kind == "local":
+                # v0.11 (B1): switching encoders wipes the
+                # session. Offer to save first when the session
+                # has unsaved steps; a cancelled save leaves the
+                # encoder where it was. A discarded session's
+                # autosave goes too: the user chose to lose it.
+                if not self._maybe_save_before_discard(
+                        "switching back to the built-in "
+                        "encoder"):
+                    self._set_encoder_ui()
+                    return
+                self._delete_autosave()
                 self._switch_to_builtin(
                     "Back to the built-in encoder. W_t is fresh.")
             elif self._local_pending:
@@ -3209,16 +3716,44 @@ class MainWindow(QMainWindow):
             # unselected, when only peeking) and wait.
             self.status_label.setText(
                 "Wait for the local model call to finish.")
-            self.model_combo.blockSignals(True)
-            if self.encoder_kind == "local" and self.local_model:
-                self.model_combo.setCurrentIndex(
-                    self.model_combo.findData(self.local_model))
-            else:
-                self.model_combo.setCurrentIndex(-1)
-            self.model_combo.blockSignals(False)
+            self._restore_model_picker()
             return
         if self._local_pending or self.encoder_kind == "local":
+            # v0.11 (B1): activating a model wipes the session
+            # with a fresh W_t. Offer to save first when the
+            # session has unsaved steps.
+            if not self._maybe_save_before_discard(
+                    "switching to another model"):
+                self._restore_model_picker()
+                return
+            # v0.11 (A14): a text model is a poor encoder. Warn
+            # upfront, before the activation probe runs -- the
+            # picker names the kind, but a pick is one click and
+            # the warning is the last chance to catch it.
+            if not is_embedding_model(name):
+                answer = QMessageBox.question(
+                    self, "Text model as encoder",
+                    "The model %s is a text model, not an "
+                    "embedding model. A text model may not work "
+                    "well as an encoder. Use it anyway?" % name,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    self._restore_model_picker()
+                    return
+            self._delete_autosave()
             self._activate_local_model(name)
+
+    def _restore_model_picker(self):
+        """Put the model picker back on the running model (or
+        unselected, when only peeking): the pick did not land."""
+        self.model_combo.blockSignals(True)
+        if self.encoder_kind == "local" and self.local_model:
+            self.model_combo.setCurrentIndex(
+                self.model_combo.findData(self.local_model))
+        else:
+            self.model_combo.setCurrentIndex(-1)
+        self.model_combo.blockSignals(False)
 
     def on_start_service(self):
         """Start the local model service, off the UI thread
@@ -3311,9 +3846,19 @@ class MainWindow(QMainWindow):
         return launched
 
     def _clear_local_thread(self):
-        """Drop the local-call thread once it has stopped."""
+        """Drop the local-call thread once it has stopped, and
+        put the buttons back. v0.11 (A5): the Step and Start
+        buttons re-enable HERE, on thread.finished -- not in
+        _finish_local_call, which runs on worker.finished while
+        the thread is still winding down. In that gap the
+        buttons were enabled while a call was technically still
+        in flight, and a click landed on the guard instead of
+        the greyed-out button."""
         self._local_thread = None
         self._local_worker = None
+        self.step_button.setEnabled(True)
+        self.start_button.setEnabled(True)
+        self._refresh_complete_button()
 
     def _on_local_progress(self, message):
         self.status_label.setText(message)
@@ -3330,15 +3875,12 @@ class MainWindow(QMainWindow):
 
     def _finish_local_call(self):
         """Shared cleanup when a local call lands: light off,
-        buttons back, Cancel gone. The thread reference stays
-        until the thread has actually stopped (see
-        _clear_local_thread)."""
+        Cancel gone. The Step and Start buttons stay off until
+        the thread has actually stopped (see _clear_local_thread):
+        re-enabling them here left a gap where a click landed on
+        the guard instead of the greyed-out button (v0.11, A5).
+        The thread reference stays until then too."""
         self._set_busy(False)
-        self.step_button.setEnabled(True)
-        # v0.10 (R1): the start button is disabled only while a
-        # start task runs; re-enabling it here is safe for every
-        # op, since it is enabled whenever no start is running.
-        self.start_button.setEnabled(True)
         self.cancel_button.hide()
         self._local_op = None
         # The completion button's state depends on the picker.
@@ -3461,6 +4003,12 @@ class MainWindow(QMainWindow):
             "step %d: resonance %.3f, W norm %.3f -> %.3f"
             % (entry["id"], entry["resonance"],
                entry["old_norm"], entry["new_norm"]))
+        # v0.11 (B1): the step landed, so the session is dirty
+        # (the saved file is out of date) and the recovery copy
+        # updates. Autosave runs after the step, never before:
+        # a failed step leaves the previous copy standing.
+        self._dirty = True
+        self._autosave()
         self._refresh_all()
         note = "Step %d done." % entry["id"]
         if entry["new_layer"]:
@@ -3470,6 +4018,13 @@ class MainWindow(QMainWindow):
             # happened, so the fallback is never silent.
             note = fallback_message + " " + note
         self.status_label.setText(note)
+        # v0.11 (A1): the input clears after a successful step --
+        # typed, stepped, or local. The box is for the NEXT
+        # sentence, not a record of the last one. A failed step
+        # returns before this, so the text stays for a retry.
+        # Example steps run through here too; the box is already
+        # empty for them, so clearing is harmless.
+        self.input_edit.clear()
 
     def on_step(self):
         text = self.input_edit.toPlainText().strip()
@@ -3642,25 +4197,55 @@ class MainWindow(QMainWindow):
         step order, so buffer item j is the j-th of the last 50
         real steps: the same mapping Engine.resonant_entries
         uses (revert entries are not steps and are filtered out
-        first)."""
+        first). v0.11 (A3): scoped to the current run, like the
+        analysis itself -- the buffer is session-wide, so
+        entries outside the run are filtered out, and the
+        analogy's A and B are the run's most resonant entries."""
         steps = [e for e in self.engine.trace
                  if "reverted_to" not in e]
         count = len(self.engine.buffer)
+        run_ids = {entry["id"] for entry in self._run_trace()}
         vectors = {}
         pool = {}
         for j, item in enumerate(self.engine.buffer):
             entry = steps[len(steps) - count + j]
+            if entry["id"] not in run_ids:
+                continue
             vectors[entry["id"]] = item["vector"]
             text = self._entry_text(entry)
             if text not in pool:
                 pool[text] = item["vector"]
         resonant = []
         for text, vector, _res, _new, step_id in (
-                self.engine.resonant_entries(2)):
+                self.engine.resonant_entries()):
+            if step_id not in run_ids:
+                continue
             resonant.append((self._full_texts.get(step_id, text),
                              vector))
+            if len(resonant) >= 2:
+                break
         return {"vectors": vectors, "pool": pool,
                 "resonant": resonant}
+
+    def _run_trace(self):
+        """The trace entries the Analyze results cover: the
+        batch's steps after a batch, the whole trace before any
+        batch (v0.11, A3). Revert entries stay in the list:
+        summarize_run filters them, and the chart needs the
+        trace as it is."""
+        if not self._batch_has_run:
+            return list(self.engine.trace)
+        return [entry for entry in self.engine.trace
+                if self._run_start_id <= entry["id"]
+                <= self._run_end_id]
+
+    def _run_scope_text(self):
+        """What the Analyze results cover, in the hero's words:
+        "in this run" after a batch, "in this session" before
+        any batch (v0.11, A3)."""
+        if self._batch_has_run:
+            return "in this run"
+        return "in this session"
 
     def start_batch(self, paths, source_note=""):
         """Run a batch analysis: every line of the picked files
@@ -3680,6 +4265,10 @@ class MainWindow(QMainWindow):
             return False
         self._batch_cancelled = False
         self._batch_source_note = source_note
+        # v0.11 (A3): the run starts at the next step id. The
+        # run range itself is set when the run lands (a run that
+        # lands no steps leaves the previous run standing).
+        self._pending_run_start = self.engine.step_count + 1
         self._clear_completion_mark()
         self._set_busy(True)
         self.step_button.setEnabled(False)
@@ -3735,15 +4324,27 @@ class MainWindow(QMainWindow):
             "%.3f, W norm %.3f."
             % (done, total, steps, skipped, resonance, w_norm))
         # v0.10 (R5): the chart and hero update as steps land,
-        # not only at the end. A snapshot of the trace: the
-        # worker owns the engine until the run lands.
-        self.analyze_window.show_live(
-            list(self.engine.trace), done, total)
+        # not only at the end. A snapshot of the run's trace:
+        # the worker owns the engine until the run lands, and
+        # the live view covers this run, not the session (v0.11,
+        # A3).
+        run_trace = [entry for entry in self.engine.trace
+                     if entry["id"] >= self._pending_run_start]
+        self.analyze_window.show_live(run_trace, done, total)
 
     def _clear_batch_thread(self):
-        """Drop the batch thread once it has stopped."""
+        """Drop the batch thread once it has stopped, and put
+        the buttons back. v0.11 (A5): Step and Go re-enable
+        HERE, on thread.finished -- the same gap as the local
+        calls had (see _clear_local_thread). Go re-enables only
+        when a file or folder is still picked: with nothing
+        picked it stays greyed out."""
         self._batch_thread = None
         self._batch_worker = None
+        self.step_button.setEnabled(True)
+        self.analyze_window.go_button.setEnabled(
+            bool(self.analyze_window._paths))
+        self._refresh_complete_button()
 
     def _on_batch_finished(self, result):
         """A batch run landed, on the UI thread. The heat history
@@ -3755,9 +4356,22 @@ class MainWindow(QMainWindow):
         self._trim_heat_history()
         self._full_texts.update(result["texts"])
         self._locators.update(result["locators"])
+        # v0.11 (A3): the run is this batch's steps. A run that
+        # landed no steps (cancelled or failed at once) leaves
+        # the previous run standing: the old results stay, and
+        # the hero keeps saying what they cover.
+        if result.get("first_step") is not None:
+            self._run_start_id = result["first_step"]
+            self._run_end_id = result["last_step"]
+            self._batch_has_run = True
+        # v0.11 (B1): the run landed, so the session is dirty
+        # and the recovery copy updates -- once per run, not per
+        # line: a per-line autosave would rewrite the whole
+        # session for every line of a long file.
+        if result["steps"]:
+            self._dirty = True
+            self._autosave()
         self._set_busy(False)
-        self.step_button.setEnabled(True)
-        self.analyze_window.go_button.setEnabled(True)
         self.analyze_window.cancel_button.setEnabled(False)
         self._refresh_all()
         self._refresh_completion_ui()
@@ -3771,11 +4385,15 @@ class MainWindow(QMainWindow):
         if result["cancelled"]:
             note = ("Analysis stopped at %d steps in this run."
                     % steps)
+            # v0.11 (N7): a stopped run resets the bar to 0:
+            # the partial percentage is not a result.
+            self.analyze_window.progress_bar.setValue(0)
             self._clear_completion_mark()
         elif result["error"] is not None:
             note = ("The local model service stopped. The "
                     "analysis stopped at %d steps in this run."
                     % steps)
+            self.analyze_window.progress_bar.setValue(0)
             self._clear_completion_mark()
         else:
             note = ("Analysis done: %d steps in this run." % steps)
@@ -3807,11 +4425,15 @@ class MainWindow(QMainWindow):
         self._clear_completion_mark()
 
     def _refresh_analysis(self):
-        """Recompute the analysis from the current trace and show
+        """Recompute the analysis from the current run and show
         it in the Analyze window. A loaded session restores the
-        analysis too, because the trace is what a session saves."""
-        summary = summarize_run(self.engine.trace)
-        self.analyze_window.show_results(summary, self.engine.trace)
+        analysis too, because the trace is what a session saves.
+        v0.11 (A3): the analysis covers the run's trace, not the
+        whole session's -- analyzing a second file shows that
+        file's results."""
+        run_trace = self._run_trace()
+        summary = summarize_run(run_trace)
+        self.analyze_window.show_results(summary, run_trace)
 
     def export_trace_to(self, path):
         """Write the trace log as JSON. Returns the path."""
@@ -3901,18 +4523,152 @@ class MainWindow(QMainWindow):
     def on_save_session(self):
         if self._refuse_if_batch_running():
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save session", "acr-session.json",
-            "JSON files (*.json)")
-        if not path:
-            return
+        self._save_session_interactive()
+
+    def _save_session_interactive(self):
+        """Save the session, asking where only when there is no
+        remembered path (v0.11, B1: Ctrl+S re-saves). Returns
+        True when a save happened, False when the user cancelled
+        the picker or the write failed. The status line says
+        which."""
+        path = self._session_path
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save session", "acr-session.json",
+                "JSON files (*.json)")
+            if not path:
+                return False
         try:
             self.save_session_to(path)
         except OSError:
             self.logger.exception("session save failed")
             self.status_label.setText("Save failed - could not write.")
-            return
+            return False
+        self._session_path = path
+        self._mark_saved()
         self.status_label.setText("Session saved to %s" % path)
+        return True
+
+    def _mark_saved(self):
+        """The session is saved to its file: not dirty, the
+        recovery copy is deleted (the file has it), and the
+        saved line shows the time."""
+        self._dirty = False
+        self._delete_autosave()
+        self.saved_label.setText("Saved %s"
+                                 % time.strftime("%H:%M"))
+        self._refresh_dirty_marker()
+
+    def _maybe_save_before_discard(self, action):
+        """Ask about unsaved steps before an action that wipes
+        the session (Load, an encoder or model switch). Returns
+        True when the caller should go ahead: the session is
+        clean, the user saved it, or the user chose to discard
+        it. False when the user cancelled, or picked Save and
+        then cancelled the picker."""
+        if not self._dirty:
+            return True
+        answer = QMessageBox.question(
+            self, "Unsaved steps",
+            "The current session has unsaved steps. Save it "
+            "before %s?" % action,
+            QMessageBox.Save | QMessageBox.Discard
+            | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Save:
+            return self._save_session_interactive()
+        return True
+
+    def _autosave(self):
+        """Write the recovery copy (v0.11, B1): the whole session,
+        as a session file, to the autosave path. Runs after each
+        manual step and when a batch lands -- never per batch
+        line. Silent on success except for the saved line; a
+        failed write is logged, never a popup: the user is
+        mid-thought, and the next step tries again. Returns True
+        when the copy was written."""
+        if self.engine.step_count == 0:
+            return False
+        try:
+            parent = os.path.dirname(self._autosave_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self.save_session_to(self._autosave_path)
+        except OSError:
+            self.logger.exception("autosave failed")
+            return False
+        self.saved_label.setText("Autosaved %s"
+                                 % time.strftime("%H:%M"))
+        return True
+
+    def _delete_autosave(self):
+        """Drop the recovery copy, when one exists: the session
+        is saved to its file, or deliberately wiped. Never
+        raises: a missing file is already gone."""
+        try:
+            os.remove(self._autosave_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.logger.exception("autosave delete failed")
+
+    def maybe_offer_restore(self):
+        """Offer to restore the autosaved session, when one
+        exists (v0.11, B1). Called once from main(), after the
+        window shows -- never from __init__, so building a
+        window (tests included) never pops a dialog. Returns
+        True when a session was restored. A damaged file is
+        dropped with a plain status line; a file whose session
+        cannot load (the local encoder is down) is kept, and
+        the offer comes again next launch."""
+        path = self._autosave_path
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            steps = len(data["engine"]["trace"])
+        except (OSError, ValueError, KeyError, TypeError):
+            self._delete_autosave()
+            self.status_label.setText(
+                "The autosaved session was damaged and could "
+                "not be restored.")
+            return False
+        if steps == 0:
+            self._delete_autosave()
+            return False
+        try:
+            saved_at = time.strftime(
+                "%H:%M", time.localtime(os.path.getmtime(path)))
+        except OSError:
+            saved_at = "earlier"
+        answer = QMessageBox.question(
+            self, "Restore autosaved session",
+            "ACR saved a session with %d steps at %s. Restore "
+            "it?" % (steps, saved_at),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            self._delete_autosave()
+            return False
+        try:
+            self.load_session_from(path)
+        except (OSError, SessionError) as exc:
+            self.logger.action("autosave restore failed: %s" % exc)
+            self.status_label.setText(
+                "Could not restore the autosaved session: %s."
+                % exc)
+            return False
+        # The restored session was never saved to a file: it is
+        # dirty, and Ctrl+S opens Save-As (load_session_from
+        # never sets the remembered path, so the autosave file
+        # itself is never the save target).
+        self._dirty = True
+        self._refresh_dirty_marker()
+        self.status_label.setText(
+            "Restored the autosaved session (%d steps)." % steps)
+        return True
 
     def load_session_from(self, path):
         """Load a session file, restoring encoder, engine, settings,
@@ -4095,10 +4851,16 @@ class MainWindow(QMainWindow):
         # v0.10 (R15): the restored source note shows in the
         # Analyze window. The picker is cleared: the loaded
         # session's source is a record, not a picked file, so
-        # Go says "Pick a file or a folder first" until the user
-        # picks one.
+        # Go greys out until the user picks one (v0.11, A5).
         self.analyze_window._paths = []
+        self.analyze_window.go_button.setEnabled(False)
         self.analyze_window._source_note = source_note
+        # v0.11 (A3): a loaded session's run is the whole loaded
+        # trace: the run is the session until the next batch.
+        self._run_start_id = 1
+        self._run_end_id = 0
+        self._batch_has_run = False
+        self._pending_run_start = 1
         if source_note:
             self.analyze_window.source_label.setText(
                 "Source: %s" % source_note)
@@ -4182,6 +4944,12 @@ class MainWindow(QMainWindow):
     def on_load_session(self):
         if self._refuse_if_batch_running():
             return
+        # v0.11 (B1): loading replaces the session. Offer to
+        # save first when the session has unsaved steps; a
+        # discarded session's autosave goes too.
+        if not self._maybe_save_before_discard(
+                "loading another session"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Load session", "", "JSON files (*.json)")
         if not path:
@@ -4197,6 +4965,15 @@ class MainWindow(QMainWindow):
             self.logger.action("session load rejected: %s" % exc)
             self.status_label.setText("Load failed - %s." % exc)
             return
+        # The loaded session is the saved one: the old autosave
+        # is a discarded session's copy, and Ctrl+S re-saves to
+        # the loaded file.
+        self._delete_autosave()
+        self._session_path = path
+        self._dirty = False
+        self.saved_label.setText("Saved %s"
+                                 % time.strftime("%H:%M"))
+        self._refresh_dirty_marker()
         self.status_label.setText("Session loaded from %s" % path)
 
     # -- exports ------------------------------------------------------
@@ -4323,10 +5100,40 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "Report failed - could not write.")
             return
-        QMessageBox.information(
-            self, "Debug report",
-            "Report written to:\n%s\n\nSend it to %s if something "
-            "broke." % (path, REPORT_EMAIL))
+        # v0.11 (A12): the report used to name its path and stop
+        # there -- finding the file to send it was the user's
+        # problem. The dialog offers to open the folder it is in,
+        # or save a copy somewhere easy to reach.
+        box = QMessageBox(self)
+        box.setWindowTitle("Debug report")
+        box.setText("Report written to:\n%s\n\nSend it to %s if "
+                    "something broke." % (path, REPORT_EMAIL))
+        open_button = box.addButton("Open folder",
+                                    QMessageBox.ActionRole)
+        save_button = box.addButton("Save a copy",
+                                    QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Close)
+        box.setDefaultButton(QMessageBox.Close)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is open_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(
+                os.path.dirname(path)))
+        elif clicked is save_button:
+            dest, _ = QFileDialog.getSaveFileName(
+                self, "Save a copy of the debug report",
+                os.path.basename(path), "Text files (*.txt)")
+            if not dest:
+                return
+            try:
+                shutil.copy(path, dest)
+            except OSError:
+                self.logger.exception("debug report copy failed")
+                self.status_label.setText(
+                    "Copy failed - could not write.")
+                return
+            self.status_label.setText(
+                "Debug report copied to %s" % dest)
 
     def do_reset(self):
         self.engine.reset()
@@ -4338,6 +5145,16 @@ class MainWindow(QMainWindow):
         self._completion_model = None
         self._completion_text = None
         self._known_flag_steps = set()
+        # v0.11: a reset is a deliberate wipe -- no run, no
+        # remembered file, nothing dirty, no recovery copy.
+        self._run_start_id = 1
+        self._run_end_id = 0
+        self._batch_has_run = False
+        self._pending_run_start = 1
+        self._session_path = None
+        self._dirty = False
+        self.saved_label.setText("")
+        self._delete_autosave()
         self._clear_completion_mark()
         self.logger.action("session reset")
         self._refresh_all()
@@ -4406,6 +5223,10 @@ class MainWindow(QMainWindow):
         self.logger.action(
             "reverted W_t to step %d: W norm %.3f -> %.3f"
             % (step_id, entry["old_norm"], entry["new_norm"]))
+        # v0.11 (B1): a revert changes the session, so it is
+        # dirty and the recovery copy updates.
+        self._dirty = True
+        self._autosave()
         self._refresh_all()
         self.status_label.setText(
             "Reverted W_t to step %d." % step_id)
@@ -4442,23 +5263,37 @@ class MainWindow(QMainWindow):
         self._celebrate_new_flags()
         self._refresh_flag_marker()
         self._refresh_example()
+        # v0.11: the dirty dot and the Complete button track the
+        # session on every refresh, so they never lag a step.
+        self._refresh_dirty_marker()
+        self._refresh_complete_button()
 
     def _refresh_flag_marker(self):
         """The persistent flag marker (v0.10, R7): a gold dot
         next to the resonance readout, naming the latest
         flagged step on hover. It stays until the next flag or
         a reset. Computed from the trace, so a loaded session
-        shows its latest flag too."""
+        shows its latest flag too. v0.11 (A13): the text label
+        next to the dot names the step in plain text, so the
+        flag never depends on a hover to be understood."""
         flagged = [entry["id"] for entry in self.engine.trace
                    if entry["new_layer"]]
         if not flagged:
             self.flag_marker.hide()
+            self.flag_label.hide()
             return
         latest = max(flagged)
         self.flag_marker.setToolTip(
             "New layer candidate flagged at step %d. See "
             "Resonance views." % latest)
+        self.flag_label.setText("Flag at step %d" % latest)
         self.flag_marker.show()
+        self.flag_label.show()
+
+    def _refresh_dirty_marker(self):
+        """The dirty dot (v0.11, B1): visible while the session
+        has steps since the last explicit save."""
+        self.dirty_marker.setVisible(self._dirty)
 
     def _celebrate_new_flags(self):
         """The resonance moment (v0.9, technique 8): when a step
@@ -4623,16 +5458,27 @@ class MainWindow(QMainWindow):
             self.trace_detail.setText("")
             return
         entry = self.engine.trace[row]
-        self.trace_detail.setText(
-            "Step %d: %s" % (entry["id"],
-                             self._entry_text(entry)))
+        text = "Step %d: %s" % (entry["id"],
+                                self._entry_text(entry))
+        if "reverted_to" in entry:
+            # v0.11 (N3): a revert row's resonance is not a
+            # measurement of the step -- it is the last input's
+            # match against the restored weights. Say so, or
+            # the number reads as a step that never happened.
+            text += (" Resonance here is the last input's match "
+                     "against the restored weights.")
+        self.trace_detail.setText(text)
 
     def _refresh_buffer_list(self):
         self.buffer_list.clear()
         for item in reversed(self.engine.buffer):
-            self.buffer_list.addItem(item["text"])
-            # v0.10 (R3): the full text, on hover: the list
-            # clips long lines.
+            # v0.11 (N6): long entries trim with "...", like the
+            # trace table's elision. The buffer already stores
+            # 80-character previews, but 80 characters of one
+            # repeated word still floods the list with no sign
+            # it was cut. The full preview stays on hover (R3).
+            self.buffer_list.addItem(
+                _trim_display(item["text"], 60))
             row = self.buffer_list.item(
                 self.buffer_list.count() - 1)
             row.setToolTip(item["text"])
@@ -4664,6 +5510,14 @@ class MainWindow(QMainWindow):
                     "Counter-examples - what this session is not:")
                 for text, score in result["counter_examples"]:
                     lines.append("  %.3f  %s" % (score, text))
+            else:
+                # v0.11 (A4): nothing in the session is actually
+                # different from the current input yet -- say
+                # so, instead of listing theme sentences as what
+                # the session is not.
+                lines.append(
+                    "Counter-examples: nothing in this session "
+                    "is far from the current input yet.")
         if result["neighbours"]:
             lines.append("Closest past inputs:")
             for text, score in result["neighbours"]:
@@ -4873,8 +5727,66 @@ def _instance_name():
     return os.environ.get(INSTANCE_ENV, INSTANCE_DEFAULT)
 
 
+def _splash_pixmap():
+    """The startup splash image, drawn in code: the dark
+    background, the gold ACR wordmark, and a plain "starting"
+    line. No image file needed, so it works from a fresh clone
+    as well as from the zip."""
+    pixmap = QPixmap(320, 140)
+    pixmap.fill(QColor(THEME_BG))
+    painter = QPainter(pixmap)
+    painter.setPen(QColor(ACCENT_GOLD))
+    font = QFont()
+    font.setPointSize(28)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "ACR")
+    painter.setPen(QColor(THEME_DIM))
+    font.setPointSize(10)
+    font.setBold(False)
+    painter.setFont(font)
+    rect = pixmap.rect().adjusted(0, 40, 0, 0)
+    painter.drawText(rect, Qt.AlignHCenter | Qt.AlignTop,
+                     "Adaptive Contextual Resonance")
+    rect = pixmap.rect().adjusted(0, 0, 0, -16)
+    painter.drawText(rect, Qt.AlignHCenter | Qt.AlignBottom,
+                     "Starting...")
+    painter.end()
+    return pixmap
+
+
+def _run_smoke_test(app, window):
+    """The install smoke check (v0.11, A9): 16 theme steps
+    through the real window, then quit with 0 when the state
+    looks right, 1 when anything fails. Prints one plain line
+    either way, for install.sh to show. The smoke session's
+    autosave is deleted before quitting, so the next real
+    launch never offers to restore a test run."""
+    try:
+        for sentence in EXAMPLE_SENTENCES * 4:
+            window._run_step(sentence, None, None)
+        if window.engine.step_count != 16:
+            raise RuntimeError("step count is %d, want 16"
+                               % window.engine.step_count)
+        norm = window.engine.w_norm()
+        if not 1.0 < norm < 3.0:
+            raise RuntimeError("W norm %.4f is outside 1.0-3.0"
+                               % norm)
+    except Exception as exc:
+        print("Smoke test FAILED: %s" % exc)
+        window._delete_autosave()
+        app.exit(1)
+        return
+    print("Smoke test OK: 16 steps, W norm %.4f"
+          % window.engine.w_norm())
+    window._delete_autosave()
+    app.exit(0)
+
+
 def main(argv=None):
-    app = QApplication(sys.argv if argv is None else argv)
+    args = sys.argv if argv is None else argv
+    smoke_test = "--smoke-test" in args
+    app = QApplication(args)
     # v0.9 identity (U15): the dark look, on the whole app.
     apply_theme(app)
     # v0.10 (R9): the big-text preset, when the user saved it.
@@ -4885,7 +5797,10 @@ def main(argv=None):
     # then exits 0. tryLock takes its timeout argument: the bare
     # call raises TypeError in this PySide6 build. removeServer
     # first, or a crashed run leaves its socket behind and the
-    # next listen fails.
+    # next listen fails. v0.11 (A8): the fast path is
+    # acr_launch.py, which checks the lock after importing
+    # QtCore only -- this check stays as the correctness net
+    # for direct launches and the double-click race.
     name = _instance_name()
     lock_path = os.path.join(tempfile.gettempdir(),
                              "acr-%s.lock" % name)
@@ -4902,6 +5817,16 @@ def main(argv=None):
     QLocalServer.removeServer("ACR-" + name)
     server = QLocalServer()
     server.listen("ACR-" + name)
+    # v0.11 (A8): the splash shows while the window builds, so
+    # the launch is never silent. The desktop's startup
+    # notification (StartupNotify in ACR.desktop) covers the
+    # import phase before this; the splash covers the window
+    # build. No splash for the smoke test: it quits on its own.
+    splash = None
+    if not smoke_test:
+        splash = QSplashScreen(_splash_pixmap())
+        splash.show()
+        app.processEvents()
     window = MainWindow()
 
     def _on_raise_request():
@@ -4917,6 +5842,17 @@ def main(argv=None):
 
     server.newConnection.connect(_on_raise_request)
     window.show()
+    if splash is not None:
+        splash.finish(window)
+    if smoke_test:
+        # The smoke drive runs once the event loop is up, then
+        # quits with its exit code.
+        QTimer.singleShot(0, lambda: _run_smoke_test(app, window))
+    else:
+        # v0.11 (B1): the restore offer, once the window is up
+        # and visible -- never before, and never in a test
+        # (tests build MainWindow directly, not through main).
+        window.maybe_offer_restore()
     return app.exec()
 
 

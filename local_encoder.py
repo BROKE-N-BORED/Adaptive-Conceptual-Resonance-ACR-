@@ -110,6 +110,17 @@ def _format_bytes(size):
     return "%d KB" % (size // 1024)
 
 
+def is_embedding_model(name):
+    """True when the model name says it is an embedding model.
+
+    The same name rule model_display_text uses: a model with
+    "embed" in its name is an embedding model, anything else is
+    a text model. The service reports no kind field, so the name
+    is all there is -- and it is what the picker shows, so the
+    warning and the picker never disagree (v0.11, A14)."""
+    return "embed" in name.lower()
+
+
 def model_display_text(info, total_ram_bytes, known_dim=None):
     """One line for the model picker (v0.9, U39): what the model
     does and whether it fits this PC.
@@ -125,7 +136,7 @@ def model_display_text(info, total_ram_bytes, known_dim=None):
     useful line: name and kind, no invented numbers.
     """
     name = info["name"]
-    kind = ("embedding model" if "embed" in name.lower()
+    kind = ("embedding model" if is_embedding_model(name)
             else "text model")
     parts = [kind]
     if info.get("parameter_size"):

@@ -69,8 +69,9 @@ class VizTests(unittest.TestCase):
                          self.window.engine.trace[0]["new_norm"])
 
     def test_chart_flags_mirror_trace(self):
-        # v0.3 note: under the v0.2 engine the first flag lands at
-        # step 15 (the v0.1 engine flagged at step 11), so the
+        # v0.11 note: under the calibrated threshold (0.4) the
+        # flags land at steps 12 and 15 (the v0.2 engine flagged
+        # at step 15 only, the v0.1 engine at step 11), so the
         # flag-bearing tests step 16 theme sentences.
         self._step_theme(16)
         chart = self.window.norm_chart
@@ -156,24 +157,32 @@ class VizTests(unittest.TestCase):
         self.assertGreater(pixmap.width(), 0)
 
     def test_layer_view_lists_candidate(self):
+        # v0.11 (B2): the calibrated 0.4 threshold flags at
+        # steps 12 and 15 now, not 15 alone. The list leads
+        # with the first flag.
         self._step_theme(16)
-        self.assertGreaterEqual(self.window.layer_list.count(), 1)
+        self.assertEqual(self.window.layer_list.count(), 2)
         first = self.window.layer_list.item(0).text()
-        self.assertIn("Step 15", first)
-        self.assertIn("quantum particles stay connected", first)
+        self.assertIn("Step 12", first)
+        self.assertIn("entanglement links distant particles",
+                      first)
         self.assertIn("resonance", first)
+        second = self.window.layer_list.item(1).text()
+        self.assertIn("Step 15", second)
+        self.assertIn("quantum particles stay connected", second)
 
     def test_layer_click_shows_trace_entries(self):
         self._step_theme(16)
         self.window.layer_list.setCurrentRow(0)
         detail = self.window.layer_detail.toPlainText()
-        self.assertIn("Step 15 (spike)", detail)
-        self.assertIn("quantum particles stay connected", detail)
+        self.assertIn("Step 12 (spike)", detail)
+        self.assertIn("entanglement links distant particles",
+                      detail)
         self.assertIn("W norm:", detail)
         self.assertIn("Resonance:", detail)
         # Context entries around the spike are shown too.
-        self.assertIn("Step 14 (before)", detail)
-        self.assertIn("Step 16 (after)", detail)
+        self.assertIn("Step 11 (before)", detail)
+        self.assertIn("Step 13 (after)", detail)
 
     def test_layer_view_empty_before_spikes(self):
         self._step_text("one lonely sentence")

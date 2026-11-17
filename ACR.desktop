@@ -5,5 +5,6 @@ Comment=Adaptive Contextual Resonance - small-scale adaptive loop
 Exec=bash "__APP_DIR__/run.sh"
 Icon=__APP_DIR__/icons/acr-48.png
 Terminal=false
+StartupNotify=true
 Categories=Utility;Science;
 StartupWMClass=ACR

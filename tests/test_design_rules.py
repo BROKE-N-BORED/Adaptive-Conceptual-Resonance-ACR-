@@ -757,14 +757,17 @@ class BentoTests(WindowCase):
         path = self._theme_fixture()
         self.assertTrue(self._run_batch([path]))
         analyze = self.window.analyze_window
+        # v0.11 (A3/B2): the hero counts the run, not the
+        # session, and the strongest theme is the step-12
+        # trigger with peak 0.522.
         self.assertEqual(analyze.hero_title.text(),
-                         "1 theme found in 24 steps in this "
-                         "session")
+                         "1 theme found in 24 steps in this run")
         self.assertIn("Strongest theme",
                       analyze.hero_theme.text())
-        self.assertIn("quantum particles stay connected",
+        self.assertIn("entanglement links distant particles",
                       analyze.hero_theme.text())
-        self.assertIn("step 15", analyze.hero_theme.text())
+        self.assertIn("trigger step 12",
+                      analyze.hero_theme.text())
 
     def test_tiles_hold_the_right_findings(self):
         path = self._theme_fixture()
@@ -794,10 +797,12 @@ class BentoTests(WindowCase):
             fh.write("the toaster needs a new heating element\n")
         self.assertTrue(self._run_batch([path], "mixed.txt"))
         analyze = self.window.analyze_window
+        # v0.11 (A3/B2): the hero counts the run, and the
+        # no-theme line says no themes were found -- not "no
+        # resonance spikes", which named the old spike rule.
         self.assertEqual(analyze.hero_title.text(),
-                         "0 themes found in 2 steps in this "
-                         "session")
-        self.assertIn("No resonance spikes",
+                         "0 themes found in 2 steps in this run")
+        self.assertIn("No themes found",
                       analyze.hero_theme.text())
 
 
@@ -808,7 +813,7 @@ class FlagMomentTests(WindowCase):
     def test_flag_moment_fires_on_a_flagged_step(self):
         for i in range(15):
             self._step_text(THEME[i % 4])
-        self.assertEqual(self.window._known_flag_steps, {15})
+        self.assertEqual(self.window._known_flag_steps, {12, 15})
         chart = self.window.norm_chart
         self.assertIsNotNone(chart._pulse_anim)
         self.assertEqual(chart._pulse_anim.duration(), 300)
@@ -855,7 +860,7 @@ class FlagMomentTests(WindowCase):
             and self.window._glow_anim is None
             and self.window._flag_anim is None,
             timeout=3.0)
-        self.assertEqual(self.window._known_flag_steps, {15})
+        self.assertEqual(self.window._known_flag_steps, {12, 15})
         # A refresh with no new flag starts no animation.
         self.window._refresh_all()
         self.assertIsNone(self.window.norm_chart._pulse_anim)
@@ -924,7 +929,20 @@ class PressDipTests(WindowCase):
             self.window.step_button.graphicsEffect())
 
     def test_go_button_dips_on_press(self):
-        go = self.window.analyze_window.go_button
+        # v0.11 (A5): Go is greyed out until a file is picked,
+        # and a disabled button dips nothing. Pick a one-line
+        # file first, so the press lands and the batch it starts
+        # finishes at once.
+        analyze = self.window.analyze_window
+        path = os.path.join(self.tmp.name, "dip.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(THEME[0] + "\n")
+        with mock.patch(
+                "acr_app.QFileDialog.getOpenFileName",
+                return_value=(path, "")):
+            analyze.on_pick_file()
+        self.assertTrue(analyze.go_button.isEnabled())
+        go = analyze.go_button
         QTest.mousePress(go, Qt.LeftButton)
         anim = getattr(go, "_dip_anim", None)
         self.assertIsNotNone(anim)
@@ -935,6 +953,11 @@ class PressDipTests(WindowCase):
         _pump_until(lambda: go.graphicsEffect() is None,
                     timeout=3.0)
         self.assertIsNone(go.graphicsEffect())
+        # The release started the batch: let it land before the
+        # window closes, or the teardown kills a live worker.
+        self.assertTrue(_pump_until(
+            lambda: self.window._batch_thread is None,
+            timeout=25.0))
 
     def test_no_dip_under_reduced_motion(self):
         with mock.patch.dict(
@@ -959,7 +982,7 @@ class ReducedMotionTests(WindowCase):
                 os.environ, {"ACR_REDUCED_MOTION": "1"}):
             for i in range(16):
                 self._step_text(THEME[i % 4])
-            self.assertEqual(self.window._known_flag_steps, {15})
+            self.assertEqual(self.window._known_flag_steps, {12, 15})
             self.assertIsNone(
                 self.window.norm_chart._pulse_anim)
             self.assertIsNone(self.window._glow_anim)

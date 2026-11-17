@@ -94,8 +94,30 @@ DIM = 64
 RANK = 8
 BUFFER_SIZE = 50
 SEED = 20261112
-RESONANCE_THRESHOLD = 0.75
+# v0.11: the flag threshold, calibrated to the observed resonance
+# scale. 0.75 never fired: the canonical 16-theme run peaks at
+# 0.59, a 12-line theme block in a file peaks at 0.46, and a
+# 312-line two-theme file peaks at 0.63 -- so every flag came
+# from the jump leg alone, and a file with two clear themes came
+# back "0 themes found" (user audit 2026-11-16, B2). 0.4 is the
+# same bar as RESONANT_FLOOR: a settled theme holds 0.45-0.55,
+# a mixed drive never passes 0.35, so 0.4 sits between the noise
+# and the plateau. The canonical 16-theme run now flags steps 12
+# and 15 (was step 15 only); W norm and resonance are unchanged
+# -- the flag rule never feeds the update.
+RESONANCE_THRESHOLD = 0.4
 RESONANCE_JUMP = 0.25
+# v0.11: a counter-example must actually differ from the current
+# input. Theme sentences score at least 0.19 against each other
+# (measured range 0.19-0.72 over the theme sentences), while
+# unrelated lines score below 0.1 (fiscal 0.04 and -0.05,
+# off-topic 0.03-0.06 and negatives), so 0.1 sits between
+# same-theme and different. Below it, the entry shares almost
+# nothing with the current input; above it, listing it as "what
+# this session is not" would be wrong (user audit 2026-11-16,
+# A4). A session with nothing below the bar has no
+# counter-examples, and the panel says so.
+COUNTER_EXAMPLE_MAX = 0.1
 # v0.6: a step counts as resonant when its resonance is at least
 # this. A fresh theme scores about 0.05-0.20 and a settled theme
 # holds about 0.45-0.55 (16 theme steps, alpha 0.30: late steps
@@ -723,7 +745,14 @@ class Engine:
                        and self.prev_resonance < RESONANCE_THRESHOLD)
             jumped = (resonance - self.prev_resonance
                       >= RESONANCE_JUMP)
-            new_layer = crossed or jumped
+            # v0.11: a frozen step never flags. W_t did not move,
+            # so no new layer was found, whatever the resonance
+            # jump -- the jump only says the input changed, not
+            # that W_t learned anything (user audit 2026-11-16,
+            # A10). Partial rank freezes still adapt, so flagging
+            # stays allowed there: only the whole-W_t freeze
+            # blocks it.
+            new_layer = (crossed or jumped) and not frozen
 
         self.step_count += 1
         entry = {
@@ -866,8 +895,10 @@ class Engine:
         exist, or when no other input is left to point at: no
         analogy is invented. Counter-examples are the distinct
         past inputs farthest from the current input (lowest
-        cosine), up to three: what this session is not. Empty
-        when the buffer is empty.
+        cosine), up to three, and only those below
+        COUNTER_EXAMPLE_MAX: what this session is not. Empty
+        when the buffer is empty, or when nothing in the session
+        is actually different from the current input.
         """
         if not self.buffer or self.h_prev is None:
             return {"neighbours": [], "midpoint": [],
@@ -878,8 +909,17 @@ class Engine:
         # the neighbours, 2x in the midpoint). The midpoint is now
         # between the top two distinct neighbours, not a vector
         # and itself.
+        # v0.11: the current input is not a past input, so it is
+        # not its own closest match: it used to sit at the top of
+        # the neighbours at 1.000 (user audit 2026-11-16, N5).
+        # The midpoint follows: it is between the top two
+        # neighbours, not between the current input and one
+        # neighbour.
+        current_text = self.buffer[-1]["text"]
         best = {}
         for item in self.buffer:
+            if item["text"] == current_text:
+                continue
             score = _dot(self.h_prev, item["vector"])
             if (item["text"] not in best
                     or score > best[item["text"]]):
@@ -945,7 +985,11 @@ class Engine:
         # the current input, lowest cosine first. Duplicates
         # collapse to one entry each, so the three shown are three
         # different inputs. The current input itself never counts.
-        current_text = self.buffer[-1]["text"]
+        # v0.11: only entries below COUNTER_EXAMPLE_MAX count as
+        # different. Without the bar, a session on one theme
+        # listed its own theme sentences as "what this session is
+        # not" (user audit 2026-11-16, A4): the farthest theme
+        # sentence is still the theme.
         farthest = {}
         for item in self.buffer[:-1]:
             if item["text"] == current_text:
@@ -954,9 +998,10 @@ class Engine:
             if (item["text"] not in farthest
                     or score < farthest[item["text"]]):
                 farthest[item["text"]] = score
-        ranked = sorted(farthest.items(), key=lambda kv: kv[1])[:3]
+        ranked = sorted(farthest.items(), key=lambda kv: kv[1])
         counter_examples = [(text, round(score, 4))
-                            for text, score in ranked]
+                            for text, score in ranked
+                            if score < COUNTER_EXAMPLE_MAX][:3]
         return {"neighbours": neighbours, "midpoint": midpoint,
                 "analogy": analogy,
                 "counter_examples": counter_examples}

@@ -174,7 +174,7 @@ class WindowSessionTests(unittest.TestCase):
             data = json.load(fh)
         self.assertEqual(data["format"], "acr-session")
         self.assertEqual(data["version"], 2)
-        self.assertEqual(data["app_version"], "0.10")
+        self.assertEqual(data["app_version"], "0.11")
         self.assertIn("engine", data)
         self.assertIn("settings", data)
         self.assertIn("heat_history", data)
@@ -232,8 +232,9 @@ class WindowSessionTests(unittest.TestCase):
         self.assertEqual(self.window.freeze_combo.currentIndex(), 1)
 
     def test_save_load_restores_views(self):
-        # 16 theme steps flags step 15 under the v0.2 engine, so
-        # the chart, the heatmap, and the layer list all have data.
+        # 16 theme steps flags steps 12 and 15 under the v0.11
+        # calibrated threshold (0.4), so the chart, the heatmap,
+        # and the layer list all have data.
         self._step_theme(16)
         path = self._path("session.json")
         self.window.save_session_to(path)
@@ -242,8 +243,11 @@ class WindowSessionTests(unittest.TestCase):
         self.assertEqual(self.window.layer_list.count(), 0)
         self.window.load_session_from(path)
         self.assertEqual(len(self.window.norm_chart.values), 16)
-        self.assertEqual(self.window.layer_list.count(), 1)
+        self.assertEqual(self.window.layer_list.count(), 2)
         self.assertEqual(self.window.layer_list.item(0).text(),
+                         "Step 12: entanglement links distant "
+                         "particles (resonance 0.460)")
+        self.assertEqual(self.window.layer_list.item(1).text(),
                          "Step 15: quantum particles stay connected "
                          "(resonance 0.482)")
         self.assertEqual(len(self.window.heatmap.values), DIM)
@@ -312,9 +316,14 @@ class WindowSessionTests(unittest.TestCase):
         path = self._path("broken.json")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{this is not json")
+        # v0.11 (B1): loading over a dirty session confirms
+        # first. Discard: the load then fails on the bad file,
+        # and the live 2 steps stay put either way.
         with mock.patch.object(
                 acr_app.QFileDialog, "getOpenFileName",
-                return_value=(path, "JSON files (*.json)")):
+                return_value=(path, "JSON files (*.json)")), \
+                mock.patch("acr_app.QMessageBox.question",
+                           return_value=QMessageBox.Discard):
             self.window.on_load_session()
         self.assertTrue(
             self.window.status_label.text().startswith("Load failed"))

@@ -1,4 +1,4 @@
-# ACR v0.10 - Adaptive Contextual Resonance
+# ACR v0.11 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
@@ -19,14 +19,19 @@ A real, runnable prototype of the core idea from the blueprint:
   signal from the blueprint), so repeated themes strengthen the
   direction they share.
 - Resonance is the match between your input and the dominant
-  direction of W_t, from 0 to 1. A spike flags a new-layer candidate.
+  direction of W_t, from 0 to 1. A step flags a new-layer candidate
+  when the resonance crosses 0.4 or jumps by 0.25 in one step; a
+  frozen step never flags, because W_t did not move.
 - The trace log records every step: what went in, how far W_t moved,
   the resonance, the confidence, and whether the cap clipped the
   step (10 columns in all).
 - Analyze a file runs the same loop over every line of a text file
   or a folder of them, and shows what is in it: the themes, the
-  core entries, the outliers, and where the topic changes. The
-  core entries export as a curated file, plain text or .jsonl.
+  core entries, the outliers, and where the topic changes. A theme
+  is a sustained stretch that held together, not one spike: the
+  results cover the latest run only, and the headline counts real
+  themes. The core entries export as a curated file, plain text
+  or .jsonl.
 
 ## What this is not
 
@@ -51,7 +56,10 @@ bash install.sh
 
 The installer creates a private folder with everything ACR needs,
 puts an ACR icon in your menu and on your desktop, and adds an `acr`
-command. Nothing is installed system-wide.
+command. Nothing is installed system-wide. It shows what it is
+doing as it goes, and checks the app starts before it finishes:
+if the check fails, it says so plainly instead of leaving a broken
+icon behind.
 
 ## Run
 
@@ -100,21 +108,29 @@ synthesis head. The rest lives in its own window, opened from View.
 5. Export trace JSON saves the whole trace log as a file. Export
    trace CSV saves the same log as a spreadsheet-friendly file.
    Both are on the File menu.
-6. The Resonance views window shows the W_t norm over time (red
-   dots are resonance spikes), the change heatmap for one step
-   (pick a step to look back, or leave it on the latest), and the
-   layer candidates: resonance spikes with the input that
-   triggered them. Click a candidate to see its trace entries.
-   Hover over the chart to see a step's values; click a point
-   (or drag across the chart) to jump the heatmap and the trace
-   selection to that step. When a layer is flagged, a gold dot
-   stays next to the resonance readout on the main window until
-   the next flag or a reset.
+6. The Resonance views window shows the W_t norm over time, from
+   0 (the red dots are resonance events: steps that flagged a
+   new-layer candidate), the change heatmap for one step (pick a
+   step to look back, or leave it on the latest), and the layer
+   candidates: flagged steps with the input that triggered them.
+   Click a candidate to see its trace entries. Hover over the
+   chart to see a step's values; click a point (or drag across
+   the chart) to jump the heatmap and the trace selection to that
+   step. When a layer is flagged, a gold dot stays next to the
+   resonance readout on the main window, with a label naming the
+   flagged step, until the next flag or a reset.
 7. Save session writes the whole session (W_t, buffer, trace,
-   settings) to one JSON file. Load session brings it back exactly
-   where you left off. Export session writes the same session as
-   readable text: the inputs and trace in time order, with the
-   final state at the top.
+   settings) to one JSON file. Ctrl+S saves to the same file
+   again without asking where; the first save asks. Load session
+   brings it back exactly where you left off. Export session
+   writes the same session as readable text: the inputs and trace
+   in time order, with the final state at the top. ACR also saves
+   a recovery copy in the background as steps land: if the app
+   closes with unsaved steps, the next launch offers the session
+   back. The status line shows when the session was last saved,
+   and a gold dot marks unsaved steps. Loading a session, or
+   switching encoders, over unsaved steps asks first, offering to
+   save.
 8. Reset asks first, then clears the session and puts W_t back to
    its start.
 9. Encoder: the picker offers Built-in or Local model. Built-in
@@ -124,12 +140,16 @@ synthesis head. The rest lives in its own window, opened from View.
    http://127.0.0.1:11434). Picking Local model lists every
    installed model with what it does and whether it fits this PC;
    nothing is picked for you, pick a model to use the local
+   encoder. Picking a text model (not an embedding model) as the
+   encoder warns first: a text model may not work well as an
    encoder. Start service starts the service for you if it is
-   not running, so you never need the terminal for it. Switching
-   encoders starts a fresh W_t, because the embedding sizes differ:
-   the trace and buffer clear, and the window says so. If the
-   service stops mid-session, ACR falls back to the built-in
-   encoder with a fresh W_t and says so plainly. Sessions remember
+   not running, so you never need the terminal for it; it keeps
+   running after ACR closes. Switching encoders starts a fresh
+   W_t, because the embedding sizes differ: the trace and buffer
+   clear, and the window says so, asking first when the session
+   has unsaved steps. If the service stops mid-session, ACR falls
+   back to the built-in encoder with a fresh W_t and says so
+   plainly. Sessions remember
    which encoder they used: a session saved with the local encoder
    needs the service running (with that model installed) to load
    back. Every local-model call runs in a worker thread, so the
@@ -140,14 +160,18 @@ synthesis head. The rest lives in its own window, opened from View.
 10. The synthesis head shows more than neighbours now: an Analogy
     (like one resonant input is to another, your input points at
     a third past input), and Counter-examples (the past inputs
-    farthest from the current one: what this session is not).
-    When the Local model encoder is active, Complete with local
-    model asks an installed model to continue the theme from the
-    most resonant inputs; its words show in the panel, labelled
-    with the model name. The button is off until a model is picked
-    in its picker, which lists every installed model the same way
-    the encoder picker does. The completion is on-demand only:
-    stepping never generates anything.
+    actually far from the current one: what this session is not).
+    When nothing in the session is far from the current input,
+    it says so instead of listing theme sentences. The closest
+    inputs never list the current input itself. When the Local
+    model encoder is active, Complete with local model asks an
+    installed model to continue the theme from the most resonant
+    inputs; its words show in the panel, labelled with the model
+    name. The button is off until a model is picked in its picker
+    and there are resonant inputs to complete from; the picker
+    lists every installed model the same way the encoder picker
+    does. The completion is on-demand only: stepping never
+    generates anything. The input box clears after each step.
 11. Revert: click a step in the trace log, then Revert W_t to
     selected step, to roll W_t back to its state after that
     step. It asks first, and shows the W norm the revert will
@@ -161,31 +185,41 @@ synthesis head. The rest lives in its own window, opened from View.
 12. Analyze a file (the button on the main window, or View, then
     Analyze a file) runs the same loop over every line of a text
     file or a folder of them, in file order. Plain text, .md, and
-    .jsonl all work; a .jsonl record uses its text field. The
-    progress bar shows how far along it is, Cancel stops it, and
-    the steps it finished stay in the trace like typed ones. While
-    it runs, the chart and the headline tile update as steps land.
-    When it finishes, the results land as tiles: one big tile for
-    the headline (themes found and the strongest theme), then tiles
+    .jsonl all work; a .jsonl record uses its text field. In a
+    .md file, headers, code fences, and horizontal rules are
+    skipped, and list markers are stripped: markup is not
+    content. The progress bar shows how far along it is, Cancel
+    stops it (and the bar goes back to 0), and the steps it
+    finished stay in the trace like typed ones. While it runs,
+    the chart and the headline tile update as steps land. When it
+    finishes, the results land as tiles: one big tile for the
+    headline (themes found and the strongest theme), then tiles
     for the resonance chart over the run, the themes found, the
     core entries (the most resonant: the heart of the file), the
     outliers (the noise and off-topic lines), and the theme shifts
-    (where the topic changes). Hover over a finding to see the
-    whole entry; double-click one to read it in full. Export
-    curated file saves the core entries as plain
-    text, one per line; Export curated .jsonl saves them as one
-    {"text": ...} object per line; Export report saves the whole
-    analysis as readable text. Export STELLA data pack first shows
-    a preview of the packs it is about to write (names, row counts,
-    first rows); Write these packs saves them. Each pack is one
+    (where the topic changes). The results cover the latest run
+    only: analyzing a second file shows that file's results, and
+    the headline says so. An entry is core or outlier, never
+    both. Hover over a finding to see the whole entry;
+    double-click one to read it in full; a finding cut short in
+    its tile shows "...". Export curated file saves the core
+    entries as plain text, one per line; Export curated .jsonl
+    saves them as one {"text": ...} object per line; Export
+    report saves the whole analysis as readable text. Export
+    STELLA data pack first shows a preview of the packs it is
+    about to write (names, row counts, first rows); Write these
+    packs saves them. If the session changes after the preview,
+    the preview says it is out of date. Each pack is one
     training-data pack per theme found (a folder with a .jsonl
     file of training rows, a README, and a manifest), plus one
     off-topic pack for the entries that belong to no theme. The
     packs teach a model what ACR found, not the raw text: theme
     membership, closest matches, analogies, and resonance
     judgments, all measured from the run. Every entry is verbatim
-    from the source: nothing is invented. STELLA needs 2 or more
-    rows per file, so a pack with fewer says so in its README.
+    from the source: nothing is invented. A run that finds no
+    themes writes no packs: with no theme to be central to, no
+    entry can be judged off-topic. STELLA needs 2 or more rows
+    per file, so a pack with fewer says so in its README.
 
 Every window remembers its size and position between runs.
 Re-clicking the icon focuses the running app; it never starts a
@@ -210,8 +244,10 @@ happening, the UI is still.
 
 Press Generate debug report in the window. It writes one file with
 the version, the system details, the recent actions, and any errors.
-Send that file to broke.n.bored.studio@gmail.com. The report never
-carries passwords, keys, or tokens.
+The dialog offers to open the folder it is in, or save a copy
+somewhere easy to reach. Send that file to
+broke.n.bored.studio@gmail.com. The report never carries passwords,
+keys, or tokens.
 
 ## How it works, in plain words
 
@@ -240,15 +276,31 @@ both the decay and the gradient step.
 The analogy takes the two most resonant past inputs (layer
 candidates first) and applies the direction between them to the
 current input: the nearest other past input to that point is the
-answer. Counter-examples are the past inputs with the lowest
-cosine to the current input. Both are built only from the
-session's own buffer and the resonance W_t reports; nothing comes
-from outside the session. A step counts as resonant when its
-resonance is at least 0.4: a fresh theme scores about 0.05-0.20
-and a settled theme holds about 0.45-0.55, so 0.4 sits between
-the noise and the plateau. Every synthesis list shows each input
-once: repeated inputs are the same point, so they collapse to one
-line each instead of repeating.
+answer. Counter-examples are the past inputs with a cosine below
+0.1 to the current input: genuinely far, not just the farthest of
+a close bunch. Both are built only from the session's own buffer
+and the resonance W_t reports; nothing comes from outside the
+session. A step counts as resonant when its resonance is at least
+0.4: a fresh theme scores about 0.05-0.20 and a settled theme
+holds about 0.45-0.55, so 0.4 sits between the noise and the
+plateau. Every synthesis list shows each input once: repeated
+inputs are the same point, so they collapse to one line each
+instead of repeating. The neighbours list never holds the current
+input itself.
+
+Themes are found by segmentation, not by single spikes: the run
+is split where the words change (a stretch of new vocabulary
+after a stretch of old), and a stretch counts as a theme when its
+resonance holds up -- at least 0.4 at its peak, or at least 0.18
+with the same sentences coming back. Stretches on the same topic
+merge into one theme. A theme needs about 12 steps of repetition
+to lock on: shorter or more scattered runs find no themes, and
+that is the engine honestly reporting what it measured, not a
+miss. Natural text with no repeated sentences rarely locks on at
+all at this scale: the engine learns from repetition. The same
+rule cuts the other way: a short set of unrelated sentences
+cycling will read as a weak theme, because at this scale
+repetition is the only signal the engine has.
 
 Two limits in the app have concrete reasons. The latent state
 buffer holds the last 50 inputs: the synthesis head works from
@@ -272,6 +324,8 @@ DELTA-RULE-PROBE.md.
 
 - `acr_app.py` - the window and the resonance views
 - `acr_engine.py` - the adaptive loop (standard library only)
+- `acr_launch.py` - the fast launcher: the single-instance check
+  before the heavy imports, then the app
 - `acr_packs.py` - the STELLA data pack writer: theme
   membership, closest matches, analogies, and resonance
   judgments as prompt/completion rows, one pack per theme

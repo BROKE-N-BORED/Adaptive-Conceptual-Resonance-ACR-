@@ -10,4 +10,8 @@ if [ ! -x .venv/bin/python ]; then
   exit 1
 fi
 
-exec .venv/bin/python acr_app.py "$@"
+# v0.11: launch through acr_launch.py, which checks the
+# single-instance lock after importing QtCore only -- a second
+# launch exits in about a second instead of paying for the full
+# import first. The launcher execs acr_app.py in this process.
+exec .venv/bin/python acr_launch.py "$@"

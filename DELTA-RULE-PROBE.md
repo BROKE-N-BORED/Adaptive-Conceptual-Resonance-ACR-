@@ -92,3 +92,38 @@ baseline in brackets): 5-step bin means 0.08, 0.12, 0.38, 0.50,
   resonance.
 - `tests/test_gui.py`: freeze test warms up with two steps, with a
   note; row count updated to match.
+
+## Canonical 16-step drive, v0.11 re-pin
+
+The 16-step theme drive (4 sentences cycled, alpha 0.3) is the
+reference run the tests pin. v0.11 changed the flag threshold and
+the synthesis head's neighbour list; the update rule is untouched,
+so the end state is the same and only the flag/neighbour pins
+moved. Old values (v0.2-v0.10) in brackets.
+
+- Step 16: W norm 1.5938, resonance 0.5216. Unchanged.
+- Resonance series: 0.058, 0.057, 0.080, 0.133, 0.074, 0.016,
+  0.036, 0.169, 0.266, 0.119, 0.242, 0.460, 0.517, 0.219, 0.482,
+  0.522. Unchanged.
+- Flags: steps 12 and 15 [step 15 only]. The threshold moved
+  0.75 -> 0.4, calibrated to the observed scale: no run ever
+  reached 0.75 (the 30-step peak is 0.59), so every flag before
+  v0.11 came from the jump leg alone. Step 12 crosses 0.4
+  (0.242 -> 0.460); step 15 crosses again after the dip and jumps
+  0.263.
+- Neighbours: 0.721 / 0.302 / 0.217 [1.000 / 0.721 / 0.302]. The
+  current input is no longer its own closest match, so the list
+  starts at the closest past input.
+- Midpoint neighbours: 0.585 / 0.224 [0.448 / 0.222]. The midpoint
+  is now between the top two past inputs; its top entry is the
+  current input's text, which genuinely sits near that midpoint.
+- Analogy: unchanged. A "quantum particles stay connected"
+  (step 15), B "entanglement links distant particles" (step 12
+  now, same text and vector as the old step-16 copy), result
+  "quantum entanglement links particles" (0.470).
+- Counter-examples: none for a pure theme run [three theme
+  sentences]. The floor is 0.1 now: only inputs actually far from
+  the current one count, and a pure theme run has none.
+- A frozen whole-W_t step never flags, whatever the resonance
+  jump: W_t did not move, so no new layer was found. A partial
+  (rank) freeze still adapts, so it can still flag.

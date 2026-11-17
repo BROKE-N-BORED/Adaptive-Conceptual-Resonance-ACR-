@@ -31,12 +31,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 import local_encoder  # noqa: E402
 from acr_app import MainWindow  # noqa: E402
-from acr_engine import (RESONANT_FLOOR, Engine, _dot,  # noqa: E402
-                        _normalize, encode)
+from acr_engine import (COUNTER_EXAMPLE_MAX, RESONANT_FLOOR,  # noqa: E402
+                        Engine, _dot, _normalize, encode)
 from local_encoder import (MSG_MODEL_FAILED, MSG_SERVICE_DOWN,  # noqa: E402
                            MSG_SERVICE_SLOW, LocalModelClient,
                            LocalModelError, pick_completion_model)
@@ -247,9 +247,11 @@ class ResonantEntriesTests(unittest.TestCase):
             self.assertGreaterEqual(res, RESONANT_FLOOR)
 
     def test_layer_candidate_sorts_first(self):
-        # Step 15 of the theme drive is the layer candidate
-        # (resonance 0.4823); step 16 scores higher (0.5216) but
-        # is not a candidate, so the candidate still leads.
+        # Steps 12 and 15 of the theme drive are the layer
+        # candidates (v0.11 calibrated threshold 0.4); step 15
+        # (resonance 0.4823) leads as the highest candidate.
+        # Step 16 scores higher (0.5216) but is not a candidate,
+        # so it never leads.
         engine = Engine()
         _drive_theme(engine, 16)
         entries = engine.resonant_entries()
@@ -291,8 +293,9 @@ class AnalogyTests(unittest.TestCase):
         _drive_theme(engine, 16)
         analogy = engine.synthesize()["analogy"]
         self.assertIsNotNone(analogy)
-        # A is the layer candidate (step 15), B the highest
-        # resonance (step 16); both pinned by the probe numbers.
+        # A is the layer candidate (step 15), B the next layer
+        # candidate (step 12, same text as step 16); both pinned
+        # by the probe numbers.
         self.assertEqual(analogy["a"],
                          "quantum particles stay connected")
         self.assertEqual(analogy["b"],
@@ -350,7 +353,8 @@ class CounterExampleTests(unittest.TestCase):
         _drive_mixed(engine, 8)
         result = engine.synthesize()["counter_examples"]
         # Independent recompute: distinct texts except the
-        # current input's, lowest cosine first, up to three.
+        # current input's, lowest cosine first, up to three --
+        # and only below the counter-example floor (v0.11, A4).
         current = engine.buffer[-1]["text"]
         farthest = {}
         for item in engine.buffer[:-1]:
@@ -360,18 +364,25 @@ class CounterExampleTests(unittest.TestCase):
             if (item["text"] not in farthest
                     or score < farthest[item["text"]]):
                 farthest[item["text"]] = score
-        expected = sorted(farthest.items(),
-                          key=lambda kv: kv[1])[:3]
+        expected = [pair for pair in sorted(
+            farthest.items(), key=lambda kv: kv[1])
+            if pair[1] < COUNTER_EXAMPLE_MAX][:3]
+        # Non-vacuous: the mixed drive has two far entries.
+        self.assertEqual(len(expected), 2)
         self.assertEqual([t for t, _s in result],
                          [t for t, _s in expected])
         for (_t, score), (_t2, want) in zip(result, expected):
             self.assertAlmostEqual(score, want, places=3)
 
     def test_distinct_texts(self):
+        # v0.11 (A4): the pure theme drive has no
+        # counter-examples any more (nothing in it is far from
+        # the theme), so distinctness is checked on the mixed
+        # drive: two far entries, two distinct texts.
         engine = Engine()
-        _drive_theme(engine, 16)
+        _drive_mixed(engine, 8)
         result = engine.synthesize()["counter_examples"]
-        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result), 2)
         texts = [text for text, _score in result]
         self.assertEqual(len(texts), len(set(texts)))
 
@@ -397,7 +408,11 @@ class SynthesizeShapeTests(unittest.TestCase):
         self.assertIsNone(result["analogy"])
         self.assertEqual(result["counter_examples"], [])
 
-    def test_neighbours_and_midpoint_unchanged(self):
+    def test_neighbours_exclude_current_input(self):
+        # v0.11 (N5): the current input is no longer its own
+        # closest match. The top neighbour is the closest PAST
+        # input (0.5283, measured); the current input never
+        # appears in the neighbours list.
         engine = Engine()
         engine.step("quantum entanglement links particles")
         engine.step("baking bread needs warm dough")
@@ -406,8 +421,19 @@ class SynthesizeShapeTests(unittest.TestCase):
         self.assertGreater(len(result["neighbours"]), 0)
         top_text, top_score = result["neighbours"][0]
         self.assertEqual(top_text,
+                         "quantum entanglement links particles")
+        self.assertAlmostEqual(top_score, 0.5283, places=3)
+        self.assertNotIn("quantum particles stay connected",
+                         [text for text, _s
+                          in result["neighbours"]])
+        # The midpoint list MAY show the current input's text:
+        # it genuinely sits near the midpoint of the top two
+        # neighbours (0.3796, measured). That is a measured
+        # fact, not a self-match at 1.000.
+        self.assertEqual(result["midpoint"][0][0],
                          "quantum particles stay connected")
-        self.assertAlmostEqual(top_score, 1.0, places=3)
+        self.assertAlmostEqual(result["midpoint"][0][1], 0.3796,
+                               places=3)
 
 
 # ---------------------------------------------------------------- client
@@ -527,6 +553,7 @@ class WindowCase(unittest.TestCase):
 
 class SynthesisPanelTests(WindowCase):
     def test_panel_shows_analogy_and_counter_examples(self):
+        # Analogy, on the pure theme drive.
         self._step_theme(16)
         text = self._synthesis()
         self.assertIn("Analogy - like", text)
@@ -534,6 +561,17 @@ class SynthesisPanelTests(WindowCase):
         self.assertIn("entanglement links distant particles", text)
         self.assertIn("your input points at:", text)
         self.assertIn("quantum entanglement links particles", text)
+        # v0.11 (A4): a pure theme drive has no counter-examples
+        # -- nothing in it is far from the theme -- so the panel
+        # says so instead of listing theme sentences.
+        self.assertIn("nothing in this session is far from the "
+                      "current input yet", text)
+        # Counter-examples, once genuinely different inputs
+        # land: the theme sentences are far from the car battery
+        # line, so they are the counter-examples now.
+        self._step_text("the toaster needs a new heating element")
+        self._step_text("my car battery died this morning")
+        text = self._synthesis()
         self.assertIn("Counter-examples - what this session is "
                       "not:", text)
         self.assertIn("entangled particles share a state", text)
@@ -689,12 +727,21 @@ class CompletionPickerTests(LocalWindowCase):
         self.assertIn("Pick a model",
                       self.window.completion_note.text())
         self._pick_completion("other:1b")
+        # v0.11 (A5): picking a model is not enough any more --
+        # Complete stays greyed out until there are resonant
+        # inputs to complete from.
+        self.assertFalse(self.window.complete_button.isEnabled())
+        self._step_theme(16)
         self.assertTrue(self.window.complete_button.isEnabled())
 
     def test_picker_refreshes_when_encoder_model_changes(self):
         self._go_local()
         self._pick_completion("other:1b")
-        self._pick_model("other:1b")
+        # v0.11 (A14): other:1b is a text model, so picking it
+        # as the encoder warns first. Yes: use it anyway.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Yes):
+            self._pick_model("other:1b")
         self.assertEqual(self.window.local_model, "other:1b")
         combo = self.window.completion_combo
         items = [combo.itemData(i) for i in range(combo.count())]
@@ -703,6 +750,10 @@ class CompletionPickerTests(LocalWindowCase):
         # The standing pick is kept: the picker is independent of
         # the encoder choice.
         self.assertEqual(combo.currentData(), "other:1b")
+        # v0.11 (A5): no steps yet, so Complete stays greyed
+        # out; it enables once resonant inputs exist.
+        self.assertFalse(self.window.complete_button.isEnabled())
+        self._step_theme(16)
         self.assertTrue(self.window.complete_button.isEnabled())
 
     def test_only_encoder_installed_still_completes(self):
@@ -716,6 +767,10 @@ class CompletionPickerTests(LocalWindowCase):
         self.assertTrue(combo.isEnabled())
         self.assertFalse(self.window.complete_button.isEnabled())
         self._pick_completion("nomic-embed-text:latest")
+        # v0.11 (A5): the pick alone does not enable Complete;
+        # resonant inputs do.
+        self.assertFalse(self.window.complete_button.isEnabled())
+        self._step_theme(16)
         self.assertTrue(self.window.complete_button.isEnabled())
         self.assertIn("Pick a model",
                       self.window.completion_note.text())
@@ -723,8 +778,14 @@ class CompletionPickerTests(LocalWindowCase):
     def test_back_to_builtin_disables_completion(self):
         self._go_local()
         self._pick_completion("other:1b")
+        self._step_theme(16)
         self.assertTrue(self.window.complete_button.isEnabled())
-        self.window.encoder_combo.setCurrentIndex(0)
+        # v0.11 (B1): the switch wipes a dirty session, so it
+        # confirms. Discard: the test is about the button, not
+        # the save.
+        with mock.patch("acr_app.QMessageBox.question",
+                        return_value=QMessageBox.Discard):
+            self.window.encoder_combo.setCurrentIndex(0)
         self.assertFalse(self.window.complete_button.isEnabled())
         self.assertEqual(self.window.completion_combo.count(), 0)
         self.assertEqual(self.window.completion_note.text(),
@@ -751,7 +812,12 @@ class CompletionTests(LocalWindowCase):
     def test_complete_scrolls_panel_to_completion(self):
         # The completion sits at the bottom of the panel: after
         # completing, the panel is scrolled to it, not left on
-        # the neighbours at the top.
+        # the neighbours at the top. v0.11 (N4) made the panel
+        # taller, so the text fits without scrolling at the
+        # production height: shrink the box for this test, so
+        # there is something to scroll.
+        self.window.synthesis_text.setMaximumHeight(100)
+        QTest.qWait(100)
         self._go_local()
         self._pick_completion("other:1b")
         self._step_theme(16)
@@ -776,8 +842,15 @@ class CompletionTests(LocalWindowCase):
         self._go_local()
         self._pick_completion("other:1b")
         self._step_theme(2)
+        # v0.11 (A5): with no resonant inputs the button is
+        # greyed out, so a click does nothing at all.
+        self.assertFalse(self.window.complete_button.isEnabled())
         QTest.mouseClick(self.window.complete_button,
                          Qt.LeftButton)
+        self.assertEqual(FakeLocalHandler.generate_posts, 0)
+        # The guard itself still stands when called directly:
+        # plain status, no call, no completion text.
+        self.window.on_complete()
         self.assertIn("No resonant inputs yet",
                       self.window.status_label.text())
         self.assertEqual(FakeLocalHandler.generate_posts, 0)

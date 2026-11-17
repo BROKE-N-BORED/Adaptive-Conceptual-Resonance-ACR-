@@ -2,6 +2,67 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.11 (2026-11-17) - User audit
+
+A full run-through as a user found 4 blocks, 15 annoyances, and
+7 nice-to-haves. All 26 are fixed here.
+
+- No lost work: ACR saves a recovery copy in the background as
+  steps land. If the app closes with unsaved steps, the next
+  launch offers the session back. The status line shows when the
+  session was last saved, a gold dot marks unsaved steps, Ctrl+S
+  re-saves to the same file, and loading a session or switching
+  encoders over unsaved steps asks first, offering to save.
+- Analyze finds real themes now. The old rule needed one big
+  single-step resonance spike, so a file with two clear themes
+  came back "0 themes found". Themes are found by segmentation
+  instead: the run splits where the words change, and a stretch
+  counts as a theme when its resonance holds up. The flag
+  threshold is calibrated to the measured scale (0.4, was 0.75,
+  which no run ever reached). The canonical 16-theme run now
+  flags at steps 12 and 15 (was 15 only); the end state is
+  unchanged (W norm 1.5938, resonance 0.5216).
+- Packs no longer teach STELLA backwards: a run that finds no
+  themes writes no packs, instead of labelling the file's core
+  entries "Off-topic". And "Themes found" counts real themes,
+  not spike events: the 2-theme audit file reported 27, then 29.
+- Analyze results cover the latest run, not the whole session:
+  analyzing a second file shows that file's results, and the
+  headline says which run it counts. Manual steps after a batch
+  do not join the run.
+- The input box clears after each step. Core and outliers never
+  share an entry. Counter-examples only list inputs that are
+  actually far from the current one; when nothing is far, the
+  panel says so. The current input is no longer its own closest
+  match.
+- Buttons that cannot act are greyed out: Go with nothing picked,
+  Step while a local-model call is running, Complete with no
+  resonant inputs yet.
+- Finding text cut short in a tile shows "...". Markdown headers,
+  code fences, and horizontal rules are skipped in .md files;
+  list markers are stripped and the item text is stepped.
+- Startup shows feedback: a splash while the window builds, and
+  the desktop's busy cursor during the imports. A second launch
+  checks the single-instance lock before the heavy imports, so
+  it exits fast instead of paying for the full start first.
+- The installer shows progress during the download and checks
+  the app starts before it finishes.
+- A frozen step never flags a new layer: W_t did not move, so no
+  new layer was found. The Analyze window resizes freely and
+  shrinks below 750 px tall.
+- The debug report dialog offers to open the folder it is in, or
+  save a copy somewhere easy to reach. A text label next to the
+  flag dot names the flagged step. Picking a text model as the
+  encoder warns first. The pack preview says when it is out of
+  date. "Start service" is explained on the main window.
+- The chart is honest: the Y axis starts at 0, and the notes say
+  the line is the W_t norm and the dots are resonance events. A
+  revert trace row explains its resonance number. The synthesis
+  box is taller, so the midpoint neighbours are not buried below
+  the fold. Long entries in the latent buffer list are cut with
+  "..." like the trace table. The progress bar resets to 0 after
+  a cancelled run.
+
 ## v0.10 (2026-11-13) - Audit redesign
 
 - Every local-model call runs in a worker thread now, not just

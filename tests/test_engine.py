@@ -300,10 +300,16 @@ class SynthesisTests(unittest.TestCase):
         engine.step("quantum particles stay connected")
         result = engine.synthesize()
         self.assertGreater(len(result["neighbours"]), 0)
-        # The latest input is its own nearest neighbour.
+        # v0.11 (N5): the latest input is NOT its own nearest
+        # neighbour any more -- the top neighbour is the closest
+        # PAST input, and the current input never appears.
         top_text, top_score = result["neighbours"][0]
-        self.assertEqual(top_text, "quantum particles stay connected")
-        self.assertAlmostEqual(top_score, 1.0, places=3)
+        self.assertEqual(top_text,
+                         "quantum entanglement links particles")
+        self.assertAlmostEqual(top_score, 0.5283, places=3)
+        self.assertNotIn("quantum particles stay connected",
+                         [text for text, _s
+                          in result["neighbours"]])
 
 
 if __name__ == "__main__":
