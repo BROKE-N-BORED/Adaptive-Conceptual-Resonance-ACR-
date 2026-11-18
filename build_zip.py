@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build acr-v0.11.zip with correct stored file modes.
+"""Build acr-v0.12.zip with correct stored file modes.
 
 Scripts and launchers are stored as 0o100755 (regular file + exec
 bits, so GUI extractors keep the exec bit); everything else is
@@ -10,6 +10,12 @@ missing, so the build works from a fresh clone (the repo holds
 only icons/acr.svg; the PNGs are zip-only). render_icons.py ships
 in the zip for exactly that: without it, a fresh clone would have
 nothing to render with.
+
+v0.12: the build also writes the checksum sidecar
+acr-v0.12.zip.sha256 next to the zip (sha256sum format). The
+Release carries both files: the in-app updater checks the
+downloaded zip against the sidecar before installing anything,
+and refuses an update whose release has no sidecar.
 """
 
 import hashlib
@@ -18,8 +24,8 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.11"
-ZIP_NAME = "acr-v0.11.zip"
+VERSION = "0.12"
+ZIP_NAME = "acr-v0.12.zip"
 
 EXEC_FILES = {
     "install.sh",
@@ -33,6 +39,7 @@ PLAIN_FILES = [
     "acr_engine.py",
     "acr_launch.py",
     "acr_packs.py",
+    "acr_updates.py",
     "local_encoder.py",
     "debug_log.py",
     "build_zip.py",
@@ -59,6 +66,7 @@ PLAIN_FILES = [
     "tests/test_analyze.py",
     "tests/test_v10.py",
     "tests/test_v11.py",
+    "tests/test_v12.py",
 ]
 
 
@@ -125,9 +133,16 @@ def build():
     digest = hashlib.sha256()
     with open(zip_path, "rb") as fh:
         digest.update(fh.read())
+    # v0.12: the checksum sidecar, in sha256sum format. The
+    # Release carries it next to the zip; the updater verifies
+    # downloads against it.
+    sidecar_path = zip_path + ".sha256"
+    with open(sidecar_path, "w", encoding="utf-8") as fh:
+        fh.write("%s  %s\n" % (digest.hexdigest(), ZIP_NAME))
     print("built %s" % zip_path)
     print("size: %d bytes" % size)
     print("sha256: %s" % digest.hexdigest())
+    print("sidecar: %s" % sidecar_path)
     print("modes ok: %s" % ok)
     return 0 if ok else 1
 

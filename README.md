@@ -1,4 +1,4 @@
-# ACR v0.11 - Adaptive Contextual Resonance
+# ACR v0.12 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
@@ -74,6 +74,35 @@ Or, from the unzipped folder:
 ```
 bash run.sh
 ```
+
+## Updates
+
+On launch, ACR quietly asks GitHub whether a newer release is
+out. When you are up to date, nothing happens at all: no popup,
+no message. When a newer release is out, a popup says so and
+asks. Nothing is downloaded until you say yes.
+
+The download is checked before anything is installed: every
+release carries a checksum file, and the downloaded file must
+match it, or the update is refused and the download thrown away.
+A release with no checksum file is refused the same way.
+
+Once the update is downloaded and checked, ACR asks whether to
+restart now to complete the update. Yes restarts the program on
+its own with the update applied. No leaves the update staged,
+and it applies the next time ACR starts. Your session is safe
+either way: the autosave already holds it.
+
+Help, Check for updates asks by hand at any time. Help, Check
+for updates on startup turns the launch check off (it is on by
+default).
+
+Two honest notes. The updater in this version updates v0.12 to
+later versions: v0.11 has no updater, so install v0.12 once from
+the Release and updates work from there. And the updater replaces
+the app files and keeps the existing private folder with the
+libraries, so a future version that needs new libraries must say
+so in its release notes, and you re-run install.sh for that one.
 
 ## Use
 

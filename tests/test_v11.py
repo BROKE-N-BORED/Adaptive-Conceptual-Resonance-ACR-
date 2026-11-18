@@ -1309,21 +1309,21 @@ class ProgressResetTests(WindowCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_version_is_0_11_everywhere(self):
-        self.assertEqual(acr_app.VERSION, "0.11")
+    def test_version_is_0_12_everywhere(self):
+        self.assertEqual(acr_app.VERSION, "0.12")
         root = os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))
         with open(os.path.join(root, "README.md"),
                   encoding="utf-8") as fh:
-            self.assertIn("v0.11", fh.readline())
+            self.assertIn("v0.12", fh.readline())
         with open(os.path.join(root, "CHANGELOG.md"),
                   encoding="utf-8") as fh:
-            self.assertIn("## v0.11", fh.read())
+            self.assertIn("## v0.12", fh.read())
         with open(os.path.join(root, "build_zip.py"),
                   encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn('VERSION = "0.11"', text)
-        self.assertIn('ZIP_NAME = "acr-v0.11.zip"', text)
+        self.assertIn('VERSION = "0.12"', text)
+        self.assertIn('ZIP_NAME = "acr-v0.12.zip"', text)
 
 
 if __name__ == "__main__":

@@ -128,8 +128,12 @@ class MenuTests(WindowCase):
 
     def test_help_menu_actions(self):
         help_menu = self.window.menuBar().actions()[2].menu()
-        names = [action.text() for action in help_menu.actions()]
-        self.assertEqual(names, ["How to Use", "About"])
+        names = [action.text() for action in help_menu.actions()
+                 if not action.isSeparator()]
+        # v0.12: the update check joins the Help menu.
+        self.assertEqual(names, ["How to Use", "About",
+                                 "Check for updates",
+                                 "Check for updates on startup"])
         self.window.action_how_to_use.trigger()
         QTest.qWait(50)
         self.assertTrue(self.window.howto_window.isVisible())
@@ -142,7 +146,8 @@ class HowToTests(WindowCase):
     SECTIONS = ["What ACR is for", "How to use it",
                 "Reading the numbers", "The windows",
                 "Analyze a file", "STELLA data packs",
-                "Synthesis head", "Sessions and controls"]
+                "Synthesis head", "Sessions and controls",
+                "Updates"]
 
     def test_window_opens_with_all_sections(self):
         self.window.show_howto_window()

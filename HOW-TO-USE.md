@@ -1,6 +1,6 @@
 # ACR: How to Use and What to Use It For
 
-ACR v0.11. Plain words, everything the app does.
+ACR v0.12. Plain words, everything the app does.
 
 ## What ACR is for
 
@@ -206,3 +206,24 @@ inputs to complete from.
   the default, because the app cannot run with no encoder at all. Start
   service starts the local model service on this PC, so ACR can use your
   installed models; it keeps running after ACR closes.
+
+## Updates
+
+On launch, ACR quietly asks GitHub whether a newer release is
+out. When you are up to date, nothing happens at all: no popup,
+no message. When a newer release is out, a popup says so and
+asks. Nothing is downloaded until you say yes.
+
+The download is checked against the release checksum file
+before anything is installed. A download that does not match, or
+a release with no checksum file, is refused and thrown away.
+
+Once the update is downloaded and checked, ACR asks whether to
+restart now to complete the update. Yes restarts the program on
+its own with the update applied. No leaves the update staged,
+and it applies the next time ACR starts. Your session is safe
+either way: the autosave already holds it.
+
+Help, Check for updates asks by hand at any time. Help, Check
+for updates on startup turns the launch check off (it is on by
+default).

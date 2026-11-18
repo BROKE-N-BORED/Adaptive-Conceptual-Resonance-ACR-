@@ -2,6 +2,32 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.12 (2026-11-17) - Update check
+
+ACR checks for updates on its own now, and asks before doing
+anything about them.
+
+- On launch, the app quietly asks GitHub whether a newer release
+  is out. When you are up to date, nothing happens at all: no
+  popup, no message. The check runs in the background, so launch
+  never waits on the network.
+- When a newer release is out, a popup says so and asks. Nothing
+  is downloaded until you say yes. Help, Check for updates asks
+  by hand at any time, and Help, Check for updates on startup
+  turns the launch check off (it is on by default).
+- The download is checked against the release checksum file
+  before anything is installed. A download that does not match,
+  or a release with no checksum file, is refused and thrown away.
+- Once the update is downloaded and checked, ACR asks whether
+  to restart now to complete the update. Yes restarts the program
+  on its own with the update applied. No leaves the update
+  staged, and it applies the next time ACR starts. The autosave
+  holds the session either way.
+- The updater replaces the app files and keeps the existing
+  private library folder. The updater in v0.12 updates v0.12 to
+  later versions; v0.11 has no updater, so install v0.12 once
+  from the Release.
+
 ## v0.11 (2026-11-17) - User audit
 
 A full run-through as a user found 4 blocks, 15 annoyances, and

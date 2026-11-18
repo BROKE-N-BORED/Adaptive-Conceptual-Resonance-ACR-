@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.11.
+"""ACR - Adaptive Contextual Resonance, v0.12.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -62,6 +62,23 @@ batch progress is throttled and the heat history bounded, the
 View menu shows which windows are open, and the empty states
 and copy are polished. The engine is untouched: the 16-theme
 numbers are still exact.
+
+v0.11 is the user-audit fix: the app autosaves as you step and
+offers to restore, Analyze finds real themes instead of counting
+spikes, STELLA packs stop calling core entries off-topic,
+results are per-run, and the input box, buttons, lists, and
+labels stop getting in the way. The flag threshold moves 0.75 to
+0.4, so the 16-theme drive flags at steps 12 and 15; the step 16
+end state is unchanged.
+
+v0.12 is the update check: on launch the app silently asks
+GitHub whether a newer release is out, and says nothing at all
+when there is not one. When there is, it asks before pulling
+anything; the download is checked against the release checksum
+before it is staged, and the restart that applies it asks too.
+Answering No to the restart leaves the update staged, and the
+launcher applies it on the next start. The engine is untouched:
+the 16-theme numbers are still exact.
 """
 
 import csv
@@ -92,6 +109,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
+import acr_updates
 from acr_engine import (BUFFER_SIZE, DIM, RANK, SCHEDULES,
                         SCHEDULE_STEADY, Engine,
                         SESSION_FORMAT_VERSION, SessionError,
@@ -105,7 +123,7 @@ from local_encoder import (
     is_embedding_model, model_display_text)
 
 APP_NAME = "acr"
-VERSION = "0.11"
+VERSION = "0.12"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 # v0.9 identity (U15): ACR's own dark look, drawn from the icon
@@ -229,6 +247,14 @@ def big_text_enabled():
     """True when the user saved the big-text preset in settings."""
     return QSettings("BrokeNBored", "ACR").value(
         "big_text", False, type=bool)
+
+
+def update_check_on_startup():
+    """True when the app should silently check for a newer
+    release at launch (v0.12). On by default: a missing setting
+    means check. The Help menu toggle turns it off."""
+    return QSettings("BrokeNBored", "ACR").value(
+        "check_updates_on_startup", True, type=bool)
 
 
 def apply_big_text(app, enabled):
@@ -942,6 +968,106 @@ class LocalTaskWorker(QObject):
             self.finished.emit(exc)
         except Exception as exc:  # never strand the window
             self.finished.emit(LocalModelError(str(exc)))
+
+
+class UpdateCheckWorker(QObject):
+    """One update check, off the UI thread (v0.12 -- the same
+    pattern as LocalTaskWorker, and the same worker shape as
+    Pixel Forge v0.69's UpdateCheckWorker).
+
+    The check is one HTTP GET with an 8 second timeout -- short,
+    but the window must never wait on the network. finished
+    carries the check_for_update dict (state newer/current/
+    unknown, plus the release links) with the manual flag added:
+    manual says whether the user asked for the check, so the done
+    slot can tell a manual check from the silent startup one.
+    check_for_update never raises for a network or parsing
+    problem, and the blanket except is belt and braces -- a
+    worker must never die silently. urlopen and url are test
+    seams: a stub, or a fake releases endpoint. There is no
+    cancel: the fetch is one blocking call that cannot be
+    interrupted mid-flight, so a cancel would only be read at
+    the same moment the thread ends anyway.
+    """
+
+    finished = Signal(object)
+
+    def __init__(self, manual, urlopen=None, url=None):
+        super().__init__()
+        self.manual = manual
+        self.urlopen = urlopen
+        self.url = url
+
+    def run(self):
+        try:
+            result = acr_updates.check_for_update(
+                VERSION, urlopen=self.urlopen, url=self.url)
+        except Exception as exc:  # never strand the window
+            result = {"state": "unknown", "latest": None,
+                      "url": None,
+                      "reason": "the update check failed: %s" % exc}
+        result["manual"] = self.manual
+        self.finished.emit(result)
+
+
+class UpdateDownloadWorker(QObject):
+    """One update download, off the UI thread (v0.12).
+
+    Downloads the release zip and checks it against the release
+    checksum, then stages it for the next restart. finished
+    carries {"ok": True, "version", "staging"} on success, or
+    {"ok": False, "reason"} when the download or the check
+    failed, or {"ok": False, "cancelled": True} when the user
+    cancelled. progress carries (downloaded bytes, total bytes),
+    total -1 when the server did not say how big the file is.
+    The worker never touches a widget itself. Cancel is honoured
+    between chunks: a cancelled download throws its partial file
+    away. cancel() is a plain method and must be CALLED
+    directly, never connected as a slot: the worker thread is
+    busy inside run(), so a queued slot call would only land
+    after the download finished.
+    """
+
+    finished = Signal(object)
+    progress = Signal(int, int)
+
+    def __init__(self, result, staging_dir, urlopen=None):
+        super().__init__()
+        self.result = result
+        self.staging_dir = staging_dir
+        self.urlopen = urlopen
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        tmp = tempfile.mkdtemp(prefix="acr-update-")
+        try:
+            def _progress(done, total):
+                self.progress.emit(
+                    done, total if total is not None else -1)
+
+            downloaded = acr_updates.download_update(
+                self.result, tmp, progress_cb=_progress,
+                cancel=lambda: self._cancelled,
+                urlopen=self.urlopen)
+            staging = acr_updates.stage_update(
+                downloaded["zip_path"], downloaded["version"],
+                downloaded["sha256"], staging=self.staging_dir)
+            self.finished.emit({"ok": True,
+                                "version": downloaded["version"],
+                                "staging": staging})
+        except acr_updates.UpdateCancelled:
+            self.finished.emit({"ok": False, "cancelled": True})
+        except acr_updates.ACRUpdateError as exc:
+            self.finished.emit({"ok": False, "reason": str(exc)})
+        except Exception as exc:  # never strand the window
+            self.finished.emit(
+                {"ok": False,
+                 "reason": "the download failed: %s" % exc})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # v0.9 Analyze: file types a folder run picks up, and how many
@@ -2604,6 +2730,25 @@ class MainWindow(QMainWindow):
                 os.path.expanduser("~"), ".local", "share",
                 "ACR", "autosave.json")
 
+        # v0.12: update check and download state. One thread
+        # slot serves both (a check and a download never run at
+        # once -- the download starts from the popup after the
+        # check finished). _update_check_started keeps the
+        # silent startup check to once per launch. The _update_*
+        # seams are for tests: a stub urlopen, a fake releases
+        # endpoint, a staging home, and an install dir, all real
+        # when None.
+        self._update_thread = None
+        self._update_worker = None
+        self._update_kind = None
+        self._update_check_started = False
+        self._update_dialog = None
+        self._update_bar = None
+        self._update_urlopen = None
+        self._update_check_url = None
+        self._update_staging_dir = None
+        self._update_install_dir = None
+
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(
                 os.path.abspath(__file__)), "logs")
@@ -2649,6 +2794,16 @@ class MainWindow(QMainWindow):
         if self._batch_worker is not None:
             try:
                 self._batch_worker.cancelled = True
+            except RuntimeError:
+                pass
+        # v0.12: a download in flight is cancelled on quit; its
+        # partial file is thrown away by the worker. A check in
+        # flight is left to finish: it is one short request, and
+        # its answer is ignored because the window is gone.
+        if (self._update_worker is not None
+                and self._update_kind == "download"):
+            try:
+                self._update_worker.cancel()
             except RuntimeError:
                 pass
         for window in (self.controls_window, self.trace_window,
@@ -3041,6 +3196,30 @@ class MainWindow(QMainWindow):
         self.action_about = QAction("About", self)
         self.action_about.triggered.connect(self.on_about)
         help_menu.addAction(self.action_about)
+        help_menu.addSeparator()
+        # v0.12: the update check, wired like Pixel Forge v0.69's
+        # Help menu -- a manual check that works whether or not
+        # the automatic one is on, and the startup toggle. Unlike
+        # Pixel Forge, the startup check is ON by default: the
+        # standing order is a silent check on launch, and the
+        # toggle is the off switch.
+        self.action_check_updates = QAction("Check for updates",
+                                            self)
+        self.action_check_updates.setToolTip(
+            "Ask GitHub whether a newer ACR is out")
+        self.action_check_updates.triggered.connect(
+            self.on_check_updates)
+        help_menu.addAction(self.action_check_updates)
+        self.action_update_on_startup = QAction(
+            "Check for updates on startup", self)
+        self.action_update_on_startup.setCheckable(True)
+        self.action_update_on_startup.setChecked(
+            update_check_on_startup())
+        self.action_update_on_startup.setToolTip(
+            "Check for a newer version each time ACR starts")
+        self.action_update_on_startup.toggled.connect(
+            self._on_update_on_startup_toggled)
+        help_menu.addAction(self.action_update_on_startup)
 
     def toggle_controls_window(self, checked):
         if checked:
@@ -3080,6 +3259,272 @@ class MainWindow(QMainWindow):
         QSettings("BrokeNBored", "ACR").setValue(
             "big_text", checked)
         adjust_big_text(QApplication.instance(), checked)
+
+    # -- updates (v0.12) ------------------------------------------
+    def _on_update_on_startup_toggled(self, checked):
+        """The Help menu's Check for updates on startup toggle
+        (v0.12): remembers the choice for the next launch.
+        Turning it on does not check now; the check runs on the
+        next launch, or by hand."""
+        QSettings("BrokeNBored", "ACR").setValue(
+            "check_updates_on_startup", bool(checked))
+
+    def _staging_dir(self):
+        """Where a verified update waits: the real staging dir,
+        or the test seam when one is set."""
+        if self._update_staging_dir is not None:
+            return self._update_staging_dir
+        return acr_updates.staging_dir()
+
+    def _install_dir(self):
+        """The app tree the updater swaps: this file's dir, or
+        the test seam when one is set."""
+        if self._update_install_dir is not None:
+            return self._update_install_dir
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def maybe_start_update_check(self):
+        """The silent startup check (v0.12), called from main()
+        once the window is up and visible -- never before, and
+        never in a test (tests build MainWindow directly, not
+        through main). Once per launch, and only when the
+        setting is on (it is on by default). Silent when current
+        or unknown: no popup, no status change, no busy light.
+        A newer release pops the update offer."""
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        if update_check_on_startup():
+            self._start_update_check(manual=False)
+
+    def _start_update_check(self, manual):
+        """Start one update check in a worker, unless a check or
+        a download is already running. Returns False when one is
+        already running, True when one started."""
+        if self._update_thread is not None:
+            return False
+        worker = UpdateCheckWorker(
+            manual, urlopen=self._update_urlopen,
+            url=self._update_check_url)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_check_done)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._clear_update_thread(thread))
+        self._update_thread = thread
+        self._update_worker = worker
+        self._update_kind = "check"
+        if manual:
+            self._set_busy(True)
+            self.status_label.setText("Checking for updates...")
+        thread.start()
+        return True
+
+    def _clear_update_thread(self, thread=None):
+        """Drop the update thread once it has stopped -- but only
+        when it is still the current one. The download starts
+        from the check's finished handler, while the check thread
+        is still winding down; clearing unconditionally would
+        drop the download thread's reference and strand its
+        result. The thread reference clears only once the thread
+        has actually stopped: dropping it in the finished handler
+        destroys a still-running QThread."""
+        if thread is not None and self._update_thread is not thread:
+            return
+        self._update_thread = None
+        self._update_worker = None
+        self._update_kind = None
+
+    def on_check_updates(self):
+        """The Help menu's Check for updates action (v0.12): a
+        manual check, which works whether or not the automatic
+        one is on -- the user asking is not phoning home."""
+        if not self._start_update_check(manual=True):
+            self.status_label.setText(
+                "Already checking for updates.")
+
+    def _on_update_check_done(self, result):
+        """One check finished (v0.12), on the UI thread. A newer
+        release pops the update offer, whether the check was
+        manual or automatic: the automatic check only runs when
+        the setting is on, so telling the user is the feature
+        working. Up to date is told only when the user asked --
+        an automatic check that finds nothing stays quiet. A
+        failed check is told only when the user asked; an
+        automatic failure stays silent too (no network on launch
+        is normal). No stale-result guard here: the single
+        thread slot means a finished worker is always the
+        current one, and sender() does not report the worker for
+        a Python signal delivered across threads (proven by
+        probe: sender() is not the worker, so a guard on it
+        would drop every real result)."""
+        manual = result.get("manual", False)
+        if manual:
+            self._set_busy(False)
+        state = result.get("state")
+        if state == "newer":
+            self._show_update_available(result)
+            return
+        if state == "current":
+            if manual:
+                self.status_label.setText("You are up to date.")
+                QMessageBox.information(
+                    self, "No updates",
+                    "You are up to date (ACR v%s)." % VERSION)
+            return
+        if manual:
+            self.status_label.setText(
+                "Could not check for updates.")
+            QMessageBox.warning(
+                self, "Could not check for updates",
+                result.get("reason")
+                or "the update check failed")
+
+    def _show_update_available(self, result):
+        """The update offer (v0.12): a newer release is out, and
+        nothing is pulled until the user says so. Yes starts the
+        verified download; No (Later) leaves everything as it
+        is, and the next launch checks again."""
+        self.status_label.setText(
+            "ACR v%s is available." % result["latest"])
+        answer = QMessageBox.question(
+            self, "Update available",
+            "ACR v%s is available. You are running v%s.\n\n"
+            "Download and install it now? The download is "
+            "checked against the release checksum before "
+            "anything is installed."
+            % (result["latest"], VERSION),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._start_update_download(result)
+        else:
+            self.status_label.setText("Ready.")
+
+    def _start_update_download(self, result):
+        """Download a newer release in a worker (v0.12), with a
+        progress dialog and Cancel (U26/U30). The dialog stays
+        up until the worker lands; closing it cancels the
+        download."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Downloading update")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Downloading ACR v%s..."
+                       % result["latest"])
+        layout.addWidget(label)
+        bar = QProgressBar(dialog)
+        bar.setRange(0, 0)  # busy until the size is known
+        layout.addWidget(bar)
+        cancel_button = QPushButton("Cancel", dialog)
+        cancel_button.setToolTip(
+            "Stop the download (the partial file is thrown away)")
+        layout.addWidget(cancel_button)
+        self._update_dialog = dialog
+        self._update_bar = bar
+        worker = UpdateDownloadWorker(
+            result, self._staging_dir(),
+            urlopen=self._update_urlopen)
+        cancel_button.clicked.connect(
+            self._cancel_update_download)
+        dialog.rejected.connect(self._cancel_update_download)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_update_progress)
+        worker.finished.connect(self._on_update_download_done)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._clear_update_thread(thread))
+        self._update_thread = thread
+        self._update_worker = worker
+        self._update_kind = "download"
+        self._set_busy(True)
+        self.status_label.setText(
+            "Downloading ACR v%s..." % result["latest"])
+        dialog.show()
+        thread.start()
+
+    def _cancel_update_download(self):
+        """Cancel button (or dialog close) on the download
+        dialog (v0.12). Sets the flag on the running worker
+        directly, from the UI thread. This must NOT be a signal
+        connected to the worker's cancel slot: the worker lives
+        in its own thread and that thread is busy inside run(),
+        so a queued call would only land after the download
+        finished. A plain attribute write lands at once, and the
+        worker checks the flag between chunks."""
+        if self._update_worker is not None:
+            self._update_worker.cancel()
+
+    def _on_update_progress(self, done, total):
+        """One download progress tick (v0.12): the bar shows the
+        real fraction once the size is known, and stays busy
+        until then."""
+        if self._update_bar is None:
+            return
+        if total > 0:
+            self._update_bar.setRange(0, total)
+            self._update_bar.setValue(done)
+
+    def _on_update_download_done(self, outcome):
+        """One download finished (v0.12), on the UI thread. A
+        cancelled download only sets the status line; a failed
+        one says why, plainly. A verified download asks the
+        restart question: Yes restarts the program on its own
+        with the update applied, No leaves the update staged,
+        and the launcher applies it on the next start. The
+        session needs no save prompt: the autosave already holds
+        it. No stale-result guard, for the same reason as
+        _on_update_check_done: the single thread slot means a
+        finished worker is always the current one."""
+        self._set_busy(False)
+        if self._update_dialog is not None:
+            self._update_dialog.close()
+            self._update_dialog = None
+            self._update_bar = None
+        if not outcome.get("ok"):
+            if outcome.get("cancelled"):
+                self.status_label.setText("Download cancelled.")
+            else:
+                self.status_label.setText("Update failed.")
+                QMessageBox.warning(
+                    self, "Update failed",
+                    outcome.get("reason")
+                    or "the download failed")
+            return
+        version = outcome["version"]
+        answer = QMessageBox.question(
+            self, "Update downloaded",
+            "ACR v%s is downloaded and checked. "
+            "Restart now to complete the update?"
+            % version,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._restart_for_update(outcome)
+        else:
+            self.status_label.setText(
+                "Update v%s will apply the next time ACR starts."
+                % version)
+
+    def _restart_for_update(self, outcome):
+        """Restart now to complete the update (v0.12): write the
+        updater script into the staging dir, start it detached,
+        and quit. The script waits for this process to exit,
+        applies the staged update, and relaunches the app.
+        Closing the window autosaves first, as always."""
+        staging = outcome["staging"]
+        install_dir = self._install_dir()
+        script = acr_updates.write_updater_script(staging)
+        QProcess.startDetached(
+            sys.executable,
+            [script, str(os.getpid()), install_dir, staging])
+        self.close()
+        QApplication.instance().quit()
 
     def show_controls_window(self):
         self.controls_window.show()
@@ -5853,6 +6298,10 @@ def main(argv=None):
         # and visible -- never before, and never in a test
         # (tests build MainWindow directly, not through main).
         window.maybe_offer_restore()
+        # v0.12: the silent startup update check, same timing:
+        # once the window is up, never in a test. Silent when
+        # current or unknown; a newer release pops the offer.
+        window.maybe_start_update_check()
     return app.exec()
 
 

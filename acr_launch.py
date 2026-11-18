@@ -20,6 +20,16 @@ this launcher masking it.
 run.sh and the installed `acr` command run this, not acr_app.py
 directly. The install smoke check runs acr_app.py directly (it
 needs a private instance, not the fast path).
+
+v0.12: the launcher also finishes a "restart later" update. When
+the user downloads an update and answers No to restarting, the
+verified update sits staged in ~/.local/share/ACR/update-pending,
+and this launcher applies it before the next start -- after the
+lock check, so an update is never swapped under a running
+instance, and before the exec, so the app that starts is the new
+one. A staged update that fails its checks is dropped and the old
+version launches, with a note on stderr (no popup: no window
+exists yet).
 """
 
 import os
@@ -71,11 +81,36 @@ def _try_raise_existing():
     return True
 
 
+def maybe_apply_staged_update(install_dir=None):
+    """Apply a staged update left by a "restart later" choice
+    (v0.12). Returns True when an update was applied. A corrupt
+    staging is dropped by apply_staged_update and the old version
+    launches, with a note on stderr. install_dir is a test seam:
+    the launcher's own dir when None."""
+    here = install_dir or os.path.dirname(os.path.abspath(__file__))
+    try:
+        import acr_updates
+    except ImportError:
+        return False
+    staging = acr_updates.staging_dir()
+    if not os.path.isdir(staging):
+        return False
+    ok, info = acr_updates.apply_staged_update(here, staging)
+    if not ok:
+        print("ACR: staged update was not applied: %s" % info,
+              file=sys.stderr)
+    return ok
+
+
 def main(argv=None):
     args = sys.argv if argv is None else argv
     if _try_raise_existing():
         return 0
     here = os.path.dirname(os.path.abspath(__file__))
+    # v0.12: finish a "restart later" update before the app
+    # starts -- the lock check above already settled whether
+    # another instance is running, so the tree is safe to swap.
+    maybe_apply_staged_update(here)
     os.execv(sys.executable,
              [sys.executable, os.path.join(here, "acr_app.py")]
              + args[1:])
