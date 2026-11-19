@@ -22,8 +22,11 @@ echo "Updating pip..."
 # v0.11 (A9): the PySide6 install shows its own progress (no
 # --quiet): it is the long step, and a silent minute looks like
 # a hung install.
+# v0.13 (N3): pinned to 6.12.0, the version installs resolve
+# to. Unpinned, two installs months apart could land on
+# different versions.
 echo "Downloading PySide6 (this takes a while)..."
-.venv/bin/pip install PySide6-Essentials
+.venv/bin/pip install PySide6-Essentials==6.12.0
 
 # v0.11 (A9): the smoke check. The app starts headless, drives
 # 16 theme steps through the real window, and prints OK. A bad

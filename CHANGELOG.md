@@ -2,6 +2,38 @@
 
 What changed in each version, in plain words. The newest is first.
 
+## v0.13 (2026-11-19) - Second user audit
+
+A second run-through as a user, this time of v0.11, found no
+blocks: 4 annoyances and 3 nice-to-haves. All 7 are fixed here,
+and the install instructions now lead with the double-click.
+
+- The restore offer has three choices: Restore, Not now, and
+  Discard. Not now keeps the saved session and offers it again
+  next launch. Only Discard deletes it, and Discard is never
+  the preselected button. Before, answering No deleted the
+  saved session without the dialog saying so.
+- A file with nothing to analyze shows its own empty result
+  (0 themes found in 0 steps in this run) instead of leaving
+  the previous file's findings standing under "in this run".
+- A pack preview that was written says it was written, and
+  goes out of date when the session changes, the same as an
+  unwritten preview. Before, a written preview read as
+  current forever.
+- The Analyze window shrinks smaller with the pack preview
+  shown: down to about 580 px tall, from about 690 px, and
+  it stays under 620 px even after several runs.
+- The installer pins the interface library to version 6.12.0,
+  so every install gets the same one.
+- Theme list items lead with the entry text; the step and
+  peak numbers follow in parentheses.
+- On long runs the chart's red flag dots draw smaller and
+  softer, so hundreds of flags stay readable as separate
+  events instead of merging into one solid band.
+- Install instructions lead with the double-click: extract
+  the zip, double-click Install-ACR.desktop. The terminal
+  commands are a short fallback note.
+
 ## v0.12 (2026-11-17) - Update check
 
 ACR checks for updates on its own now, and asks before doing

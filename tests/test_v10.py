@@ -201,8 +201,8 @@ class LocalWindowCase(WindowCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_is_0_11(self):
-        # v0.12: the version moved; the pin moves with it.
-        self.assertEqual(acr_app.VERSION, "0.12")
+        # v0.13: the version moved; the pin moves with it.
+        self.assertEqual(acr_app.VERSION, "0.13")
 
 
 # --------------------------------------------------------------------- R1

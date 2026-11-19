@@ -546,6 +546,24 @@ class AutosaveTests(WindowCase):
     def _autosave_path(self):
         return os.path.join(self.tmp.name, "autosave.json")
 
+    def _fake_box_class(self, button):
+        """A QMessageBox stand-in for the restore offer (the
+        DebugReportTests pattern): constructing it returns a
+        mock dialog whose buttons record themselves by text,
+        and whose clicked button is the chosen one."""
+        box = mock.MagicMock()
+        buttons = {}
+
+        def _add(text, role=None):
+            btn = mock.MagicMock()
+            buttons[text] = btn
+            return btn
+
+        box.addButton.side_effect = _add
+        box.clickedButton.side_effect = (
+            lambda: buttons[button])
+        return mock.MagicMock(return_value=box)
+
     def test_step_writes_autosave_and_marks_dirty(self):
         self.assertFalse(os.path.exists(self._autosave_path()))
         self._step_text("quantum entanglement links particles")
@@ -601,8 +619,8 @@ class AutosaveTests(WindowCase):
         self.assertTrue(os.path.exists(self._autosave_path()))
         self.window = MainWindow(log_dir=self.tmp.name)
         self.window.show()
-        with mock.patch("acr_app.QMessageBox.question",
-                        return_value=QMessageBox.Yes):
+        with mock.patch("acr_app.QMessageBox",
+                        self._fake_box_class("Restore")):
             self.assertTrue(self.window.maybe_offer_restore())
         self.assertEqual(self.window.step_label.text(),
                          "Step: 3")
@@ -612,6 +630,11 @@ class AutosaveTests(WindowCase):
         self.assertIsNone(self.window._session_path)
 
     def test_restore_declined_drops_the_autosave(self):
+        # v0.13 (A3): this test used to pin the bug -- the old
+        # offer's No deleted the autosave without saying so.
+        # The offer now answers with Not now, which KEEPS the
+        # recovery copy for the next launch; Discard is the
+        # only answer that deletes (pinned in test_v13).
         self._step_theme(2)
         self.window.close()
         self.window.deleteLater()
@@ -619,10 +642,10 @@ class AutosaveTests(WindowCase):
         self.assertTrue(os.path.exists(self._autosave_path()))
         self.window = MainWindow(log_dir=self.tmp.name)
         self.window.show()
-        with mock.patch("acr_app.QMessageBox.question",
-                        return_value=QMessageBox.No):
+        with mock.patch("acr_app.QMessageBox",
+                        self._fake_box_class("Not now")):
             self.assertFalse(self.window.maybe_offer_restore())
-        self.assertFalse(os.path.exists(self._autosave_path()))
+        self.assertTrue(os.path.exists(self._autosave_path()))
         self.assertEqual(self.window.step_label.text(),
                          "Step: 0")
 
@@ -1310,20 +1333,21 @@ class ProgressResetTests(WindowCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_is_0_12_everywhere(self):
-        self.assertEqual(acr_app.VERSION, "0.12")
+        # v0.13: the version moved; the pins move with it.
+        self.assertEqual(acr_app.VERSION, "0.13")
         root = os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))
         with open(os.path.join(root, "README.md"),
                   encoding="utf-8") as fh:
-            self.assertIn("v0.12", fh.readline())
+            self.assertIn("v0.13", fh.readline())
         with open(os.path.join(root, "CHANGELOG.md"),
                   encoding="utf-8") as fh:
-            self.assertIn("## v0.12", fh.read())
+            self.assertIn("## v0.13", fh.read())
         with open(os.path.join(root, "build_zip.py"),
                   encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn('VERSION = "0.12"', text)
-        self.assertIn('ZIP_NAME = "acr-v0.12.zip"', text)
+        self.assertIn('VERSION = "0.13"', text)
+        self.assertIn('ZIP_NAME = "acr-v0.13.zip"', text)
 
 
 if __name__ == "__main__":

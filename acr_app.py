@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACR - Adaptive Contextual Resonance, v0.12.
+"""ACR - Adaptive Contextual Resonance, v0.13.
 
 A native desktop window for the ACR adaptive loop at small scale:
 type text, step the loop, watch W_t adapt, read the trace log, and
@@ -79,6 +79,18 @@ before it is staged, and the restart that applies it asks too.
 Answering No to the restart leaves the update staged, and the
 launcher applies it on the next start. The engine is untouched:
 the 16-theme numbers are still exact.
+
+v0.13 is the second user-audit fix: the restore offer gains a
+Not now choice that keeps the autosaved session (only Discard
+deletes it), a batch run that lands no steps shows its own
+empty result instead of the previous run's, a written pack
+preview is marked written and goes out of date like a pending
+one, the Analyze window shrinks smaller with the preview
+shown, the installer pins the interface library version,
+theme list items lead with the entry text, and dense chart
+flags draw smaller and softer so they stay readable as
+events. The engine is untouched: the 16-theme numbers are
+still exact.
 """
 
 import csv
@@ -123,7 +135,7 @@ from local_encoder import (
     is_embedding_model, model_display_text)
 
 APP_NAME = "acr"
-VERSION = "0.12"
+VERSION = "0.13"
 REPORT_EMAIL = "broke.n.bored.studio@gmail.com"
 
 # v0.9 identity (U15): ACR's own dark look, drawn from the icon
@@ -457,7 +469,11 @@ class NormChart(QWidget):
         super().__init__(parent)
         # v0.11 (A11): 90 tall, down from 130 -- the old floor
         # held the Analyze window above 750 px tall.
-        self.setMinimumHeight(90)
+        # v0.13 (A4): 56 -- the floor cuts further so the
+        # Analyze window can shrink with the pack preview
+        # shown. The legend is drawn inside the chart, so it
+        # stays fully visible at this height.
+        self.setMinimumHeight(56)
         # v0.10 (R15): the empty message fits where the chart
         # lives. The Views chart says "Step some text"; the
         # Analyze chart says "Analyze a file" -- nobody steps
@@ -613,13 +629,31 @@ class NormChart(QWidget):
             x1, y1 = point(i - 1, self.values[i - 1])
             x2, y2 = point(i, self.values[i])
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        # v0.13 (N2): on a long run the flags crowd together
+        # (at 300+ steps the points sit about 3 px apart), and
+        # full-size solid dots merge into one near-solid band
+        # where no single flag reads as an event. Dense runs
+        # draw the flags smaller and semi-transparent, so each
+        # flag still reads as its own dot. The pulse keeps its
+        # full size and full colour: it marks the step that
+        # just landed, and there is only ever one of it.
+        if n > 120:
+            flag_radius, flag_alpha = 2, 150
+        elif n > 40:
+            flag_radius, flag_alpha = 3, 190
+        else:
+            flag_radius, flag_alpha = 4, 255
+        spike = QColor(CHART_SPIKE)
+        spike.setAlpha(flag_alpha)
         for i, value in enumerate(self.values):
             x, y = point(i, value)
             if i < len(self.flags) and self.flags[i]:
-                painter.setPen(QPen(CHART_SPIKE, 2))
-                painter.setBrush(CHART_SPIKE)
-                radius = 4
+                painter.setPen(QPen(spike, 2))
+                painter.setBrush(spike)
+                radius = flag_radius
                 if i == self._pulse_index:
+                    painter.setPen(QPen(CHART_SPIKE, 2))
+                    painter.setBrush(CHART_SPIKE)
                     radius = max(1, int(round(4 * self._pulse_scale)))
                 painter.drawEllipse(int(x) - radius, int(y) - radius,
                                     radius * 2, radius * 2)
@@ -1796,7 +1830,17 @@ class AnalyzeWindow(SubWindow):
         # v0.10 (R11): the step count the pack preview was built
         # from, so the write can say when the session moved on.
         self._preview_step_count = None
+        # v0.13 (A2): whether the current preview was written,
+        # and a stamp of everything the preview depends on (the
+        # session step count and the run the results cover). A
+        # written preview goes out of date when the stamp moves,
+        # exactly like a pending one.
+        self._preview_written = False
+        self._preview_stamp = None
         layout = QVBoxLayout(self)
+        # v0.13 (A4): tighter gaps -- part of shrinking the
+        # window's minimum height with the preview shown.
+        layout.setSpacing(4)
 
         layout.addWidget(_header_label("What to analyze"))
         source_row = QHBoxLayout()
@@ -1849,12 +1893,15 @@ class AnalyzeWindow(SubWindow):
             return frame
 
         results_grid = QGridLayout()
-        results_grid.setSpacing(16)
+        # v0.13 (A4): 8 px gaps, down from 16 -- part of
+        # shrinking the window's minimum height.
+        results_grid.setSpacing(8)
         layout.addLayout(results_grid, 1)
 
         self.hero_tile = _tile()
         hero_layout = QVBoxLayout(self.hero_tile)
-        hero_layout.setContentsMargins(12, 8, 12, 8)
+        hero_layout.setContentsMargins(12, 6, 12, 6)
+        hero_layout.setSpacing(4)
         hero_layout.addWidget(_header_label("Results"))
         self.hero_title = QLabel("Nothing analyzed yet.")
         self.hero_title.setStyleSheet(
@@ -1868,7 +1915,8 @@ class AnalyzeWindow(SubWindow):
 
         chart_tile = _tile()
         chart_layout = QVBoxLayout(chart_tile)
-        chart_layout.setContentsMargins(10, 8, 10, 10)
+        chart_layout.setContentsMargins(10, 6, 10, 6)
+        chart_layout.setSpacing(4)
         chart_layout.addWidget(_header_label("Chart"))
         # v0.11 (N2): the note says what the line and the dots
         # each are -- the old wording mixed them together.
@@ -1890,7 +1938,8 @@ class AnalyzeWindow(SubWindow):
 
         themes_tile = _tile()
         themes_layout = QVBoxLayout(themes_tile)
-        themes_layout.setContentsMargins(10, 8, 10, 10)
+        themes_layout.setContentsMargins(10, 6, 10, 6)
+        themes_layout.setSpacing(4)
         themes_layout.addWidget(_header_label("Themes"))
         # v0.11 (B4): themes are sustained stretches now, not
         # spikes -- the note says so.
@@ -1901,7 +1950,7 @@ class AnalyzeWindow(SubWindow):
         # v0.11 (A11): the lists keep a small floor so the
         # window can shrink: the default list height held the
         # window above 750 px tall.
-        self.themes_list.setMinimumHeight(40)
+        self.themes_list.setMinimumHeight(20)
         self.themes_list.setUniformItemSizes(True)
         # v0.11 (A6): overlong items elide with "..." at the
         # tile edge instead of growing a horizontal scrollbar.
@@ -1920,9 +1969,10 @@ class AnalyzeWindow(SubWindow):
         self.theme_detail.setReadOnly(True)
         # Capped: an uncapped QTextEdit's minimum size squeezes
         # the note label above it until its text clips, and
-        # starves the list. Floored at three lines: the detail
-        # always shows the trigger entry and its neighbours.
-        self.theme_detail.setMinimumHeight(40)
+        # starves the list. v0.13 (A4): the floor drops to one
+        # line so the window can shrink with the pack preview
+        # shown; the detail stretches taller with the window.
+        self.theme_detail.setMinimumHeight(20)
         self.theme_detail.setMaximumHeight(80)
         # v0.10 (R2): a read-only display surface: no Tab stop.
         self.theme_detail.setFocusPolicy(Qt.NoFocus)
@@ -1931,13 +1981,14 @@ class AnalyzeWindow(SubWindow):
 
         core_tile = _tile()
         core_layout = QVBoxLayout(core_tile)
-        core_layout.setContentsMargins(10, 8, 10, 10)
+        core_layout.setContentsMargins(10, 6, 10, 6)
+        core_layout.setSpacing(4)
         core_layout.addWidget(_header_label("Core entries"))
         core_layout.addWidget(_note_label(
             "Core entries: the most resonant entries overall. "
             "The heart of the file."))
         self.core_list = QListWidget()
-        self.core_list.setMinimumHeight(40)
+        self.core_list.setMinimumHeight(20)
         self.core_list.setUniformItemSizes(True)
         # v0.11 (A6): overlong items elide with "..." at the
         # tile edge instead of growing a horizontal scrollbar.
@@ -1951,13 +2002,14 @@ class AnalyzeWindow(SubWindow):
 
         outlier_tile = _tile()
         outlier_layout = QVBoxLayout(outlier_tile)
-        outlier_layout.setContentsMargins(10, 8, 10, 10)
+        outlier_layout.setContentsMargins(10, 6, 10, 6)
+        outlier_layout.setSpacing(4)
         outlier_layout.addWidget(_header_label("Outliers"))
         outlier_layout.addWidget(_note_label(
             "Outliers: the lowest-resonance entries. The noise "
             "and off-topic lines."))
         self.outlier_list = QListWidget()
-        self.outlier_list.setMinimumHeight(40)
+        self.outlier_list.setMinimumHeight(20)
         self.outlier_list.setUniformItemSizes(True)
         # v0.11 (A6): overlong items elide with "..." at the
         # tile edge instead of growing a horizontal scrollbar.
@@ -1971,13 +2023,14 @@ class AnalyzeWindow(SubWindow):
 
         shift_tile = _tile()
         shift_layout = QVBoxLayout(shift_tile)
-        shift_layout.setContentsMargins(10, 8, 10, 10)
+        shift_layout.setContentsMargins(10, 6, 10, 6)
+        shift_layout.setSpacing(4)
         shift_layout.addWidget(_header_label("Theme shifts"))
         shift_layout.addWidget(_note_label(
             "Theme shifts: the steps where resonance drops "
             "sharply and stays low. Topic boundaries."))
         self.shift_list = QListWidget()
-        self.shift_list.setMinimumHeight(40)
+        self.shift_list.setMinimumHeight(20)
         self.shift_list.setUniformItemSizes(True)
         # v0.11 (A6): overlong items elide with "..." at the
         # tile edge instead of growing a horizontal scrollbar.
@@ -2047,10 +2100,23 @@ class AnalyzeWindow(SubWindow):
             "data pack again for a fresh preview.")
         self.pack_stale_label.hide()
         layout.addWidget(self.pack_stale_label)
+        # v0.13 (A2): a written preview says it was written, so
+        # it never reads as a pending plan. The stale warning
+        # replaces it when the session moves on.
+        self.pack_written_label = _note_label(
+            "These packs were written to disk. The preview "
+            "below is what was written.")
+        self.pack_written_label.hide()
+        layout.addWidget(self.pack_written_label)
         self.pack_preview = QTextEdit()
         self.pack_preview.setReadOnly(True)
         self.pack_preview.setFocusPolicy(Qt.NoFocus)
         self.pack_preview.setMaximumHeight(160)
+        # v0.13 (A4): a one-line floor. The pane scrolls, so a
+        # small floor loses nothing; the default text-edit
+        # floor was part of what held the window near 690 px
+        # with the preview shown.
+        self.pack_preview.setMinimumHeight(24)
         self.pack_preview.hide()
         layout.addWidget(self.pack_preview)
         self.write_packs_button = QPushButton("Write these packs")
@@ -2138,10 +2204,20 @@ class AnalyzeWindow(SubWindow):
         steps = summary["steps"]
         themes = summary["themes"]
         if steps == 0:
-            self.hero_title.setText("Nothing analyzed yet.")
-            self.hero_theme.setText(
-                "Pick a file, press Go, and the findings land "
-                "here.")
+            if self.main._batch_has_run:
+                # v0.13 (A1): a run landed and found no steps.
+                # Say so in the run's own numbers: the previous
+                # run's findings never stand in for this one.
+                self.hero_title.setText(
+                    "0 themes found in 0 steps in this run")
+                self.hero_theme.setText(
+                    "Nothing in the file became a step: it was "
+                    "empty, or every line was skipped.")
+            else:
+                self.hero_title.setText("Nothing analyzed yet.")
+                self.hero_theme.setText(
+                    "Pick a file, press Go, and the findings "
+                    "land here.")
         else:
             # v0.11 (A3): the results cover the latest run, not
             # the whole session -- the hero says which, so the
@@ -2174,20 +2250,22 @@ class AnalyzeWindow(SubWindow):
         self.themes_list.clear()
         restore_row = -1
         for entry in summary["themes"]:
-            # v0.11: the theme's trigger step, peak, and spans
-            # first, then the trigger text trimmed with "..."
-            # when cut (A6) -- the text is the tail, so the
-            # trim never eats the numbers.
+            # v0.13 (N1): the entry text leads the item, so the
+            # list reads as the themes themselves; the trigger
+            # step, peak, and spans follow in parentheses. The
+            # text is trimmed with "..." when cut (A6), and the
+            # full text stays on the tooltip.
             spans = entry.get("spans", [])
             peak = entry.get("peak", entry["resonance"])
             if spans:
-                head = ("Step %d (peak %.3f, steps %s)"
+                tail = ("(step %d, peak %.3f, steps %s)"
                         % (entry["id"], peak, _span_text(spans)))
             else:
-                head = "Step %d (peak %.3f)" % (entry["id"], peak)
+                tail = ("(step %d, peak %.3f)"
+                        % (entry["id"], peak))
             self.themes_list.addItem(
-                "%s: %s" % (head, _trim_display(
-                    self.main._entry_text(entry))))
+                "%s %s" % (_trim_display(
+                    self.main._entry_text(entry)), tail))
             item = self.themes_list.item(
                 self.themes_list.count() - 1)
             item.setData(Qt.UserRole, entry["id"])
@@ -2247,18 +2325,38 @@ class AnalyzeWindow(SubWindow):
         self.export_packs_button.setEnabled(has_steps)
         self._refresh_stale_label()
 
+    def _preview_stamp_now(self):
+        """What the pack preview depends on, as one comparable
+        stamp (v0.13, A2): the session step count and the run
+        the results cover. Any new step, new run, or session
+        change moves it."""
+        main = self.main
+        return (main.engine.step_count, main._run_start_id,
+                main._run_end_id, main._batch_has_run)
+
     def _refresh_stale_label(self):
-        """v0.11 (A15): the pack preview is stale when the
-        session moved on since it was made. The warning shows
-        with the preview pane, never on its own: no preview,
-        nothing stale. Called from show_results (every refresh)
-        and from on_export_stella_packs (a fresh preview clears
-        the mark)."""
-        stale = (self._preview_step_count is not None
-                 and self.main.engine.step_count
-                 != self._preview_step_count)
-        self.pack_stale_label.setVisible(
-            stale and not self.pack_preview.isHidden())
+        """v0.11 (A15) + v0.13 (A2): the pack preview is stale
+        when the session moved on since it was made -- and a
+        WRITTEN preview goes stale the same way. Writing used
+        to clear the step-count marker, so a written preview
+        read as current forever; now the marker and the stamp
+        stay, the written label shows while the preview is
+        current, and the stale warning replaces it when the
+        session moves on. Both labels show with the preview
+        pane, never on their own: no preview, no labels.
+        Called from show_results (every refresh), from
+        on_export_stella_packs (a fresh preview clears both
+        marks), and from on_write_stella_packs."""
+        if self.pack_preview.isHidden():
+            self.pack_stale_label.hide()
+            self.pack_written_label.hide()
+            return
+        stale = (self._preview_stamp is not None
+                 and self._preview_stamp
+                 != self._preview_stamp_now())
+        self.pack_stale_label.setVisible(stale)
+        self.pack_written_label.setVisible(
+            self._preview_written and not stale)
 
     def show_live(self, trace, done, total):
         """Mid-run refresh (v0.10, R5): the chart and the hero
@@ -2499,6 +2597,10 @@ class AnalyzeWindow(SubWindow):
         # rows also depend on the session buffer (vectors,
         # neighbours, resonant entries), which any step churns.
         self._preview_step_count = self.main.engine.step_count
+        # v0.13 (A2): a fresh preview is pending, not written,
+        # and its stamp is the state it was made from.
+        self._preview_stamp = self._preview_stamp_now()
+        self._preview_written = False
         self.pack_preview.setPlainText(
             self._render_pack_preview(packs))
         self.pack_preview_label.show()
@@ -2588,7 +2690,16 @@ class AnalyzeWindow(SubWindow):
                         "packs are from the current state."
                         % (self._preview_step_count,
                            self.main.engine.step_count))
-        self._preview_step_count = None
+        # v0.13 (A2): the preview stays on screen as the record
+        # of what was written, marked written. The step-count
+        # marker and the stamp stay set, so any later change
+        # marks the preview out of date, like a pending one.
+        # (When the session had already changed since the
+        # preview, the stamp no longer matches, so the stale
+        # warning shows instead of the written mark: the
+        # preview text is not what was written.)
+        self._preview_written = True
+        self._refresh_stale_label()
         if under == 1:
             message += (" 1 pack has fewer than 2 rows: STELLA "
                         "needs 2 or more, add more source "
@@ -4711,8 +4822,9 @@ class MainWindow(QMainWindow):
         self._batch_cancelled = False
         self._batch_source_note = source_note
         # v0.11 (A3): the run starts at the next step id. The
-        # run range itself is set when the run lands (a run that
-        # lands no steps leaves the previous run standing).
+        # run range itself is set when the run lands (v0.13,
+        # A1: a run that lands no steps gets an empty range, so
+        # the view shows its own empty result).
         self._pending_run_start = self.engine.step_count + 1
         self._clear_completion_mark()
         self._set_busy(True)
@@ -4801,14 +4913,19 @@ class MainWindow(QMainWindow):
         self._trim_heat_history()
         self._full_texts.update(result["texts"])
         self._locators.update(result["locators"])
-        # v0.11 (A3): the run is this batch's steps. A run that
-        # landed no steps (cancelled or failed at once) leaves
-        # the previous run standing: the old results stay, and
-        # the hero keeps saying what they cover.
+        # v0.11 (A3): the run is this batch's steps.
+        # v0.13 (A1): a run that landed no steps is still this
+        # run. Its range is empty (start one past the end), so
+        # the Analyze view shows this run's own empty result --
+        # never the previous run's numbers standing as "in
+        # this run".
         if result.get("first_step") is not None:
             self._run_start_id = result["first_step"]
             self._run_end_id = result["last_step"]
-            self._batch_has_run = True
+        else:
+            self._run_start_id = self._pending_run_start
+            self._run_end_id = self._pending_run_start - 1
+        self._batch_has_run = True
         # v0.11 (B1): the run landed, so the session is dirty
         # and the recovery copy updates -- once per run, not per
         # line: a per-line autosave would rewrite the whole
@@ -5059,6 +5176,41 @@ class MainWindow(QMainWindow):
         except OSError:
             self.logger.exception("autosave delete failed")
 
+    def _restore_offer_choice(self, steps, saved_at):
+        """Ask what to do with the autosaved session (v0.13,
+        A3): Restore it now, Not now (keep it saved; the offer
+        comes again next launch), or Discard (delete it for
+        good). The old Yes/No offer deleted the file on No,
+        which reads as "not now" -- the only copy of the
+        session went away without the dialog saying so. Now
+        only Discard deletes. Restore is the default button;
+        Discard never is. Closing the dialog without choosing
+        counts as Not now, so nothing is deleted by accident.
+        Returns "restore", "not now", or "discard"."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Restore autosaved session")
+        box.setText(
+            "ACR saved a session with %d steps at %s."
+            % (steps, saved_at))
+        box.setInformativeText(
+            "Restore it now, keep it saved for later, or "
+            "discard it. Not now keeps the saved session and "
+            "offers it again next launch. Only Discard "
+            "deletes it.")
+        restore_button = box.addButton(
+            "Restore", QMessageBox.AcceptRole)
+        box.addButton("Not now", QMessageBox.RejectRole)
+        discard_button = box.addButton(
+            "Discard", QMessageBox.DestructiveRole)
+        box.setDefaultButton(restore_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is restore_button:
+            return "restore"
+        if clicked is discard_button:
+            return "discard"
+        return "not now"
+
     def maybe_offer_restore(self):
         """Offer to restore the autosaved session, when one
         exists (v0.11, B1). Called once from main(), after the
@@ -5067,7 +5219,9 @@ class MainWindow(QMainWindow):
         True when a session was restored. A damaged file is
         dropped with a plain status line; a file whose session
         cannot load (the local encoder is down) is kept, and
-        the offer comes again next launch."""
+        the offer comes again next launch. v0.13 (A3): the
+        offer has three choices -- Restore, Not now, Discard --
+        and only Discard deletes the saved session."""
         path = self._autosave_path
         if not os.path.exists(path):
             return False
@@ -5089,13 +5243,21 @@ class MainWindow(QMainWindow):
                 "%H:%M", time.localtime(os.path.getmtime(path)))
         except OSError:
             saved_at = "earlier"
-        answer = QMessageBox.question(
-            self, "Restore autosaved session",
-            "ACR saved a session with %d steps at %s. Restore "
-            "it?" % (steps, saved_at),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if answer != QMessageBox.Yes:
+        choice = self._restore_offer_choice(steps, saved_at)
+        if choice == "discard":
+            # v0.13 (A3): the one answer that deletes, and the
+            # dialog said so before it was picked.
             self._delete_autosave()
+            self.status_label.setText(
+                "Discarded the autosaved session.")
+            return False
+        if choice != "restore":
+            # Not now, or the dialog closed without a choice:
+            # the saved session stays, and the offer comes
+            # again next launch.
+            self.status_label.setText(
+                "Kept the autosaved session: it will be "
+                "offered again next launch.")
             return False
         try:
             self.load_session_from(path)

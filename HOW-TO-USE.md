@@ -1,6 +1,6 @@
 # ACR: How to Use and What to Use It For
 
-ACR v0.12. Plain words, everything the app does.
+ACR v0.13. Plain words, everything the app does.
 
 ## What ACR is for
 

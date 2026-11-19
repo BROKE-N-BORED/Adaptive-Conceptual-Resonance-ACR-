@@ -770,7 +770,7 @@ class WindowCase(unittest.TestCase):
             QTest.qWait(50)
         return False
 
-    def _release_stub(self, tag="v0.13", with_sidecar=True):
+    def _release_stub(self, tag="v0.14", with_sidecar=True):
         """A urlopen stub serving a release plus its zip and
         sidecar, all from memory."""
         zip_bytes = _fake_zip_bytes(_fake_update_files())
@@ -828,7 +828,9 @@ class HelpMenuTests(WindowCase):
 
 class ManualCheckTests(WindowCase):
     def test_manual_check_current_tells_the_user(self):
-        self.window._update_urlopen = self._release_stub("v0.12")
+        # v0.13: the app's own version moved, so "current"
+        # serves v0.13 now.
+        self.window._update_urlopen = self._release_stub("v0.13")
         seen = []
         with mock.patch.object(
                 QMessageBox, "information",
@@ -853,7 +855,9 @@ class ManualCheckTests(WindowCase):
         self.assertIn("GitHub", seen[0])
 
     def test_manual_check_newer_and_later_downloads_nothing(self):
-        self.window._update_urlopen = self._release_stub("v0.13")
+        # v0.13: the app's own version moved, so the "newer"
+        # release serves v0.14 now.
+        self.window._update_urlopen = self._release_stub("v0.14")
         asked = []
         with mock.patch.object(
                 QMessageBox, "question",
@@ -862,14 +866,14 @@ class ManualCheckTests(WindowCase):
             self.window.on_check_updates()
             self.assertTrue(self._wait_update_idle())
         self.assertEqual(len(asked), 1)
-        self.assertIn("v0.13", asked[0])
+        self.assertIn("v0.14", asked[0])
         self.assertIn("Download and install it now", asked[0])
         self.assertFalse(os.path.exists(
             self.window._update_staging_dir))
         self.assertIsNone(self.window._update_thread)
 
     def test_manual_check_twice_at_once_is_one_check(self):
-        self.window._update_urlopen = self._release_stub("v0.12")
+        self.window._update_urlopen = self._release_stub("v0.13")
         with mock.patch.object(QMessageBox, "information"):
             self.assertTrue(
                 self.window._start_update_check(manual=True))
@@ -880,7 +884,9 @@ class ManualCheckTests(WindowCase):
 
 class DownloadFlowTests(WindowCase):
     def test_full_flow_restart_later_leaves_staging(self):
-        self.window._update_urlopen = self._release_stub("v0.13")
+        # v0.13: the served release moves to v0.14 with the
+        # app's own version.
+        self.window._update_urlopen = self._release_stub("v0.14")
         answers = [QMessageBox.Yes, QMessageBox.No]
         asked = []
         with mock.patch.object(
@@ -892,16 +898,16 @@ class DownloadFlowTests(WindowCase):
             QTest.qWait(200)
         # The offer, then the restart question.
         self.assertEqual(len(asked), 2)
-        self.assertIn("v0.13", asked[0])
+        self.assertIn("v0.14", asked[0])
         self.assertIn("Restart now to complete the update",
                       asked[1])
         staging = self.window._update_staging_dir
         self.assertTrue(os.path.exists(
-            os.path.join(staging, "acr-v0.13.zip")))
+            os.path.join(staging, "acr-v0.14.zip")))
         with open(os.path.join(staging, "manifest.json"),
                   encoding="utf-8") as fh:
             manifest = json.load(fh)
-        self.assertEqual(manifest["version"], "0.13")
+        self.assertEqual(manifest["version"], "0.14")
         self.assertIn("next time ACR starts",
                       self.window.status_label.text())
         # Nothing swapped yet: the restart is what applies it.
@@ -911,7 +917,7 @@ class DownloadFlowTests(WindowCase):
             b"OLD APP\n")
 
     def test_restart_yes_writes_script_starts_it_and_quits(self):
-        self.window._update_urlopen = self._release_stub("v0.13")
+        self.window._update_urlopen = self._release_stub("v0.14")
         answers = [QMessageBox.Yes, QMessageBox.Yes]
         with mock.patch.object(
                 QMessageBox, "question",
@@ -938,10 +944,10 @@ class DownloadFlowTests(WindowCase):
     def test_download_refused_on_bad_checksum(self):
         zip_bytes = _fake_zip_bytes(_fake_update_files())
         # The sidecar claims a different file's hash.
-        sidecar = "%s  acr-v0.13.zip\n" % _sha256_text(b"other")
+        sidecar = "%s  acr-v0.14.zip\n" % _sha256_text(b"other")
         payload = _release_payload(
-            "v0.13", "http://fake/acr-v0.13.zip",
-            "http://fake/acr-v0.13.zip.sha256")
+            "v0.14", "http://fake/acr-v0.14.zip",
+            "http://fake/acr-v0.14.zip.sha256")
         self.window._update_urlopen = _stub_urlopen({
             "latest": _json_bytes(payload),
             ".zip.sha256": sidecar.encode("utf-8"),
@@ -970,10 +976,10 @@ class DownloadFlowTests(WindowCase):
                 return super().read(size)
 
         zip_bytes = _fake_zip_bytes(_fake_update_files())
-        sidecar = "%s  acr-v0.13.zip\n" % _sha256_text(zip_bytes)
+        sidecar = "%s  acr-v0.14.zip\n" % _sha256_text(zip_bytes)
         payload = _release_payload(
-            "v0.13", "http://fake/acr-v0.13.zip",
-            "http://fake/acr-v0.13.zip.sha256")
+            "v0.14", "http://fake/acr-v0.14.zip",
+            "http://fake/acr-v0.14.zip.sha256")
 
         def _slow_open(url, timeout=None):
             if "latest" in url:
@@ -1018,7 +1024,7 @@ class DownloadFlowTests(WindowCase):
 
 class StartupCheckTests(WindowCase):
     def test_startup_check_silent_when_current(self):
-        self.window._update_urlopen = self._release_stub("v0.12")
+        self.window._update_urlopen = self._release_stub("v0.13")
         with mock.patch.object(
                 QMessageBox, "information") as info, \
                 mock.patch.object(
@@ -1051,7 +1057,7 @@ class StartupCheckTests(WindowCase):
                          "Ready.")
 
     def test_startup_check_runs_once_per_launch(self):
-        self.window._update_urlopen = self._release_stub("v0.12")
+        self.window._update_urlopen = self._release_stub("v0.13")
         with mock.patch.object(QMessageBox, "information"):
             self.window.maybe_start_update_check()
             self.assertTrue(self._wait_update_idle())
@@ -1068,7 +1074,7 @@ class StartupCheckTests(WindowCase):
             settings.remove, "check_updates_on_startup")
         window2 = MainWindow(log_dir=self.tmp.name)
         try:
-            window2._update_urlopen = self._release_stub("v0.13")
+            window2._update_urlopen = self._release_stub("v0.14")
             with mock.patch.object(QMessageBox, "question") as ask:
                 window2.maybe_start_update_check()
                 QTest.qWait(200)
@@ -1102,7 +1108,7 @@ class BuildTests(unittest.TestCase):
                 timeout=180)
             self.assertEqual(proc.returncode, 0, proc.stdout
                              + proc.stderr)
-            zip_path = os.path.join(clone, "acr-v0.12.zip")
+            zip_path = os.path.join(clone, "acr-v0.13.zip")
             sidecar_path = zip_path + ".sha256"
             self.assertTrue(os.path.exists(sidecar_path))
             with open(sidecar_path, encoding="utf-8") as fh:
@@ -1111,7 +1117,7 @@ class BuildTests(unittest.TestCase):
             with open(zip_path, "rb") as fh:
                 digest.update(fh.read())
             self.assertEqual(
-                sidecar, "%s  acr-v0.12.zip\n" % digest.hexdigest())
+                sidecar, "%s  acr-v0.13.zip\n" % digest.hexdigest())
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()
             self.assertIn("acr/acr_updates.py", names)

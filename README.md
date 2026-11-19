@@ -1,4 +1,4 @@
-# ACR v0.12 - Adaptive Contextual Resonance
+# ACR v0.13 - Adaptive Contextual Resonance
 
 A desktop program for the adaptive loop at small scale. Type text,
 step the loop, and watch the weight matrix adapt to what you type.
@@ -45,14 +45,10 @@ stays there until a bigger engine actually exists.
 
 ## Install
 
-Unzip the release anywhere, then double-click `Install-ACR`.
+Extract the zip anywhere, then double-click `Install-ACR.desktop`.
 
-If the file manager asks, right-click `Install-ACR` first and pick
-Allow Launching, then double-click it. Or run this in a terminal:
-
-```
-bash install.sh
-```
+If the file manager asks, right-click `Install-ACR.desktop` first
+and pick Allow Launching, then double-click it.
 
 The installer creates a private folder with everything ACR needs,
 puts an ACR icon in your menu and on your desktop, and adds an `acr`
@@ -61,19 +57,15 @@ doing as it goes, and checks the app starts before it finishes:
 if the check fails, it says so plainly instead of leaving a broken
 icon behind.
 
+Fallback, only if double-clicking does not work: in a terminal, in
+the extracted folder, run `bash install.sh`.
+
 ## Run
 
-Double-click the ACR icon, or run:
+Double-click the ACR icon in your menu or on your desktop.
 
-```
-acr
-```
-
-Or, from the unzipped folder:
-
-```
-bash run.sh
-```
+Fallback: run `acr` in a terminal, or `bash run.sh` in the
+extracted folder.
 
 ## Updates
 
@@ -97,12 +89,14 @@ Help, Check for updates asks by hand at any time. Help, Check
 for updates on startup turns the launch check off (it is on by
 default).
 
-Two honest notes. The updater in this version updates v0.12 to
-later versions: v0.11 has no updater, so install v0.12 once from
-the Release and updates work from there. And the updater replaces
+Two honest notes. The updater in this version updates v0.13 to
+later versions, and v0.12 has an updater too. v0.11 and older
+have none, so from those, install this version once from the
+Release and updates work from there. And the updater replaces
 the app files and keeps the existing private folder with the
 libraries, so a future version that needs new libraries must say
-so in its release notes, and you re-run install.sh for that one.
+so in its release notes, and you install that one from its
+Release instead.
 
 ## Use
 

@@ -213,7 +213,7 @@ class WindowIconTests(WindowCase):
         self.assertEqual(QApplication.applicationName(), "ACR")
 
     def test_window_title_carries_version(self):
-        self.assertIn("0.12", self.window.windowTitle())
+        self.assertIn("0.13", self.window.windowTitle())
 
 
 # ------------------------------------------------------------- geometry
@@ -293,7 +293,7 @@ class ShippedFilesTests(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"),
                   encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn("v0.12", text)
+        self.assertIn("v0.13", text)
         self.assertIn("10 columns", text)
 
 
@@ -323,7 +323,7 @@ class BuildFromCloneTests(unittest.TestCase):
                 path = os.path.join(clone, name)
                 self.assertTrue(os.path.exists(path))
                 self.assertGreater(os.path.getsize(path), 100)
-            zip_path = os.path.join(clone, "acr-v0.12.zip")
+            zip_path = os.path.join(clone, "acr-v0.13.zip")
             self.assertTrue(os.path.exists(zip_path))
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()
